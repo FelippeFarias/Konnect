@@ -1060,7 +1060,8 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
 /// accepted `{}` and nothing else, and the MCP dispatcher validates before it
 /// dispatches (`mcp/handler.rs:366`) — so no caller could ever save a review
 /// map. Keep this in sync with [`PhotoReviewMap`] (design D8);
-/// `the_map_schema_names_every_review_map_field` fails when they drift.
+/// `the_map_schema_names_every_review_map_field_and_stays_open` fails when
+/// they drift.
 ///
 /// Every object a reviewer hand-edits is left open
 /// (`"additionalProperties": true`, which `entry().or_insert()` preserves):
@@ -1288,7 +1289,16 @@ async fn handle_check_retrace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let requested = args["project_dir"].as_str().map(PathBuf::from);
+    // Canonicalized exactly as `scan_pcb_photo` canonicalizes it: a probe that
+    // reads a different project's config than the scan it is meant to diagnose
+    // is worse than no probe.
+    let requested = match args["project_dir"].as_str() {
+        Some(raw) => match canonical_existing_dir(raw, "project_dir") {
+            Ok(path) => Some(path),
+            Err(message) => return Ok(CallToolResult::error(message)),
+        },
+        None => None,
+    };
     let project_dir = config_project_dir(requested.as_deref(), &ctx.config);
     let config = crate::tools::config::effective_config(project_dir.as_deref()).await;
     let configured = config["photo_intake"]["retrace_python_path"].as_str();
@@ -2347,6 +2357,49 @@ mod scan_contract_tests {
         assert!(result.is_error);
         let text = response_text(&result);
         assert!(text.contains("check_retrace"), "{text}");
+    }
+
+    /// `both_handlers_resolve_the_config_project_the_same_way` tests the
+    /// resolver; this tests the two handlers that call it. `check_retrace`
+    /// passed its raw `project_dir` argument through while `scan_pcb_photo`
+    /// canonicalized first, so the probe could resolve a different project's
+    /// config than the scan it is meant to diagnose — and a `project_dir`
+    /// that is not there was a silent fall-through in one and an error in
+    /// the other.
+    #[tokio::test]
+    async fn check_retrace_rejects_a_project_dir_the_scan_would_reject() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let image = project.path().join("board.png");
+        std::fs::write(&image, b"not really a png").expect("write image");
+        let missing = project.path().join("no-such-project");
+        let ctx = test_ctx();
+
+        let checked =
+            handle_check_retrace(&json!({ "project_dir": missing.to_string_lossy() }), &ctx)
+                .await
+                .expect("handler returns");
+        let scanned = handle_scan_pcb_photo(
+            &json!({
+                "image_path": image.to_string_lossy(),
+                "project_dir": missing.to_string_lossy(),
+            }),
+            &ctx,
+        )
+        .await
+        .expect("handler returns");
+
+        assert!(checked.is_error, "{}", response_text(&checked));
+        assert!(scanned.is_error, "{}", response_text(&scanned));
+        assert_eq!(
+            response_text(&checked),
+            response_text(&scanned),
+            "both handlers must reject an unresolvable project_dir the same way"
+        );
+        assert!(
+            response_text(&checked).contains("'project_dir' does not resolve"),
+            "{}",
+            response_text(&checked)
+        );
     }
 
     #[tokio::test]

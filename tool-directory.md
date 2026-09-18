@@ -438,7 +438,7 @@ the approved map is handed to schematic build, which re-checks the approval.
 | `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. |
 | `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. |
 | `save_project_config` | Save a project-specific rule or override (same dot-notation as `save_user_config`). |
-| `get_effective_config` | Return the merged config (user defaults + project overrides). The config Claude should use for design decisions. |
+| `get_effective_config` | Return the merged config (built-in defaults, then user defaults, then project overrides). The config Claude should use for design decisions. |
 | `add_design_rule` | Add a natural-language design rule Claude should follow. Examples: "Always use 100nF X7R for MCU decoupling within 3mm of power pin". |
 | `list_design_rules` | List all active design rules (user-level + project-level). |
 
