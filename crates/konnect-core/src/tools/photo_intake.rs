@@ -505,10 +505,20 @@ fn resolve_scan_timeout(argument: Option<u64>, configured: Option<u64>) -> Durat
 /// `used_fallback: false` over a result produced with no detection at all. The
 /// `||` makes stderr primary; if a later retrace release rewords the warning,
 /// the expression degrades to the probe's answer and errs toward `true`.
+///
+/// **Both extras count.** `ultralytics` (detection) and `easyocr` (OCR) are
+/// separate installs, and the flag's published meaning is a biconditional:
+/// `used_fallback: true` means marking, `value` and `part_number` were *never
+/// attempted* (`SKILL.md`, `references/review-map-schema.md`,
+/// `pcb-photo-intake-agent.md`). A detection-only install never attempts them
+/// either, so reporting `false` there would teach a reviewer to read an empty
+/// `value` as "nothing was printed on the part" — the silent guess this whole
+/// change exists to prevent. `fallback_evidence` keeps all four raw signals,
+/// so which half was missing stays visible in the tool's own output.
 fn derive_fallback(stderr: &str, extras: RetraceExtras) -> (bool, serde_json::Value) {
     let yolo_warning_seen = stderr.contains("YOLO not available");
     let ocr_warning_seen = stderr.contains("easyocr is not installed");
-    let used_fallback = yolo_warning_seen || !extras.detection;
+    let used_fallback = yolo_warning_seen || ocr_warning_seen || !extras.detection || !extras.ocr;
     (
         used_fallback,
         json!({
@@ -1943,6 +1953,51 @@ mod scan_contract_tests {
         assert_eq!(evidence["ocr_warning_seen"], true);
     }
 
+    /// `ultralytics` and `easyocr` are separate extras, so detection without
+    /// OCR is a plausible install — and it is exactly the case three asset
+    /// files describe as `used_fallback: true` ("marking, `value` and
+    /// `part_number` were **never attempted**"). Reading `false` there would
+    /// teach the agent that an empty `value` means "nothing printed on the
+    /// part" when in fact nothing ever looked.
+    #[test]
+    fn used_fallback_is_true_whenever_any_extra_did_not_run() {
+        let detection_only = RetraceExtras {
+            detection: true,
+            ocr: false,
+        };
+        let (used, evidence) = derive_fallback("", detection_only);
+        assert!(
+            used,
+            "OCR never ran, so marking/value/part_number were never attempted: {evidence}"
+        );
+        assert_eq!(evidence["extras_detection"], true);
+        assert_eq!(evidence["extras_ocr"], false);
+        assert_eq!(
+            evidence["ocr_warning_seen"], false,
+            "the raw signals stay distinguishable even when the verdict collapses them"
+        );
+
+        // The mirror case: OCR present, detection gone.
+        let ocr_only = RetraceExtras {
+            detection: false,
+            ocr: true,
+        };
+        let (used, _) = derive_fallback("", ocr_only);
+        assert!(used);
+
+        // And the stderr half, with both extras importable.
+        let ml = RetraceExtras {
+            detection: true,
+            ocr: true,
+        };
+        let (used, evidence) = derive_fallback("WARNING easyocr is not installed\n", ml);
+        assert!(
+            used,
+            "easyocr imported but OCR still did not run — stderr is primary: {evidence}"
+        );
+        assert!(!derive_fallback("", ml).0, "both extras ran, no warning");
+    }
+
     #[test]
     fn map_dir_is_computed_under_the_project_and_re_checked() {
         let project = tempfile::tempdir().expect("tempdir");
@@ -2840,19 +2895,33 @@ mod live_retrace_tests {
         let duration = payload["duration_seconds"].as_f64().expect("duration");
         assert!(duration > 0.0 && duration < 120.0, "{duration}");
 
-        // Design D11's derivation, asserted against both raw signals.
+        // Design D11's derivation, asserted against all four raw signals.
         let evidence = &payload["fallback_evidence"];
         let yolo = evidence["yolo_warning_seen"].as_bool().expect("yolo flag");
+        let ocr_warning = evidence["ocr_warning_seen"].as_bool().expect("ocr warning");
         let detection = evidence["extras_detection"]
             .as_bool()
             .expect("detection flag");
-        assert!(evidence["ocr_warning_seen"].is_boolean());
-        assert!(evidence["extras_ocr"].is_boolean());
+        let ocr = evidence["extras_ocr"].as_bool().expect("ocr extra");
         assert_eq!(
             payload["used_fallback"].as_bool().expect("used_fallback"),
-            yolo || !detection,
-            "used_fallback must be stderr OR'd with the extras probe: {payload}"
+            yolo || ocr_warning || !detection || !ocr,
+            "used_fallback must be stderr OR'd with both halves of the extras probe: {payload}"
         );
+
+        // D11's stderr literal is an unversioned contract, so pin it against
+        // a real run rather than re-deriving it from the response's own
+        // fields: on a machine without the detection extra retrace must still
+        // print the marker `derive_fallback` greps for. When retrace rewords
+        // it, this assertion is what says so.
+        if !detection {
+            assert!(
+                yolo,
+                "retrace ran without the detection extra and did not print \
+                 'YOLO not available' — the stderr contract moved, and \
+                 used_fallback now rests on the probe alone: {payload}"
+            );
+        }
 
         // The raw analysis stays under the project as evidence. Both sides are
         // compared without the Windows verbatim prefix, which is what the
