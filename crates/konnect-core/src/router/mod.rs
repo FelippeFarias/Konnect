@@ -201,7 +201,16 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        // The review map is a document a human edits by hand
+                        // between two tool calls, and the skill instructs the
+                        // agent to re-save it afterwards. A closed record here
+                        // would make that save delete the annotations — the
+                        // three levels below are the ones a reviewer writes in.
+                        "save_photo_review_map/properties/map" |
+                        "save_photo_review_map/properties/map/properties/scale_reference" |
+                        "save_photo_review_map/properties/map/properties/components/items" |
+                        "save_photo_review_map/properties/map/properties/nets/items"
                     ),
                         "unreviewed open input record: {path}"
                     );
