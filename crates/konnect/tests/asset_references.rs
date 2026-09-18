@@ -177,11 +177,15 @@ fn agents_make_claimed_evidence_executable() {
     let cases = [
         (
             "kicad-schematic-build-agent.md",
-            &["sch_analysis", "sch_export"][..],
+            &["sch_analysis", "sch_export", "photo_intake"][..],
             &[
                 "find_shorted_nets",
                 "run_erc",
                 "render_schematic_png",
+                // The approval gate the builder consumes: `approval_valid` is
+                // the server-computed answer, and reading the map's own
+                // `approved` instead is the mistake this marker forbids.
+                "approval_valid",
                 "INCOMPLETE",
             ][..],
         ),
