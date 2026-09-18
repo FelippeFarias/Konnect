@@ -568,6 +568,125 @@ fn build_scan_response(
     })
 }
 
+/// Design D1. Nothing on disk changes until every argument and every bound has
+/// been checked: the view is rendered in memory first, and only then does the
+/// `views/` directory get created and the PNG written. A rejected call leaves
+/// the map directory exactly as it found it.
+///
+/// Synchronous CPU work inside an async handler on purpose: there is no
+/// network and no subprocess to await, and the size caps in [`render_view`]
+/// are what bound how long it can run.
+async fn handle_prepare_board_photo(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let image_arg = match require_str(args, "image_path") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let map_id = match require_str(args, "map_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+
+    let image_path = match canonical_existing_file(&image_arg, "image_path") {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let project_dir = match canonical_existing_dir(&project_arg, "project_dir") {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    // Design D8: the creating variant is `scan_pcb_photo`'s alone. A `map_id`
+    // whose directory is not there names a map that does not exist.
+    let map_dir = match existing_map_dir(&project_dir, &map_id) {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+
+    let label = match args.get("label").filter(|value| !value.is_null()) {
+        None => None,
+        Some(value) => {
+            let Some(raw) = value.as_str() else {
+                return Ok(CallToolResult::error("'label' must be a string."));
+            };
+            // Validated before any path join, by the same token rule `map_id`
+            // uses — which rejects `..`, `/`, `\`, `:` and NUL by construction.
+            if let Err(message) = validate_path_token(raw, "label") {
+                return Ok(CallToolResult::error(message));
+            }
+            Some(raw.to_string())
+        }
+    };
+    let crop = match parse_crop(args) {
+        Ok(crop) => crop,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let rotate = match parse_rotate(args) {
+        Ok(rotate) => rotate,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let scale = match parse_scale(args) {
+        Ok(scale) => scale,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+
+    let rendered = match render_view(&image_path, crop, rotate, scale) {
+        Ok(rendered) => rendered,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+
+    let views_dir = match prepare_views_dir(&map_dir) {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let file_name = match &label {
+        Some(label) => format!("{label}.png"),
+        None => format!("{}.png", next_view_number(&views_dir)),
+    };
+    let view_path = views_dir.join(file_name);
+    if let Err(error) = rendered.image.save(&view_path) {
+        return Ok(CallToolResult::error(format!(
+            "Could not write {} ({error}).",
+            view_path.display()
+        )));
+    }
+
+    // Design D3: reported only when the map the view belongs to already
+    // carries a resolved scale. Never estimated here — this tool has no way to
+    // know what a pixel is worth.
+    let mm_per_px = read_review_map(&map_dir.join(REVIEW_MAP_FILE))
+        .await
+        .ok()
+        .and_then(|map| {
+            map.get("scale_reference")
+                .and_then(|scale| scale.get("mm_per_px"))
+                .and_then(serde_json::Value::as_f64)
+        });
+
+    info!(
+        map_id = %map_id,
+        view = %view_path.display(),
+        "[BETA] board photo view prepared"
+    );
+
+    let mut response = json!({
+        "view_path": subprocess_arg(&view_path),
+        "source_size_px": rendered.source_size_px,
+        "source_rect_px": rendered.source_rect_px,
+        "output_size_px": rendered.output_size_px,
+        "exif_orientation": format!("{:?}", rendered.orientation),
+    });
+    if let Some(mm_per_px) = mm_per_px {
+        response["mm_per_px"] = json!(mm_per_px);
+    }
+    Ok(CallToolResult::json(&response))
+}
+
 /// The project whose configuration applies to this call: the `project_dir` the
 /// caller named, else the server's configured project.
 ///
@@ -1035,7 +1154,11 @@ fn now_rfc3339_utc() -> String {
 /// Reject anything that is not [`MAP_ID_PATTERN`] *before* it reaches a path
 /// join. A token rule rejects `/`, `\`, `.`, `..`, `:` and NUL by construction
 /// rather than by blacklist, so there is no traversal spelling left to miss.
-fn validate_map_id(raw: &str) -> Result<(), String> {
+///
+/// Takes the field name because `prepare_board_photo`'s `label` is a path
+/// component for exactly the same reason `map_id` is, and an error that names
+/// the wrong argument sends the caller to fix the wrong thing.
+fn validate_path_token(raw: &str, field: &str) -> Result<(), String> {
     let length = raw.chars().count();
     let valid = (1..=64).contains(&length)
         && raw.chars().all(|character| {
@@ -1045,10 +1168,14 @@ fn validate_map_id(raw: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "'map_id' must match {MAP_ID_PATTERN} (1-64 characters of A-Z a-z 0-9 _ -); got \
+            "'{field}' must match {MAP_ID_PATTERN} (1-64 characters of A-Z a-z 0-9 _ -); got \
              {raw:?}. No file was read or written."
         ))
     }
+}
+
+fn validate_map_id(raw: &str) -> Result<(), String> {
+    validate_path_token(raw, "map_id")
 }
 
 /// The directory of a map that already exists. Unlike [`prepare_map_dir`] it
@@ -1164,6 +1291,252 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
         }
     }
     Ok(parsed)
+}
+
+// ─── Board photo views (design D1) ────────────────────────────────────────────
+
+/// The `views/` subdirectory of a map, where `prepare_board_photo` writes.
+const VIEWS_DIR: &str = "views";
+
+/// Design D1's four bounds, named once so the schema, the error messages and
+/// the tests cannot drift apart.
+///
+/// The handler is synchronous CPU-and-memory work with no network and no
+/// subprocess, so a wall-clock timeout would guard nothing these already
+/// guard. 50 MP at RGBA8 is 200 MB decoded and a 4096 x 4096 output is 67 MB,
+/// which puts peak resident under ~300 MB per call; `MAX_DECODE_ALLOC_BYTES`
+/// backstops a header that lies about its own dimensions.
+const MAX_SOURCE_MEGAPIXELS: u64 = 50;
+const MAX_SOURCE_PIXELS: u64 = MAX_SOURCE_MEGAPIXELS * 1_000_000;
+const MAX_VIEW_SIDE_PX: u32 = 4096;
+const MIN_VIEW_SCALE: f64 = 0.25;
+const MAX_VIEW_SCALE: f64 = 4.0;
+const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+
+/// One rendered view, still in memory: nothing is written until every bound
+/// has been checked, so a rejected call leaves no file and no `views/`
+/// directory behind.
+struct RenderedView {
+    image: image::DynamicImage,
+    /// `[w, h]` of the decoded image **after** EXIF orientation.
+    source_size_px: [u32; 2],
+    /// `[x, y, w, h]` actually used, in that same oriented space.
+    source_rect_px: [u32; 4],
+    output_size_px: [u32; 2],
+    orientation: image::metadata::Orientation,
+}
+
+/// Decode → EXIF-orient → crop → rotate → scale, design D1's steps 1-8.
+///
+/// The orientation dance is explicit because `ImageReader::decode()` does
+/// **not** apply the tag: a phone original carries one, the reader the agent
+/// used to pick its rectangle may or may not have honoured it, and the agent
+/// cannot detect the mismatch from the cropped result. Orienting first and
+/// reporting both the applied variant and the oriented size makes the
+/// coordinate space this tool used inspectable.
+fn render_view(
+    image_path: &Path,
+    crop: Option<[u32; 4]>,
+    rotate: u32,
+    scale: f64,
+) -> Result<RenderedView, String> {
+    use image::ImageDecoder as _;
+
+    let mut reader = image::ImageReader::open(image_path)
+        .map_err(|error| format!("Could not open {} ({error}).", image_path.display()))?
+        .with_guessed_format()
+        .map_err(|error| {
+            format!(
+                "Could not determine the image format of {} ({error}). PNG and JPEG are \
+                 supported.",
+                image_path.display()
+            )
+        })?;
+    // Set explicitly rather than inherited from the crate's default, so the
+    // cap this code states is the cap it enforces. `Limits` is
+    // `#[non_exhaustive]`, hence the field assignment rather than a literal.
+    let mut limits = image::Limits::no_limits();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("Could not read {} ({error}).", image_path.display()))?;
+    // Read from the header, before a pixel is decoded: a crafted file whose
+    // header claims 65535 x 65535 must cost nothing but this comparison.
+    let (header_width, header_height) = decoder.dimensions();
+    let header_pixels = u64::from(header_width) * u64::from(header_height);
+    if header_pixels > MAX_SOURCE_PIXELS {
+        return Err(format!(
+            "{} is {header_width}x{header_height} px, which is over prepare_board_photo's \
+             {MAX_SOURCE_MEGAPIXELS} MP ({MAX_SOURCE_PIXELS} px) cap. Nothing was decoded and no \
+             file was written. Downscale the photo first.",
+            image_path.display()
+        ));
+    }
+    // Defaults to `NoTransforms` for a format or a file with no EXIF tag, so
+    // this is safe on a WhatsApp JPEG whose metadata has been stripped.
+    let orientation = decoder.orientation().map_err(|error| {
+        format!(
+            "Could not read the EXIF orientation of {} ({error}).",
+            image_path.display()
+        )
+    })?;
+    let mut image = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("Could not decode {} ({error}).", image_path.display()))?;
+    image.apply_orientation(orientation);
+
+    let (oriented_width, oriented_height) = (image.width(), image.height());
+    let source_rect_px = match crop {
+        // Bounds-checked against the **oriented** dimensions, and rejected
+        // rather than clamped: a silently shrunk rectangle leaves the agent
+        // reasoning about pixel coordinates in a space that does not exist.
+        Some([x, y, width, height]) => {
+            let (right, bottom) = (
+                u64::from(x) + u64::from(width),
+                u64::from(y) + u64::from(height),
+            );
+            if right > u64::from(oriented_width) || bottom > u64::from(oriented_height) {
+                return Err(format!(
+                    "crop [{x}, {y}, {width}, {height}] falls outside {}, which is \
+                     {oriented_width}x{oriented_height} px after its EXIF orientation \
+                     ({orientation:?}) was applied. No file was written.",
+                    image_path.display()
+                ));
+            }
+            image = image.crop_imm(x, y, width, height);
+            [x, y, width, height]
+        }
+        None => [0, 0, oriented_width, oriented_height],
+    };
+
+    let image = match rotate {
+        90 => image.rotate90(),
+        180 => image.rotate180(),
+        270 => image.rotate270(),
+        _ => image,
+    };
+
+    let scaled = |side: u32| ((f64::from(side) * scale).round() as u32).max(1);
+    let (output_width, output_height) = (scaled(image.width()), scaled(image.height()));
+    // Checked before the destination buffer is allocated, not after.
+    if output_width > MAX_VIEW_SIDE_PX || output_height > MAX_VIEW_SIDE_PX {
+        return Err(format!(
+            "scale {scale} would produce a {output_width}x{output_height} px view, whose long \
+             side is over prepare_board_photo's {MAX_VIEW_SIDE_PX} px cap. Nothing was allocated \
+             and no file was written. Use a smaller scale or a tighter crop."
+        ));
+    }
+    let image = if (output_width, output_height) == (image.width(), image.height()) {
+        // A resample at the source size is not a no-op — Lanczos3 would ring
+        // the edges of a view nobody asked to resize.
+        image
+    } else {
+        image.resize_exact(
+            output_width,
+            output_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+
+    Ok(RenderedView {
+        image,
+        source_size_px: [oriented_width, oriented_height],
+        source_rect_px,
+        output_size_px: [output_width, output_height],
+        orientation,
+    })
+}
+
+/// `<map_dir>/views/`, created on demand and re-checked for confinement the
+/// same way [`prepare_map_dir`] re-checks the map directory: a pre-existing
+/// `views` that is a symlink to somewhere else is the one case a computed path
+/// cannot rule out.
+fn prepare_views_dir(map_dir: &Path) -> Result<PathBuf, String> {
+    let views = map_dir.join(VIEWS_DIR);
+    std::fs::create_dir_all(&views)
+        .map_err(|error| format!("Could not create {}: {error}", views.display()))?;
+    let canonical = views
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve {}: {error}", views.display()))?;
+    if !canonical.starts_with(map_dir) {
+        return Err(format!(
+            "Refusing to write outside the map directory: {} resolves to {}, which is not under \
+             {}",
+            views.display(),
+            canonical.display(),
+            map_dir.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Design D1: `1 +` however many files the `views/` directory already holds.
+/// A directory that cannot be listed counts as empty — the save below is what
+/// reports a real filesystem problem.
+fn next_view_number(views_dir: &Path) -> usize {
+    std::fs::read_dir(views_dir)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+        + 1
+}
+
+/// `crop`, `rotate` and `scale`, validated in Rust as well as in the schema:
+/// the schema is the MCP dispatcher's guard, and these handlers are also
+/// called directly.
+fn parse_crop(args: &serde_json::Value) -> Result<Option<[u32; 4]>, String> {
+    let Some(crop) = args.get("crop").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(object) = crop.as_object() else {
+        return Err("'crop' must be an object with integer x, y, w and h.".to_string());
+    };
+    let mut rectangle = [0u32; 4];
+    for (index, (field, minimum)) in [("x", 0), ("y", 0), ("w", 1), ("h", 1)].iter().enumerate() {
+        let value = object
+            .get(*field)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| format!("'crop.{field}' is missing or is not an integer."))?;
+        if value < *minimum {
+            return Err(format!(
+                "'crop.{field}' is {value}; it must be at least {minimum}."
+            ));
+        }
+        rectangle[index] = u32::try_from(value)
+            .map_err(|_| format!("'crop.{field}' is {value}, which is larger than any image."))?;
+    }
+    Ok(Some(rectangle))
+}
+
+fn parse_rotate(args: &serde_json::Value) -> Result<u32, String> {
+    let Some(rotate) = args.get("rotate").filter(|value| !value.is_null()) else {
+        return Ok(0);
+    };
+    match rotate.as_i64() {
+        Some(degrees @ (0 | 90 | 180 | 270)) => Ok(degrees as u32),
+        _ => Err(format!(
+            "'rotate' is {rotate}; it must be one of 0, 90, 180 or 270."
+        )),
+    }
+}
+
+fn parse_scale(args: &serde_json::Value) -> Result<f64, String> {
+    let Some(scale) = args.get("scale").filter(|value| !value.is_null()) else {
+        return Ok(1.0);
+    };
+    let Some(factor) = scale.as_f64() else {
+        return Err(format!("'scale' is {scale}; it must be a number."));
+    };
+    // Rejected, never clamped: a silently clamped scale makes output_size_px
+    // disagree with what the agent asked for.
+    if !(MIN_VIEW_SCALE..=MAX_VIEW_SCALE).contains(&factor) {
+        return Err(format!(
+            "'scale' is {factor}; it must be between {MIN_VIEW_SCALE} and {MAX_VIEW_SCALE}. It is \
+             rejected rather than clamped, so that the view's reported size is always the size \
+             you asked for. No file was written."
+        ));
+    }
+    Ok(factor)
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -1463,6 +1836,62 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["image_path", "project_dir"]
             }),
             |args, ctx| async move { handle_scan_pcb_photo(args, ctx).await }
+        ),
+        tool!(
+            "prepare_board_photo",
+            "Save a cropped, rotated and/or scaled PNG view of a board photo under an existing \
+             review map's views/ directory, so you can read silkscreen text, terminals and \
+             component markings the full photo is too coarse for. One image in, one view out: \
+             call it once per view. EXIF orientation is applied first and reported, and crop is \
+             interpreted in that oriented space. This tool decodes and re-encodes only — \
+             counting, classification and OCR are yours to do from the views it produces.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to the source photo (PNG/JPEG). May live anywhere; it is read, never written."
+                    },
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory the map belongs to."
+                    },
+                    "map_id": {
+                        "type": "string",
+                        "pattern": MAP_ID_PATTERN,
+                        "description": "The map identifier assigned by scan_pcb_photo. Its directory must already exist — this tool never mints one."
+                    },
+                    "crop": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer", "minimum": 0, "description": "Left edge, in pixels of the EXIF-oriented source." },
+                            "y": { "type": "integer", "minimum": 0, "description": "Top edge, in pixels of the EXIF-oriented source." },
+                            "w": { "type": "integer", "minimum": 1, "description": "Width in pixels." },
+                            "h": { "type": "integer", "minimum": 1, "description": "Height in pixels." }
+                        },
+                        "required": ["x", "y", "w", "h"],
+                        "description": "Region to cut out, in the coordinate space reported as source_size_px. Omit for the whole image. A rectangle that does not fit is an error naming the actual size, never a silently clamped one."
+                    },
+                    "rotate": {
+                        "type": "integer",
+                        "enum": [0, 90, 180, 270],
+                        "description": "Clockwise rotation applied after crop, on top of any EXIF orientation already applied. For a photo taken sideways with no EXIF tag at all."
+                    },
+                    "scale": {
+                        "type": "number",
+                        "minimum": MIN_VIEW_SCALE,
+                        "maximum": MAX_VIEW_SCALE,
+                        "description": "Resampling factor applied after rotate. Out of range is rejected, not clamped, so output_size_px is always the size you asked for."
+                    },
+                    "label": {
+                        "type": "string",
+                        "pattern": MAP_ID_PATTERN,
+                        "description": "File name stem for the view, e.g. boardA_top_left. Omitted, the view is numbered. The output directory itself is computed and never supplied."
+                    }
+                },
+                "required": ["image_path", "project_dir", "map_id"]
+            }),
+            |args, ctx| async move { handle_prepare_board_photo(args, ctx).await }
         ),
         tool!(
             "save_photo_review_map",
@@ -2426,6 +2855,7 @@ mod scan_contract_tests {
             vec![
                 "check_retrace",
                 "scan_pcb_photo",
+                "prepare_board_photo",
                 "save_photo_review_map",
                 "load_photo_review_map",
                 "approve_photo_review_map"
@@ -3960,6 +4390,584 @@ mod review_map_tests {
                 "{name} enforces the map_id token in its schema too"
             );
         }
+    }
+}
+
+/// `prepare_board_photo` (design D1 and D8).
+#[cfg(test)]
+mod board_view_tests {
+    use super::test_support::{response_json, response_text, test_ctx};
+    use super::*;
+
+    /// A project with one scan directory already minted, exactly as
+    /// `scan_pcb_photo` leaves it.
+    fn scanned_project(map_id: &str) -> (tempfile::TempDir, PathBuf) {
+        let project = tempfile::tempdir().expect("temp project");
+        let canonical = project.path().canonicalize().expect("canonical project");
+        prepare_map_dir(&canonical, map_id).expect("scan directory");
+        (project, canonical)
+    }
+
+    fn views_dir(project_canonical: &Path, map_id: &str) -> PathBuf {
+        project_canonical
+            .join(".konnect")
+            .join("photo_intake")
+            .join(map_id)
+            .join(VIEWS_DIR)
+    }
+
+    /// A `width` x `height` image whose top-left `block` x `block` corner is
+    /// red and whose remainder is black. A crop that lands on the wrong corner
+    /// then shows up as a colour rather than only as a size, which is what
+    /// makes the orientation test below able to fail.
+    fn corner_marked(width: u32, height: u32, block: u32) -> image::RgbImage {
+        let mut image = image::RgbImage::from_pixel(width, height, image::Rgb([0, 0, 0]));
+        for y in 0..block.min(height) {
+            for x in 0..block.min(width) {
+                image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        image
+    }
+
+    fn encode(image: &image::RgbImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image.clone())
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .expect("encodes");
+        bytes
+    }
+
+    fn write_source(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("writes the source photo");
+        path
+    }
+
+    /// PNG's CRC-32 (ISO-HDLC, reflected polynomial), needed to splice a chunk
+    /// into an encoded PNG. Hand-rolled rather than pulled in as a dependency:
+    /// eight lines beat a crate for two test fixtures.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// Splice an `eXIf` chunk carrying one EXIF orientation entry in right
+    /// after IHDR. The `png` crate parses `eXIf` into `info().exif_metadata`
+    /// verbatim, and that is exactly the raw little-endian TIFF block
+    /// `Orientation::from_exif_chunk` reads — so this produces a file the
+    /// production decode path sees an orientation tag on, with no checked-in
+    /// photo and no camera.
+    fn with_exif_orientation(png: &[u8], exif_orientation: u8) -> Vec<u8> {
+        let mut tiff = vec![
+            0x49, 0x49, 0x2A, 0x00, // little-endian TIFF magic
+            0x08, 0x00, 0x00, 0x00, // IFD0 begins at offset 8
+            0x01, 0x00, // one entry
+            0x12, 0x01, // tag 0x0112, Orientation
+            0x03, 0x00, // type SHORT
+            0x01, 0x00, 0x00, 0x00, // count 1
+        ];
+        tiff.extend_from_slice(&[exif_orientation, 0x00, 0x00, 0x00]); // value, padded
+        tiff.extend_from_slice(&[0x00; 4]); // no next IFD
+
+        let mut chunk = (tiff.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&tiff);
+        let crc = crc32(&chunk[4..]);
+        chunk.extend_from_slice(&crc.to_be_bytes());
+
+        // 8-byte signature followed by a 25-byte IHDR chunk.
+        const AFTER_IHDR: usize = 8 + 25;
+        let mut spliced = png[..AFTER_IHDR].to_vec();
+        spliced.extend_from_slice(&chunk);
+        spliced.extend_from_slice(&png[AFTER_IHDR..]);
+        spliced
+    }
+
+    /// A real PNG whose IHDR is rewritten to claim a size its pixel data does
+    /// not have. Nothing ever decodes it: `decoder.dimensions()` reads the
+    /// header, which is exactly where design D1 puts the megapixel check.
+    fn png_claiming(png: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let mut patched = png.to_vec();
+        patched[16..20].copy_from_slice(&width.to_be_bytes());
+        patched[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&patched[12..29]); // chunk type plus its 13 data bytes
+        patched[29..33].copy_from_slice(&crc.to_be_bytes());
+        patched
+    }
+
+    async fn prepare(args: serde_json::Value) -> CallToolResult {
+        handle_prepare_board_photo(&args, &test_ctx())
+            .await
+            .expect("handler returns a result")
+    }
+
+    fn is_red(path: &Path) -> bool {
+        let view = image::open(path).expect("the view decodes").to_rgb8();
+        view.pixels().all(|pixel| pixel.0 == [255, 0, 0])
+    }
+
+    // ─── Schema (task 1.2, design D1) ────────────────────────────────────────
+
+    #[test]
+    fn the_view_schema_requires_the_three_paths_and_computes_the_rest() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "prepare_board_photo")
+            .expect("prepare_board_photo is defined")
+            .input_schema;
+
+        let mut names: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "crop",
+                "image_path",
+                "label",
+                "map_id",
+                "project_dir",
+                "rotate",
+                "scale"
+            ],
+            "the output location is computed, never an argument"
+        );
+        assert_eq!(
+            schema["required"],
+            json!(["image_path", "project_dir", "map_id"])
+        );
+        for token in ["map_id", "label"] {
+            assert_eq!(
+                schema["properties"][token]["pattern"],
+                json!(MAP_ID_PATTERN),
+                "{token} is a path component, so the token rule is in the schema too"
+            );
+        }
+        assert_eq!(
+            schema["properties"]["rotate"]["enum"],
+            json!([0, 90, 180, 270])
+        );
+        assert_eq!(
+            schema["properties"]["scale"]["minimum"],
+            json!(MIN_VIEW_SCALE)
+        );
+        assert_eq!(
+            schema["properties"]["scale"]["maximum"],
+            json!(MAX_VIEW_SCALE)
+        );
+    }
+
+    // ─── Pipeline (task 1.3, design D1 steps 1-9) ────────────────────────────
+
+    /// Spec scenario "a cropped, scaled view is produced": what the response
+    /// says the view is must be what is on disk, or an agent reasoning about
+    /// pixel coordinates is reasoning about a space that does not exist.
+    #[tokio::test]
+    async fn a_cropped_and_scaled_view_is_saved_at_exactly_the_size_it_reports() {
+        let (project, canonical) = scanned_project("cropped");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(40, 20, 10), image::ImageFormat::Png),
+        );
+
+        let result = response_json(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "cropped",
+                "crop": { "x": 0, "y": 0, "w": 10, "h": 10 },
+                "scale": 2.0,
+                "label": "boardA_zoom"
+            }))
+            .await,
+        );
+
+        assert_eq!(result["source_size_px"], json!([40, 20]));
+        assert_eq!(result["source_rect_px"], json!([0, 0, 10, 10]));
+        assert_eq!(result["output_size_px"], json!([20, 20]));
+        assert_eq!(result["exif_orientation"], json!("NoTransforms"));
+
+        let view = views_dir(&canonical, "cropped").join("boardA_zoom.png");
+        assert!(view.exists(), "the view is written where the response says");
+        let decoded = image::open(&view).expect("the view decodes");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (20, 20),
+            "the saved PNG's size is output_size_px, not an aspect-ratio rounding of it"
+        );
+        assert!(is_red(&view), "the crop landed on the marked corner");
+    }
+
+    /// The whole reason design D1 orients before it crops: a phone original
+    /// carries the tag, the viewer the agent picked its rectangle in may or
+    /// may not have honoured it, and the agent cannot tell from the result.
+    ///
+    /// The source is 40x20 with a red top-left corner and an EXIF orientation
+    /// of 6 (`Rotate90`). Oriented, it is 20x40 with the red corner at the
+    /// top *right* — so a crop at `[10, 0, 10, 10]` is all red and one at
+    /// `[0, 0, 10, 10]` is not. Skip `apply_orientation` and both assertions
+    /// invert.
+    #[tokio::test]
+    async fn exif_orientation_is_applied_before_the_crop_is_measured() {
+        let (project, canonical) = scanned_project("oriented");
+        let source = write_source(
+            project.path(),
+            "rotated.png",
+            &with_exif_orientation(
+                &encode(&corner_marked(40, 20, 10), image::ImageFormat::Png),
+                6,
+            ),
+        );
+        let base = json!({
+            "image_path": source.to_string_lossy(),
+            "project_dir": project.path().to_string_lossy(),
+            "map_id": "oriented",
+        });
+
+        let mut whole = base.clone();
+        whole["label"] = json!("whole");
+        let result = response_json(&prepare(whole).await);
+        assert_eq!(
+            result["exif_orientation"],
+            json!("Rotate90"),
+            "the applied orientation is reported, so the coordinate space is inspectable"
+        );
+        assert_eq!(
+            result["source_size_px"],
+            json!([20, 40]),
+            "source_size_px is the oriented size, not the stored one"
+        );
+        assert_eq!(result["source_rect_px"], json!([0, 0, 20, 40]));
+
+        for (label, rect, expect_red) in [
+            ("marked", json!({ "x": 10, "y": 0, "w": 10, "h": 10 }), true),
+            ("blank", json!({ "x": 0, "y": 0, "w": 10, "h": 10 }), false),
+        ] {
+            let mut args = base.clone();
+            args["label"] = json!(label);
+            args["crop"] = rect;
+            prepare(args).await;
+            assert_eq!(
+                is_red(&views_dir(&canonical, "oriented").join(format!("{label}.png"))),
+                expect_red,
+                "the {label} crop is measured in the oriented space"
+            );
+        }
+    }
+
+    /// The `jpeg` feature design D2 adds, exercised: the reference board
+    /// photos are WhatsApp JPEGs, and a decoder that is not compiled in is a
+    /// tool that cannot look at them.
+    #[tokio::test]
+    async fn a_jpeg_photo_goes_through_the_same_pipeline() {
+        let (project, canonical) = scanned_project("jpeg");
+        let source = write_source(
+            project.path(),
+            "boardA.jpeg",
+            &encode(&corner_marked(64, 32, 16), image::ImageFormat::Jpeg),
+        );
+
+        let result = response_json(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "jpeg",
+                "label": "from_jpeg"
+            }))
+            .await,
+        );
+        assert_eq!(result["source_size_px"], json!([64, 32]));
+        assert_eq!(result["output_size_px"], json!([64, 32]));
+
+        let view = views_dir(&canonical, "jpeg").join("from_jpeg.png");
+        let decoded = image::open(&view).expect("the view decodes");
+        assert_eq!((decoded.width(), decoded.height()), (64, 32));
+    }
+
+    /// Design D1's naming rule: `label` when given, else `1 +` whatever the
+    /// directory already holds.
+    #[tokio::test]
+    async fn unlabelled_views_are_numbered_from_what_the_directory_already_holds() {
+        let (project, canonical) = scanned_project("numbered");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+        );
+        let args = json!({
+            "image_path": source.to_string_lossy(),
+            "project_dir": project.path().to_string_lossy(),
+            "map_id": "numbered",
+        });
+
+        for expected in ["1.png", "2.png", "3.png"] {
+            let result = response_json(&prepare(args.clone()).await);
+            assert!(
+                result["view_path"]
+                    .as_str()
+                    .expect("view_path")
+                    .ends_with(expected),
+                "expected {expected}, got {}",
+                result["view_path"]
+            );
+            assert!(views_dir(&canonical, "numbered").join(expected).exists());
+        }
+    }
+
+    // ─── Path rule (task 1.4, design D8) ─────────────────────────────────────
+
+    /// Spec scenario "a map directory that does not exist is rejected": a map
+    /// id is server-assigned, so naming one that is not there names a map that
+    /// does not exist — never a directory to mint on the caller's say-so.
+    #[tokio::test]
+    async fn a_map_id_no_scan_ever_assigned_is_rejected_and_mints_nothing() {
+        let (project, canonical) = scanned_project("real-map");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+        );
+
+        let message = response_text(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "invented-map",
+            }))
+            .await,
+        );
+        assert!(message.contains("scan_pcb_photo"), "{message}");
+        assert!(
+            !canonical
+                .join(".konnect")
+                .join("photo_intake")
+                .join("invented-map")
+                .exists(),
+            "no directory is minted for an unknown map id"
+        );
+        assert!(
+            !views_dir(&canonical, "real-map").exists(),
+            "and nothing is created under the map that does exist either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_that_is_not_a_token_is_rejected_before_any_path_join() {
+        let (project, canonical) = scanned_project("labelled");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+        );
+
+        for label in ["..", "../escape", "views/../..", "a\\b", "a:b", ""] {
+            let message = response_text(
+                &prepare(json!({
+                    "image_path": source.to_string_lossy(),
+                    "project_dir": project.path().to_string_lossy(),
+                    "map_id": "labelled",
+                    "label": label,
+                }))
+                .await,
+            );
+            assert!(
+                message.contains("'label'") && message.contains("No file was read or written"),
+                "{label:?}: {message}"
+            );
+        }
+        assert!(
+            !views_dir(&canonical, "labelled").exists(),
+            "a rejected label must not even create the views directory"
+        );
+    }
+
+    // ─── mm_per_px and the four bounds (task 1.5, design D1 and D3) ──────────
+
+    /// Spec scenario "a view carries a physical scale when one is resolved",
+    /// both halves. The tool never estimates one: absent means absent.
+    #[tokio::test]
+    async fn mm_per_px_is_reported_only_when_the_saved_map_resolved_one() {
+        let (project, _canonical) = scanned_project("scaled");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+        );
+        let args = json!({
+            "image_path": source.to_string_lossy(),
+            "project_dir": project.path().to_string_lossy(),
+            "map_id": "scaled",
+        });
+
+        // (a) No map on disk at all.
+        let result = response_json(&prepare(args.clone()).await);
+        assert!(result.get("mm_per_px").is_none(), "{result}");
+
+        let mut map = json!({
+            "map_id": "scaled",
+            "source_images": [source.to_string_lossy()],
+            "scale_reference": { "kind": "board_edge_mm", "value": "50" },
+            "components": [],
+            "nets": []
+        });
+        let project_dir = project.path().to_path_buf();
+        let save = |map: serde_json::Value| {
+            let project_dir = project_dir.clone();
+            async move {
+                handle_save_photo_review_map(
+                    &json!({ "project_dir": project_dir.to_string_lossy(), "map": map }),
+                    &test_ctx(),
+                )
+                .await
+                .expect("save returns a result")
+            }
+        };
+
+        // (b) A map whose scale was never resolved.
+        save(map.clone()).await;
+        let result = response_json(&prepare(args.clone()).await);
+        assert!(result.get("mm_per_px").is_none(), "{result}");
+
+        // (c) One the agent resolved, with its evidence.
+        map["scale_reference"]["mm_per_px"] = json!(0.24);
+        map["scale_reference"]["evidence"] =
+            json!("21px between M3 hole centers, 5mm pitch stated by the user");
+        save(map).await;
+        let result = response_json(&prepare(args).await);
+        assert_eq!(result["mm_per_px"], json!(0.24));
+    }
+
+    /// Spec scenario "an out-of-bounds crop is rejected": the error names the
+    /// size the tool actually saw, because the size the caller assumed is the
+    /// thing that was wrong.
+    #[tokio::test]
+    async fn an_out_of_bounds_crop_names_the_oriented_dimensions_and_writes_nothing() {
+        let (project, canonical) = scanned_project("out-of-bounds");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(40, 20, 10), image::ImageFormat::Png),
+        );
+
+        let message = response_text(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "out-of-bounds",
+                "crop": { "x": 30, "y": 0, "w": 20, "h": 10 },
+            }))
+            .await,
+        );
+        assert!(message.contains("40x20"), "{message}");
+        assert!(message.contains("No file was written"), "{message}");
+        assert!(!views_dir(&canonical, "out-of-bounds").exists());
+    }
+
+    #[tokio::test]
+    async fn a_photo_over_the_megapixel_cap_is_rejected_before_it_is_decoded() {
+        let (project, canonical) = scanned_project("too-many-pixels");
+        let source = write_source(
+            project.path(),
+            "huge.png",
+            // A 16x16 file whose header claims 65535 x 65535 — the crafted
+            // case cause 7 of the pre-mortem names. Its pixel data is never
+            // touched, which is the point.
+            &png_claiming(
+                &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+                65_535,
+                65_535,
+            ),
+        );
+
+        let message = response_text(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "too-many-pixels",
+            }))
+            .await,
+        );
+        assert!(message.contains("65535x65535"), "{message}");
+        assert!(
+            message.contains(&MAX_SOURCE_MEGAPIXELS.to_string()),
+            "the cap is named too: {message}"
+        );
+        assert!(!views_dir(&canonical, "too-many-pixels").exists());
+    }
+
+    #[tokio::test]
+    async fn a_scale_outside_the_range_is_rejected_rather_than_clamped() {
+        let (project, canonical) = scanned_project("bad-scale");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(16, 16, 4), image::ImageFormat::Png),
+        );
+
+        for (scale, actual) in [(5.0, "5"), (0.1, "0.1")] {
+            let message = response_text(
+                &prepare(json!({
+                    "image_path": source.to_string_lossy(),
+                    "project_dir": project.path().to_string_lossy(),
+                    "map_id": "bad-scale",
+                    "scale": scale,
+                }))
+                .await,
+            );
+            assert!(message.contains(actual), "{message}");
+            assert!(
+                message.contains(&MIN_VIEW_SCALE.to_string())
+                    && message.contains(&MAX_VIEW_SCALE.to_string()),
+                "both ends of the range are named: {message}"
+            );
+            assert!(
+                message.contains("rejected rather than clamped"),
+                "{message}"
+            );
+        }
+        assert!(!views_dir(&canonical, "bad-scale").exists());
+    }
+
+    #[tokio::test]
+    async fn a_view_longer_than_the_side_cap_is_rejected_before_it_is_allocated() {
+        let (project, canonical) = scanned_project("too-wide");
+        let source = write_source(
+            project.path(),
+            "wide.png",
+            &encode(&corner_marked(1100, 8, 4), image::ImageFormat::Png),
+        );
+
+        let message = response_text(
+            &prepare(json!({
+                "image_path": source.to_string_lossy(),
+                "project_dir": project.path().to_string_lossy(),
+                "map_id": "too-wide",
+                "scale": 4.0,
+            }))
+            .await,
+        );
+        assert!(message.contains("4400x32"), "{message}");
+        assert!(
+            message.contains(&MAX_VIEW_SIDE_PX.to_string()),
+            "the cap is named too: {message}"
+        );
+        assert!(!views_dir(&canonical, "too-wide").exists());
     }
 }
 

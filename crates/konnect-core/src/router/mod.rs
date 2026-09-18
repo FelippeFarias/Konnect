@@ -371,16 +371,18 @@ mod tests {
         }
     }
 
-    /// The `photo_intake` toolset's five tools, in the order the LLM meets
-    /// them: probe, scan, then the three that own the review map's approval
-    /// gate. Order is asserted, not just membership, because `tools/list` is
-    /// read top to bottom and `check_retrace` is the one to call first when a
-    /// scan fails.
+    /// The `photo_intake` toolset's six tools, in the order the LLM meets
+    /// them: probe, scan, look closer, then the three that own the review
+    /// map's approval gate. Order is asserted, not just membership, because
+    /// `tools/list` is read top to bottom, `check_retrace` is the one to call
+    /// first when a scan fails, and `prepare_board_photo` needs the map
+    /// directory the scan above it mints.
     #[tokio::test]
-    async fn photo_intake_exposes_exactly_its_five_tools_in_order() {
+    async fn photo_intake_exposes_exactly_its_six_tools_in_order() {
         let expected = [
             "check_retrace",
             "scan_pcb_photo",
+            "prepare_board_photo",
             "save_photo_review_map",
             "load_photo_review_map",
             "approve_photo_review_map",
@@ -398,10 +400,13 @@ mod tests {
             .expect("photo_intake loads");
         let loaded_names: Vec<&str> = loaded.iter().map(|def| def.name).collect();
         assert_eq!(loaded_names, expected);
-        assert_eq!(
-            router.find_toolset_for_tool("approve_photo_review_map"),
-            Some("photo_intake")
-        );
+        for tool in ["approve_photo_review_map", "prepare_board_photo"] {
+            assert_eq!(
+                router.find_toolset_for_tool(tool),
+                Some("photo_intake"),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

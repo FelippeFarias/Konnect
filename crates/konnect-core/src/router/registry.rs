@@ -118,9 +118,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "photo_intake",
-        description: "PCB photo reverse engineering via the optional retrace package: capability probe, component scan, and the human-reviewed map its approval gate guards",
+        description: "PCB photo reverse engineering via the optional retrace package: capability probe, component scan, zoomed photo views, and the human-reviewed map its approval gate guards",
         category: "integration",
-        tool_count: 5,
+        tool_count: 6,
     },
     ToolsetMeta {
         name: "verification",
