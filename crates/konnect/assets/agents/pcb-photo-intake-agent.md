@@ -43,21 +43,26 @@ reference before starting. The scale reference is always theirs to give.
 
 ### Phase 0: Capability
 
-- `check_retrace(python_path)` — read `available`, the resolved interpreter,
-  `retrace_version` and the extras.
+- `check_retrace(python_path, project_dir)` — read `available`, the resolved
+  interpreter, `retrace_version`, the extras and `candidates_tried`. Pass the
+  same `project_dir` you will pass to `scan_pcb_photo`: both read that
+  project's `photo_intake.retrace_python_path`, so probing a different project
+  can name an interpreter the scan never uses.
 - If `available` is false, stop. Report the install command and
   `candidates_tried`; do not scan and do not fabricate a map.
-- If the extras are absent, say so before scanning: the scan will be a coarse
-  OpenCV contour pass with no marking, `value` or `part_number` read at all.
+- If either extra is absent, say so before scanning: the scan will be a coarse
+  OpenCV contour pass with no marking or `value` read at all.
 
 ### Phase 1: Scan
 
 - `scan_pcb_photo(image_path, project_dir)`.
-- Record `map_id`, `analysis_json_path`, `duration_seconds`, `used_fallback`
-  and `fallback_evidence`. The raw analysis is the evidence for every later
-  claim; name its path.
-- A `used_fallback: true` scan read no markings. Every empty `value` in it
-  means "not read", and you say so in those words.
+- Record `map_id`, `analysis_json_path`, `duration_seconds`, `used_fallback`,
+  `fallback_evidence`, and the `python_path` the scan reports. The raw analysis
+  is the evidence for every later claim; name its path, and say so when the
+  interpreter that ran is not the one you asked for.
+- A `used_fallback: true` scan read no markings — it is true whenever either
+  extra was missing. Every empty `value` in it means "not read", and you say so
+  in those words.
 
 ### Phase 2: Build the review map
 

@@ -24,7 +24,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{require_str, ToolContext, ToolDef};
+use crate::tools::{require_str, ServerConfig, ToolContext, ToolDef};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -341,6 +341,12 @@ pub(crate) struct RetraceCapability {
     pub python_path: PathBuf,
     pub retrace_version: Option<String>,
     pub extras: RetraceExtras,
+    /// The candidates that were tried and rejected before `python_path` won,
+    /// each with the diagnostic that rejected it. Carried on the capability
+    /// rather than beside it so every consumer of a resolution reports the
+    /// same thing: a fall-through past the interpreter the caller named is
+    /// only visible if the tool that fell through says so.
+    pub candidates_tried: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -435,6 +441,7 @@ pub(crate) async fn resolve_retrace(
                     python_path,
                     retrace_version,
                     extras,
+                    candidates_tried: attempts,
                 });
             }
             Err(detail) => attempts.push(format!("{}: {detail}", candidate.join(" "))),
@@ -478,6 +485,7 @@ fn build_check_response(
                 "python_path": subprocess_arg(&capability.python_path),
                 "retrace_version": capability.retrace_version,
                 "extras": { "detection": extras.detection, "ocr": extras.ocr },
+                "candidates_tried": capability.candidates_tried,
                 "note": note,
             })
         }
@@ -528,6 +536,49 @@ fn derive_fallback(stderr: &str, extras: RetraceExtras) -> (bool, serde_json::Va
             "extras_ocr": extras.ocr,
         }),
     )
+}
+
+/// The `scan_pcb_photo` response. A function rather than a `json!` inside the
+/// handler so the shape is assertable without an interpreter: the handler
+/// around it is 200 lines of subprocess plumbing that no default-run test can
+/// reach.
+fn build_scan_response(
+    map_id: &str,
+    capability: &RetraceCapability,
+    analysis: &RetraceAnalysis,
+    analysis_path: &Path,
+    duration_seconds: f64,
+    stderr: &str,
+) -> serde_json::Value {
+    let (used_fallback, fallback_evidence) = derive_fallback(stderr, capability.extras);
+    json!({
+        "map_id": map_id,
+        "components": analysis.components,
+        "traces": analysis.traces,
+        "pattern_matches": analysis.pattern_matches,
+        "analysis_json_path": subprocess_arg(analysis_path),
+        "duration_seconds": duration_seconds,
+        "used_fallback": used_fallback,
+        "fallback_evidence": fallback_evidence,
+        // Spelled exactly as `check_retrace` spells them (design D15): a scan
+        // run by an interpreter the caller did not name must be visible in the
+        // scan's own result, not inferred from a separate probe call.
+        "python_path": subprocess_arg(&capability.python_path),
+        "candidates_tried": capability.candidates_tried,
+    })
+}
+
+/// The project whose configuration applies to this call: the `project_dir` the
+/// caller named, else the server's configured project.
+///
+/// `check_retrace` and `scan_pcb_photo` both resolve it here. They used to
+/// differ — the probe read `ctx.config.project_dir` while the scan read its
+/// `project_dir` argument — so a Phase-0 capability report could name the
+/// interpreter one project configured while the scan used another's.
+fn config_project_dir(argument: Option<&Path>, config: &ServerConfig) -> Option<PathBuf> {
+    argument
+        .map(Path::to_path_buf)
+        .or_else(|| config.project_dir.clone())
 }
 
 /// The scan's output directory: computed, never supplied. An argument that
@@ -1019,15 +1070,20 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "check_retrace",
             "Report whether the optional `retrace` Python package is usable for PCB photo \
-             analysis: which interpreter resolved, the retrace version, and which optional \
-             extras (detection, ocr) are importable. Absence is reported as a field, never as \
-             an error — call this first to diagnose any scan_pcb_photo failure.",
+             analysis: which interpreter resolved, the retrace version, which optional \
+             extras (detection, ocr) are importable, and which candidates were rejected on \
+             the way there. Absence is reported as a field, never as an error — call this \
+             first to diagnose any scan_pcb_photo failure.",
             json!({
                 "type": "object",
                 "properties": {
                     "python_path": {
                         "type": "string",
                         "description": "Python interpreter to probe. If omitted, uses photo_intake.retrace_python_path, then RETRACE_PYTHON, then PATH discovery."
+                    },
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project whose config supplies photo_intake.retrace_python_path. Optional; defaults to the server's configured project. Pass the same project_dir you will pass to scan_pcb_photo, or this probe may resolve a different interpreter than the scan does."
                     }
                 },
                 "required": []
@@ -1140,7 +1196,9 @@ async fn handle_check_retrace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let config = crate::tools::config::effective_config(ctx.config.project_dir.as_deref()).await;
+    let requested = args["project_dir"].as_str().map(PathBuf::from);
+    let project_dir = config_project_dir(requested.as_deref(), &ctx.config);
+    let config = crate::tools::config::effective_config(project_dir.as_deref()).await;
     let configured = config["photo_intake"]["retrace_python_path"].as_str();
 
     let home = scoped_home_dir()?;
@@ -1154,7 +1212,7 @@ async fn handle_check_retrace(
 
 async fn handle_scan_pcb_photo(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let image_arg = match require_str(args, "image_path") {
         Ok(value) => value.to_string(),
@@ -1173,7 +1231,8 @@ async fn handle_scan_pcb_photo(
         Err(message) => return Ok(CallToolResult::error(message)),
     };
 
-    let config = crate::tools::config::effective_config(Some(&project_dir)).await;
+    let config_dir = config_project_dir(Some(&project_dir), &ctx.config);
+    let config = crate::tools::config::effective_config(config_dir.as_deref()).await;
     let configured_python = config["photo_intake"]["retrace_python_path"].as_str();
     let run_timeout = resolve_scan_timeout(
         args["timeout_seconds"].as_u64(),
@@ -1266,18 +1325,15 @@ async fn handle_scan_pcb_photo(
     };
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let (used_fallback, fallback_evidence) = derive_fallback(&stderr, capability.extras);
 
-    Ok(CallToolResult::json(&json!({
-        "map_id": map_id,
-        "components": analysis.components,
-        "traces": analysis.traces,
-        "pattern_matches": analysis.pattern_matches,
-        "analysis_json_path": subprocess_arg(&analysis_path),
-        "duration_seconds": duration_seconds,
-        "used_fallback": used_fallback,
-        "fallback_evidence": fallback_evidence,
-    })))
+    Ok(CallToolResult::json(&build_scan_response(
+        &map_id,
+        &capability,
+        &analysis,
+        &analysis_path,
+        duration_seconds,
+        &stderr,
+    )))
 }
 
 /// `project_dir` + `map_id` → the review map's file, with every design D13
@@ -1688,6 +1744,7 @@ mod capability_probe_tests {
             python_path: PathBuf::from("C:/py/python.exe"),
             retrace_version: Some("0.3.0".to_string()),
             extras: RetraceExtras { detection, ocr },
+            candidates_tried: Vec::new(),
         }
     }
 
@@ -1731,6 +1788,90 @@ mod capability_probe_tests {
         let note = response["note"].as_str().expect("note");
         assert!(note.contains("contour"), "{note}");
         assert!(note.contains("detection, ocr"), "{note}");
+    }
+
+    /// "Which interpreter did you use" must be answerable from the scan's own
+    /// result, not inferred.
+    ///
+    /// `resolve_retrace` falls through to PATH when an explicit `python_path`
+    /// or the configured `retrace_python_path` fails the import probe (D15).
+    /// Without these two fields a scan run by an interpreter the user never
+    /// named is indistinguishable from one that honoured them — the exact
+    /// hardening `check_retrace` already carries, applied to the tool whose
+    /// output ends up on a board.
+    #[test]
+    fn the_scan_response_names_the_interpreter_that_ran_just_as_check_retrace_does() {
+        let capability = capability(false, false);
+        let analysis = RetraceAnalysis::default();
+        let scan = build_scan_response(
+            "map-1",
+            &capability,
+            &analysis,
+            Path::new(r"C:\proj\.konnect\photo_intake\map-1\analysis.json"),
+            0.6,
+            "",
+        );
+        let probe = build_check_response(Some(&capability), &[]);
+
+        assert_eq!(
+            scan["python_path"], probe["python_path"],
+            "the scan must report the interpreter that ran, spelled as check_retrace spells it"
+        );
+        assert_eq!(scan["python_path"], "C:/py/python.exe");
+        assert_eq!(
+            scan["candidates_tried"], probe["candidates_tried"],
+            "and the candidates it rejected on the way there"
+        );
+
+        // A resolution that had to fall past the caller's interpreter says so
+        // in both tools.
+        let fell_through = RetraceCapability {
+            candidates_tried: vec!["C:/asked/python.exe: no module named retrace".to_string()],
+            ..capability
+        };
+        let scan = build_scan_response(
+            "map-1",
+            &fell_through,
+            &analysis,
+            Path::new("/tmp/analysis.json"),
+            0.6,
+            "",
+        );
+        assert_eq!(
+            scan["candidates_tried"][0],
+            "C:/asked/python.exe: no module named retrace"
+        );
+        assert_eq!(
+            build_check_response(Some(&fell_through), &[])["candidates_tried"],
+            scan["candidates_tried"]
+        );
+    }
+
+    /// `check_retrace` read `ctx.config.project_dir` while `scan_pcb_photo`
+    /// read the `project_dir` argument, so a Phase-0 capability report could
+    /// name a configured interpreter the scan then never used. One resolver,
+    /// both handlers.
+    #[test]
+    fn both_handlers_resolve_the_config_project_the_same_way() {
+        let server = ServerConfig {
+            project_dir: Some(PathBuf::from("/server/project")),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_project_dir(Some(Path::new("/argument/project")), &server),
+            Some(PathBuf::from("/argument/project")),
+            "an explicit project_dir wins"
+        );
+        assert_eq!(
+            config_project_dir(None, &server),
+            Some(PathBuf::from("/server/project")),
+            "otherwise the server's configured project"
+        );
+        assert_eq!(
+            config_project_dir(None, &ServerConfig::default()),
+            None,
+            "and neither means built-in defaults only"
+        );
     }
 
     #[test]
@@ -1882,8 +2023,16 @@ mod scan_contract_tests {
         );
     }
 
+    /// `check_retrace` takes the interpreter to probe and the project whose
+    /// config names one — both optional, nothing else.
+    ///
+    /// `project_dir` was added by the review finding that `check_retrace` read
+    /// `ctx.config.project_dir` while `scan_pcb_photo` read its `project_dir`
+    /// argument: an agent could not ask the probe about the project it was
+    /// about to scan, so the Phase-0 report could name an interpreter the scan
+    /// never used. This test previously pinned `python_path` alone.
     #[test]
-    fn check_schema_offers_only_python_path() {
+    fn check_schema_offers_the_interpreter_and_the_project_whose_config_names_one() {
         let schema = tools()
             .into_iter()
             .find(|tool| tool.name == "check_retrace")
@@ -1892,9 +2041,14 @@ mod scan_contract_tests {
         let properties = schema["properties"].as_object().expect("properties");
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["python_path"]
+            vec!["project_dir", "python_path"]
         );
-        assert_eq!(schema["required"], json!([]));
+        assert_eq!(properties["project_dir"]["type"], json!("string"));
+        assert_eq!(
+            schema["required"],
+            json!([]),
+            "both stay optional — the probe is callable before a project is open"
+        );
     }
 
     #[test]
@@ -2894,6 +3048,24 @@ mod live_retrace_tests {
         assert!(payload["analysis_json_path"].as_str().is_some());
         let duration = payload["duration_seconds"].as_f64().expect("duration");
         assert!(duration > 0.0 && duration < 120.0, "{duration}");
+
+        // The interpreter that actually ran, in the scan's own result: a
+        // resolution that fell past the one the caller named has to be
+        // visible here, not inferred from a separate check_retrace call.
+        let reported = payload["python_path"].as_str().expect("python_path");
+        assert!(
+            Path::new(reported).is_file(),
+            "the scan must name the real interpreter it ran: {payload}"
+        );
+        assert_eq!(
+            Path::new(reported).file_name(),
+            Path::new(&python).file_name(),
+            "the scan ran a different interpreter than RETRACE_PYTHON named: {payload}"
+        );
+        assert!(
+            payload["candidates_tried"].is_array(),
+            "candidates_tried is reported whether or not anything was rejected: {payload}"
+        );
 
         // Design D11's derivation, asserted against all four raw signals.
         let evidence = &payload["fallback_evidence"];

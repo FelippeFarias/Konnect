@@ -38,9 +38,14 @@ never installs it for you.
   to be present) and `photo_intake.retrace_timeout_seconds` (default 120).
 
 `check_retrace` reports which interpreter won, the `retrace_version` it found,
-and which optional extras (detection, ocr) imported. It never returns an error
-for absence — absence is a reported field. Read `candidates_tried` when it
-reports unavailable.
+which optional extras (detection, ocr) imported, and `candidates_tried` — every
+interpreter rejected on the way there. It never returns an error for absence:
+absence is a reported field.
+
+Pass the same `project_dir` to `check_retrace` that you will pass to
+`scan_pcb_photo`. Both read `photo_intake.retrace_python_path` from that
+project's config, and a probe run against a different project can name an
+interpreter the scan never uses.
 
 Without the ML extras, retrace falls back to an OpenCV contour pass: coarse
 labels, `confidence` around 0.5, and no marking, `value` or `part_number` read
@@ -72,20 +77,24 @@ from the approved map.
 Each step ends with evidence. A step without its evidence leaves the intake
 `INCOMPLETE`; say so rather than proceeding.
 
-0. **Capability** — `check_retrace(python_path)`. If `available` is false, stop
-   and report the install command and `candidates_tried`; do not scan. If the
-   extras are absent, tell the user the scan will be contour-only before
-   spending their time on it.
+0. **Capability** — `check_retrace(python_path, project_dir)`. If `available`
+   is false, stop and report the install command and `candidates_tried`; do not
+   scan. If either extra is absent, tell the user the scan will be contour-only
+   before spending their time on it.
 
 1. **Scan** — `scan_pcb_photo(image_path, project_dir)`. It returns `map_id`,
    the detected components and traces, `pattern_matches`, the path to the raw
-   analysis in `analysis_json_path`, `duration_seconds`, `used_fallback` and
-   `fallback_evidence`. The raw analysis is kept under the project as evidence;
-   name its path in your report.
+   analysis in `analysis_json_path`, `duration_seconds`, `used_fallback`,
+   `fallback_evidence`, and — exactly as `check_retrace` reports them — the
+   `python_path` that ran and the `candidates_tried` before it. The raw
+   analysis is kept under the project as evidence; name its path in your
+   report, and say which interpreter produced it when it is not the one the
+   user named.
 
-   `used_fallback: true` means marking, `value` and `part_number` were **never
-   attempted** on this board. Do not present an empty value as "no value
-   printed"; present it as "not read".
+   `used_fallback: true` means marking and `value` were **never attempted** on
+   this board: it is true whenever either extra was missing or either fallback
+   warning was printed. Do not present an empty value as "no value printed";
+   present it as "not read".
 
 2. **Build the review map** — one entry per detected component, carried over
    from the scan, never invented:
