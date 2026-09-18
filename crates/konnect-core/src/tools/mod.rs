@@ -20,6 +20,7 @@ pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
+pub mod photo_intake;
 pub mod placement;
 pub mod project;
 pub mod sch_analysis;

@@ -1,0 +1,104 @@
+{
+  "version": "0.3.0",
+  "timestamp": "2026-09-18T03:22:44Z",
+  "image": "C:/Users/felip/AppData/Local/Temp/claude/C--Users-felip-Documents-FFS-Hardware-Eng-aulas-serie-leds/d5d701e0-3338-44e7-bd88-2563da5d9127/scratchpad/retrace-smoke/board.png",
+  "components": [
+    {
+      "id": "C0000",
+      "label": "resistor",
+      "confidence": 0.5,
+      "bbox": [
+        295,
+        195,
+        51,
+        31
+      ],
+      "marking": "",
+      "part_number": "",
+      "datasheet_url": "",
+      "value": "",
+      "package": ""
+    },
+    {
+      "id": "C0001",
+      "label": "connector",
+      "confidence": 0.5,
+      "bbox": [
+        225,
+        115,
+        271,
+        41
+      ],
+      "marking": "",
+      "part_number": "",
+      "datasheet_url": "",
+      "value": "",
+      "package": ""
+    },
+    {
+      "id": "C0002",
+      "label": "connector",
+      "confidence": 0.5,
+      "bbox": [
+        500,
+        100,
+        61,
+        201
+      ],
+      "marking": "",
+      "part_number": "",
+      "datasheet_url": "",
+      "value": "",
+      "package": ""
+    },
+    {
+      "id": "C0003",
+      "label": "resistor",
+      "confidence": 0.5,
+      "bbox": [
+        100,
+        100,
+        121,
+        81
+      ],
+      "marking": "",
+      "part_number": "",
+      "datasheet_url": "",
+      "value": "",
+      "package": ""
+    }
+  ],
+  "traces": [],
+  "pattern_matches": [
+    {
+      "pattern_name": "pull_up_resistor",
+      "description": "Pull-up resistor from VCC to a signal line",
+      "component_roles": {
+        "resistor": "C0000"
+      },
+      "score": 0.7,
+      "is_partial": false
+    },
+    {
+      "pattern_name": "pull_up_resistor",
+      "description": "Pull-up resistor from VCC to a signal line",
+      "component_roles": {
+        "resistor": "C0003"
+      },
+      "score": 0.7,
+      "is_partial": false
+    }
+  ],
+  "summary": {
+    "image": "C:/Users/felip/AppData/Local/Temp/claude/C--Users-felip-Documents-FFS-Hardware-Eng-aulas-serie-leds/d5d701e0-3338-44e7-bd88-2563da5d9127/scratchpad/retrace-smoke/board.png",
+    "components": 4,
+    "components_by_type": {
+      "resistor": 2,
+      "connector": 2
+    },
+    "traces": 0,
+    "identified": 0,
+    "pattern_matches": 2,
+    "duration_seconds": 0.2
+  }
+}
