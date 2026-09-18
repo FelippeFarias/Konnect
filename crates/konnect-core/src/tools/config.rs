@@ -642,7 +642,7 @@ mod dot_path_and_merge_tests {
     /// the defaults with the documented values — a missing key would send
     /// every scan down interpreter discovery with no timeout of its own.
     ///
-    /// And *only* those keys. `retrace_extras_expected` shipped here with no
+    /// And *only* those keys. An expected-extras list shipped here with no
     /// consumer anywhere in the crate while the skill documented it as "extras
     /// you expect to be present"; a knob nobody reads teaches users to
     /// distrust the ones that work.
