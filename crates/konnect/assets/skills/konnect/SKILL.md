@@ -141,7 +141,7 @@ cost the most when ignored:
 | "Check if board is ready for fab" | 2 | Load `verification` + `design_review` toolsets |
 | "Layout the board" / "place and route" | 1 | Delegate the complete layout to `kicad-pcb-layout-agent`; for a bounded edit, the `kicad-pcb` skill with its methodology and gates |
 | "Move R5 next to U1" | 1 | `load_toolset("pcb_components")` then `get_component_pads` before `move_component` — place by pins, then check the outline |
-| "I have photos of a board" / "reverse engineer this PCB" | 1 | Delegate to `pcb-photo-intake-agent`; it produces an approved review map and never mutates the design |
+| "I have photos of a board, recreate it" / "reverse engineer this PCB" | 1 | Load the `kicad-photo-to-board` skill and run its stages one agent at a time: `pcb-photo-intake-agent` (scan + dossier) → human approval → `pcb-design-reconstruction-agent` (design brief) → human approval → `kicad-schematic-build-agent` → `kicad-pcb-layout-agent`. For intake alone (an approved component and net map, no rebuild), delegate to `pcb-photo-intake-agent` and stop there |
 
 ## KiCAD 10 IPC API Reality
 
@@ -198,10 +198,23 @@ that agent until it hands back a saved, verified result.
   edits.
 - Delegate a reverse-engineering intake — photographs of a physical board — to
   `pcb-photo-intake-agent`. It owns the photo → approved review map boundary
-  only: capability probe, scan, review map, human approval. It never calls a
-  schematic-, board-, or library-mutating tool, and it hands the approved map's
-  path to `kicad-schematic-build-agent`, which re-checks the approval itself
-  before placing a single symbol.
+  only: capability probe, scan, review map, the board `dossier`, human
+  approval. It never calls a schematic-, board-, or library-mutating tool, and
+  it hands the approved map's path back to the session, which invokes the next
+  stage; every consumer re-checks the approval itself before placing a single
+  symbol.
+- Delegate turning an approved `dossier` into a `design_brief` to
+  `pcb-design-reconstruction-agent`. It owns the dossier → design brief
+  boundary only: blocks, calculated values with their derating, a BOM resolved
+  through `search_symbols`/`search_footprints`, and the layout constraint
+  record. It refuses while `approval_valid` is false, never writes a library id
+  a search did not return, and never mutates a schematic, a board or a library
+  part.
+- **Agents do not invoke agents.** Each returns to the session, which reads its
+  five-field block (`stage`, `map_id`, `produced`, `verdict`, `blockers`),
+  shows the human whatever gate that stage's row names, and only then invokes
+  the next one. The `kicad-photo-to-board` skill holds that stage table for the
+  photo-to-board pipeline.
 - Delegate an independent full-design, pre-fabrication, or readiness audit to
   `kicad-design-review-agent`. It gathers and reports evidence without mutating
   the design. Return fixes to the current design owner, then run a fresh review.

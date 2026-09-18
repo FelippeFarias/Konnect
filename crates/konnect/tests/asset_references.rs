@@ -829,6 +829,93 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Values those fields carry, not tools.
         "board_edge_mm",
         "pull_up_resistor",
+        // Structured board-dossier and design-brief fields, not callable
+        // tools. Every name below is a field of the review map's optional
+        // `dossier`/`design_brief` sections, a field of a `prepare_board_photo`
+        // response, or a value one of those fields carries. Derived from this
+        // test's own failures, not from a design draft. `prepare_board_photo`'s
+        // own top-level parameters (`image_path`, `project_dir`, `map_id`,
+        // plus the single-word `crop`/`rotate`/`scale`/`label`) are
+        // deliberately absent: the schemas exempt them, and listing them here
+        // would re-create the phantom allowlist this doc comment warns about.
+        //
+        // `prepare_board_photo` response fields.
+        "exif_orientation",
+        "output_size_px",
+        "source_size_px",
+        // Resolved-scale fields of `scale_reference`.
+        "mm_per_px",
+        // `dossier` sections and the fields of their array elements.
+        "component_survey",
+        "silkscreen_markings",
+        "topology_claims",
+        "retrace_correlation",
+        "photo_views_used",
+        "design_brief_seed",
+        "open_questions",
+        "board_size_px",
+        "board_size_mm",
+        "scale_status",
+        "mounting_holes",
+        "layers_visible",
+        "visual_class",
+        "count_method",
+        "count_confidence",
+        "count_alternatives",
+        "retrace_component_ids",
+        "location_px",
+        "position_px",
+        "claim_id",
+        "resolution_path",
+        "overlap_confidence",
+        "depends_on_open_questions",
+        "rect_px",
+        // `design_brief` sections and the fields of their array elements.
+        "design_brief",
+        "derived_from_dossier",
+        "block_diagram",
+        "calculated_values",
+        "derating_notes",
+        "value_ohms",
+        "kicad_symbol",
+        "kicad_footprint",
+        "resolution_status",
+        "search_terms_used",
+        "physical_constraints",
+        "board_size_status",
+        "max_component_height_mm",
+        "connector_edges",
+        "user_facing_parts",
+        "why_user_facing",
+        "net_currents",
+        "continuous_a",
+        "peak_a",
+        "net_voltages",
+        "nominal_v",
+        "surge_v",
+        "signal_speeds",
+        "frequency_hz",
+        "rise_time_ns",
+        "sensitive_nets",
+        "layer_count",
+        "assembly_notes",
+        "keep_outs",
+        "region_mm",
+        "region_px",
+        "position_mm",
+        "diameter_mm",
+        "pitch_mm",
+        // Values those fields carry, not tools: visual classes, count
+        // methods, hole roles, scale kinds and example block names.
+        "led_5mm_clear",
+        "axial_resistor_tht",
+        "manual_count_by_region",
+        "blob_count",
+        "hough_circles",
+        "plated_corner",
+        "mounting_hole_pitch",
+        "power_input",
+        "led_string_1",
     ];
 
     let mut phantom = Vec::new();

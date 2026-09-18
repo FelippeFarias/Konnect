@@ -69,6 +69,47 @@ load_toolset("photo_intake")
    `saved_path` and `map_id` beside the ERC result, so the schematic is
    traceable to the exact content a human approved.
 
+### Building from an approved design brief
+
+When the work arrives as a `design_brief` from
+`pcb-design-reconstruction-agent` — the same `map_id` and project directory,
+but a reconstructed design rather than a component list — the brief is the
+requirements. Load the intake toolset for this one read:
+
+```
+load_toolset("photo_intake")
+```
+
+1. Call `load_photo_review_map(project_dir, map_id)` yourself and read
+   `map.design_brief`. Never build from the caller's summary of it.
+2. Proceed **only when the response's `approval_valid` is true**. That flag is
+   the second approval checkpoint: adding the brief revoked the dossier's
+   approval, so a map whose brief was never approved reads exactly like one
+   whose dossier was edited. When it is false, stop and report `INCOMPLETE` —
+   the map needs `approve_photo_review_map` from the human who owns it.
+3. Place one real library symbol per `bom` entry whose `resolution_status` is
+   `resolved`, matched via `search_symbols` starting from that entry's own
+   `kicad_symbol` lib_id. The brief's id is the search term, not the licence to
+   skip the search.
+4. **Report `INCOMPLETE` for every `bom` entry whose `resolution_status` is
+   `unresolved`** and place nothing for it. Its `candidates` are the
+   reconstruction agent's near misses, deliberately left unchosen; picking one
+   here is exactly the invention the unresolved marker exists to prevent. Name
+   each skipped entry and its candidates in your report.
+5. Wire the `circuits` topology: each entry's `block` names a
+   `block_diagram` block whose `inputs`/`outputs` are the net names, and its
+   `description` states how the parts inside it connect. Use the `sch_wiring`
+   and `sch_batch` tools. A connection naming a part you did not place is
+   reported, not invented around.
+6. Carry the brief's `calculated_values` into the component values you place,
+   and name in your report any value you had to change and why. The `formula`
+   and `assumptions` beside each one are what make that disagreement
+   reviewable.
+7. From there the workflow below applies unchanged — annotate, save, and
+   collect the same direct evidence, `run_erc` included. Report the map's
+   `saved_path`, its `map_id`, and the brief's `open_questions` beside the ERC
+   result.
+
 ### Build Workflow
 
 **Step 1: Understand Requirements**

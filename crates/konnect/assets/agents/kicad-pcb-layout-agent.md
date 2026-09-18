@@ -49,6 +49,58 @@ load_toolset("project")
 load_toolset("pcb_export")
 ```
 
+### Building from an approved design brief
+
+When the layout arrives as a `design_brief` from
+`pcb-design-reconstruction-agent` — a `map_id` and a project directory beside
+the built schematic — the brief's `physical_constraints` **is** your Phase 1
+constraint record, already written one key per row. Load the intake toolset for
+this one read:
+
+```
+load_toolset("photo_intake")
+```
+
+1. Call `load_photo_review_map(project_dir, map_id)` yourself and read
+   `map.design_brief`. Never lay out from the caller's summary of it.
+2. Proceed **only when the response's `approval_valid` is true** — the
+   server-computed flag, never the map's own `approved` field, which stays
+   `true` on a map edited after approval. When it is false, place nothing and
+   report `INCOMPLETE`: the brief needs `approve_photo_review_map` from the
+   human who owns it.
+3. Fill the Phase 1 constraint table from `physical_constraints` directly, row
+   for row:
+
+   | `layout-methodology.md` section 1 row | `physical_constraints` field(s) |
+   |---|---|
+   | Board dimensions, holes, enclosure, available height | `board_size_mm`, `board_size_status`, `mounting_holes[]`, `enclosure`, `max_component_height_mm` |
+   | Connector positions and access to controls | `connector_edges[]`, `user_facing_parts[]` |
+   | Continuous current, peaks, and transients per net | `net_currents[]` |
+   | Operating voltages and possible surges | `net_voltages[]` |
+   | Frequencies and rise/fall times | `signal_speeds[]` |
+   | Signal sensitivity | `sensitive_nets[]` |
+   | Layer count and stackup | `layer_count`, `stackup` |
+   | Fabricator capability | `fabricator` |
+   | Assembly and test process | `assembly_notes` |
+   | (not a methodology row) | `keep_outs[]` |
+
+4. Treat those values as **hard** constraints, not suggestions: the board size
+   is the outline you create, the mounting-hole positions are fixed placements,
+   the connector edges decide which side each connector sits on, and
+   `keep_outs` are regions nothing may occupy. You do not choose a board size
+   the brief already states.
+5. **Report `INCOMPLETE` rather than choosing a value** when
+   `physical_constraints.unresolved` contains `board_size_mm` or any of the
+   four rows section 1 calls load-bearing: net currents, net voltages,
+   connector position, enclosure. An unresolved row is a question already asked
+   and not yet answered; answering it yourself is how a guessed board size
+   reaches a fabricator.
+6. For any other unresolved row, proceed with a **stated assumption**, written
+   into your own constraint record beside the row it fills.
+7. From there the phases below apply unchanged. Report the map's `saved_path`,
+   its `map_id`, and every unresolved row you assumed past, beside the DRC
+   result.
+
 ### Phase 0: Understand the circuit
 
 - Read the schematic net inventory: `export_netlist_summary`,
