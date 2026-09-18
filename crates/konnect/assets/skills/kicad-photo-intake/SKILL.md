@@ -34,8 +34,7 @@ never installs it for you.
 - Interpreter resolution order: the `python_path` argument, then the
   `photo_intake.retrace_python_path` config key, then the `RETRACE_PYTHON`
   environment variable, then PATH discovery.
-- Other config keys: `photo_intake.retrace_extras_expected` (extras you expect
-  to be present) and `photo_intake.retrace_timeout_seconds` (default 120).
+- Other config keys: `photo_intake.retrace_timeout_seconds` (default 120).
 
 `check_retrace` reports which interpreter won, the `retrace_version` it found,
 which optional extras (detection, ocr) imported, and `candidates_tried` — every

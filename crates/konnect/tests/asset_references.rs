@@ -821,7 +821,6 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "approved_at",
         "content_hash_at_approval",
         "retrace_python_path",
-        "retrace_extras_expected",
         "retrace_timeout_seconds",
         // Values those fields carry, not tools.
         "board_edge_mm",

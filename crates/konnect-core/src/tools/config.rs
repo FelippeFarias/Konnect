@@ -51,13 +51,13 @@ fn default_user_config() -> serde_json::Value {
                 "regulator": { "power": 0.70, "current": 0.80 }
             }
         },
-        // Photo-intake (`retrace`) preferences. All three are safe when
-        // untouched: a null interpreter means "discover one", an empty
-        // extras list means "expect nothing", and the timeout is sized
-        // against the scan the tool actually runs, not a KiCad render.
+        // Photo-intake (`retrace`) preferences. Both are safe when untouched:
+        // a null interpreter means "discover one", and the timeout is sized
+        // against the scan the tool actually runs, not a KiCad render. Every
+        // key here has a reader in `photo_intake.rs` — an unread knob
+        // documented as a preference is a promise the tools do not keep.
         "photo_intake": {
             "retrace_python_path": null,
-            "retrace_extras_expected": [],
             "retrace_timeout_seconds": 120
         }
     })
@@ -601,12 +601,26 @@ mod dot_path_and_merge_tests {
     /// The photo-intake keys the `photo_intake` toolset reads must exist in
     /// the defaults with the documented values — a missing key would send
     /// every scan down interpreter discovery with no timeout of its own.
+    ///
+    /// And *only* those keys. `retrace_extras_expected` shipped here with no
+    /// consumer anywhere in the crate while the skill documented it as "extras
+    /// you expect to be present"; a knob nobody reads teaches users to
+    /// distrust the ones that work.
     #[test]
-    fn default_photo_intake_config_is_present_with_documented_values() {
+    fn default_photo_intake_config_is_exactly_the_keys_something_reads() {
         let user = default_user_config();
         assert_eq!(user["photo_intake"]["retrace_python_path"], json!(null));
-        assert_eq!(user["photo_intake"]["retrace_extras_expected"], json!([]));
         assert_eq!(user["photo_intake"]["retrace_timeout_seconds"], 120);
+        assert_eq!(
+            user["photo_intake"]
+                .as_object()
+                .expect("photo_intake object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["retrace_python_path", "retrace_timeout_seconds"],
+            "every photo_intake config key must have a reader in the crate"
+        );
     }
 
     /// Project config wins over user config for a `photo_intake.*` key, and
