@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**226 tools across 21 on-demand toolsets.** Schematic capture, PCB layout and
+**231 tools across 22 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 226 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 231 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -301,6 +301,13 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   compiles and passes tests in CI but hasn't had per-platform QA yet; both are
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
+- Optional, for the `photo_intake` toolset only (PCB photo reverse
+  engineering): Python 3.10+ with the `retrace` package —
+  `pip install git+https://github.com/ericrihm/retrace.git`. Point Konnect at
+  the interpreter with the `photo_intake.retrace_python_path` config key or the
+  `RETRACE_PYTHON` environment variable, and run `check_retrace` to diagnose:
+  it reports which interpreter resolved and which optional extras imported,
+  and never fails merely because `retrace` is absent.
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, and `rotate_component` can safely fall
   back to a closed board file when IPC is unreachable. `flip_component`

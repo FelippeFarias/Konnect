@@ -789,6 +789,43 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_found",
         "unavailable",
         "ambiguous",
+        // Structured photo-intake response and review-map fields, not callable
+        // tools. Every name here is a field of a `photo_intake` response, a key
+        // of the persisted review map, a `photo_intake.*` config key, or a
+        // value one of those fields carries. The tools' own top-level
+        // parameters (`python_path`, `image_path`, `project_dir`, `map`,
+        // `map_id`, `timeout_seconds`) are deliberately absent: they are
+        // exempted from the schemas, and listing them here would re-create the
+        // phantom allowlist this doc comment warns about.
+        "used_fallback",
+        "fallback_evidence",
+        "retrace_version",
+        "candidates_tried",
+        "analysis_json_path",
+        "duration_seconds",
+        "pattern_matches",
+        "subcircuit_hints",
+        "pattern_name",
+        "component_roles",
+        "is_partial",
+        "component_id",
+        "bbox_px",
+        "footprint_suggestion",
+        "part_number",
+        "source_images",
+        "scale_reference",
+        "review_map",
+        "saved_path",
+        "saved_at",
+        "approval_valid",
+        "approved_at",
+        "content_hash_at_approval",
+        "retrace_python_path",
+        "retrace_extras_expected",
+        "retrace_timeout_seconds",
+        // Values those fields carry, not tools.
+        "board_edge_mm",
+        "pull_up_resistor",
     ];
 
     let mut phantom = Vec::new();

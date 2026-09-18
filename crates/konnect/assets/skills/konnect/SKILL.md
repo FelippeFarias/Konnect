@@ -141,6 +141,7 @@ cost the most when ignored:
 | "Check if board is ready for fab" | 2 | Load `verification` + `design_review` toolsets |
 | "Layout the board" / "place and route" | 1 | Delegate the complete layout to `kicad-pcb-layout-agent`; for a bounded edit, the `kicad-pcb` skill with its methodology and gates |
 | "Move R5 next to U1" | 1 | `load_toolset("pcb_components")` then `get_component_pads` before `move_component` — place by pins, then check the outline |
+| "I have photos of a board" / "reverse engineer this PCB" | 1 | Delegate to `pcb-photo-intake-agent`; it produces an approved review map and never mutates the design |
 
 ## KiCAD 10 IPC API Reality
 
@@ -173,7 +174,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
 | PCB | pcb_board, pcb_components, pcb_routing, pcb_export, placement |
 | Library | library |
-| Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets) |
+| Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets), photo_intake (PCB photo reverse engineering) |
 | Verification & Review | verification, design_review |
 | Config | config |
 | Templates | templates |
@@ -195,6 +196,12 @@ that agent until it hands back a saved, verified result.
   inspection, and save, following the `kicad-pcb` skill's methodology and its
   placement and routing gates. The caller does not make concurrent board
   edits.
+- Delegate a reverse-engineering intake — photographs of a physical board — to
+  `pcb-photo-intake-agent`. It owns the photo → approved review map boundary
+  only: capability probe, scan, review map, human approval. It never calls a
+  schematic-, board-, or library-mutating tool, and it hands the approved map's
+  path to `kicad-schematic-build-agent`, which re-checks the approval itself
+  before placing a single symbol.
 - Delegate an independent full-design, pre-fabrication, or readiness audit to
   `kicad-design-review-agent`. It gathers and reports evidence without mutating
   the design. Return fixes to the current design owner, then run a fresh review.

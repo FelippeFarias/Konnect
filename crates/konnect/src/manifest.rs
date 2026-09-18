@@ -150,6 +150,14 @@ pub const SKILLS: &[SkillManifest] = &[
         content: include_str!("../assets/skills/kicad-library/SKILL.md"),
         references: &[],
     },
+    SkillManifest {
+        name: "kicad-photo-intake",
+        content: include_str!("../assets/skills/kicad-photo-intake/SKILL.md"),
+        references: &[(
+            "review-map-schema.md",
+            include_str!("../assets/skills/kicad-photo-intake/references/review-map-schema.md"),
+        )],
+    },
 ];
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
@@ -166,6 +174,10 @@ pub const AGENTS: &[AgentManifest] = &[
     AgentManifest {
         filename: "kicad-pcb-layout-agent.md",
         content: include_str!("../assets/agents/kicad-pcb-layout-agent.md"),
+    },
+    AgentManifest {
+        filename: "pcb-photo-intake-agent.md",
+        content: include_str!("../assets/agents/pcb-photo-intake-agent.md"),
     },
 ];
 
