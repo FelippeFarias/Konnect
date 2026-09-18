@@ -32,6 +32,9 @@ dirs.workspace = true
 rusqlite.workspace = true
 usvg.workspace = true
 zip.workspace = true
+# `prepare_board_photo` decodes the real board photos (JPEG) and writes PNG
+# views; the live photo_intake test also draws its synthetic board with it.
+image.workspace = true
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
@@ -41,7 +44,3 @@ winreg.workspace = true
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove
 # a reachable-but-rejecting KiCAD never triggers the file-editing fallback.
 nng.workspace = true
-# The photo_intake live test draws its own synthetic board PNG rather than
-# checking in a photo. `image` is already in this crate's tree through
-# konnect-render, so this adds no crate to the build.
-image.workspace = true

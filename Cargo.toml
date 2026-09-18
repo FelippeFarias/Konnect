@@ -87,7 +87,7 @@ usvg = "0.48"
 # tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
 # machines, so a silent renderer bump must be a deliberate decision.
 resvg = "=0.48.1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Pure-Rust git for the vcs toolset (konnect-vcs). No libgit2, no C.
 # Default features for now — the T2.1 spike trims to the plumbing actually
