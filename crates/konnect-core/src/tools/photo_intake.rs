@@ -764,9 +764,85 @@ const UNHASHED_KEYS: [&str; 6] = [
     "subcircuit_hints",
 ];
 
+/// The design D8 fields of one component. The hash projects every element onto
+/// exactly these, so a reviewer annotation nested inside a component is as
+/// invisible to the gate as one at the top level — which is what D8 and D16
+/// promise about the three objects the schema declares open.
+const COMPONENT_CONTENT_KEYS: [&str; 8] = [
+    "component_id",
+    "ref",
+    "type",
+    "value",
+    "footprint_suggestion",
+    "confidence",
+    "bbox_px",
+    "approved",
+];
+
+/// The design D8 fields of one net.
+const NET_CONTENT_KEYS: [&str; 2] = ["connections", "source"];
+
+/// The design D8 fields of the scale reference.
+const SCALE_REFERENCE_CONTENT_KEYS: [&str; 2] = ["kind", "value"];
+
+/// Component fields where retrace's `""` means "never read" (design D1), which
+/// `save` normalizes to `null`. The hash applies the same normalization, or the
+/// save that normalizes would revoke the approval it had just matched.
+const EMPTY_STRING_IS_NULL: [&str; 2] = ["value", "footprint_suggestion"];
+
+/// One object of the review map, projected onto the design D8 fields it is
+/// allowed to contribute to the hash, with D8's own normalization applied.
+///
+/// A value that is not an object at all is hashed verbatim: both writing paths
+/// run `validate_incoming_map` first, so the only caller that can reach a
+/// broken shape is [`approval_is_valid`] on a file someone hand-edited into
+/// nonsense, where no digest can match anyway.
+fn hashed_fields(
+    value: &serde_json::Value,
+    keys: &[&str],
+    empty_string_is_null: &[&str],
+) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut covered = serde_json::Map::new();
+    for key in keys {
+        let mut field = object.get(*key).cloned().unwrap_or(serde_json::Value::Null);
+        if empty_string_is_null.contains(key) && field.as_str() == Some("") {
+            field = serde_json::Value::Null;
+        }
+        covered.insert((*key).to_string(), field);
+    }
+    serde_json::Value::Object(covered)
+}
+
+/// [`hashed_fields`] over an array, keeping stored order (design D16).
+fn hashed_elements(
+    value: Option<&serde_json::Value>,
+    keys: &[&str],
+    empty_string_is_null: &[&str],
+) -> serde_json::Value {
+    match value {
+        Some(serde_json::Value::Array(items)) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| hashed_fields(item, keys, empty_string_is_null))
+                .collect(),
+        ),
+        Some(other) => other.clone(),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// SHA-256, lowercase hex, over a fresh object holding only [`CONTENT_KEYS`],
-/// cloned from `map` — the exact digest form `design_hash.rs:47` already
-/// produces. The one implementation of the gate's "is this still the content a
+/// each of them projected onto the design D8 fields of its own shape
+/// ([`COMPONENT_CONTENT_KEYS`], [`NET_CONTENT_KEYS`],
+/// [`SCALE_REFERENCE_CONTENT_KEYS`]) rather than cloned whole — the exact
+/// digest form `design_hash.rs:47` already produces. Cloning the subtrees put
+/// every key nested inside `components`, `nets` and `scale_reference` in the
+/// hash, so a reviewer note added to a component after the approval revoked
+/// it; those are the three objects D8 declares open precisely so notes can go
+/// there. The one implementation of the gate's "is this still the content a
 /// human said yes to" question; `save_photo_review_map`,
 /// `approve_photo_review_map` and the schematic-build re-check (D6 step 3) all
 /// call it rather than each hashing their own selection.
@@ -784,9 +860,22 @@ const UNHASHED_KEYS: [&str; 6] = [
 pub(crate) fn review_map_content_hash(map: &serde_json::Value) -> String {
     let mut covered = serde_json::Map::new();
     for key in CONTENT_KEYS {
+        let field = map.get(key);
         covered.insert(
             key.to_string(),
-            map.get(key).cloned().unwrap_or(serde_json::Value::Null),
+            match key {
+                "scale_reference" => match field {
+                    Some(value) => hashed_fields(value, &SCALE_REFERENCE_CONTENT_KEYS, &[]),
+                    None => serde_json::Value::Null,
+                },
+                "components" => {
+                    hashed_elements(field, &COMPONENT_CONTENT_KEYS, &EMPTY_STRING_IS_NULL)
+                }
+                "nets" => hashed_elements(field, &NET_CONTENT_KEYS, &[]),
+                // `source_images` is an array of strings: it has no object to
+                // hide an unknown key in.
+                _ => field.cloned().unwrap_or(serde_json::Value::Null),
+            },
         );
     }
     // Serializing a `Value` that was built by cloning cannot fail.
@@ -2410,6 +2499,78 @@ mod review_map_tests {
 
     /// One named edit to a review map, for the coverage table below.
     type MapEdit = (&'static str, Box<dyn Fn(&mut serde_json::Value)>);
+
+    /// The open record's other half: a key the schema does not name is
+    /// invisible to the gate *wherever* it sits, not only at the top level.
+    ///
+    /// The hash used to clone `components`, `nets` and `scale_reference`
+    /// whole, so a reviewer note added to a component after the approval moved
+    /// the digest and silently revoked it — the opposite of what design D8 and
+    /// D16 promise about the three objects they declare open, and the one
+    /// ordering `out_of_schema_keys_survive_a_save_and_load_round_trip` (which
+    /// annotates before approving) cannot reach.
+    #[test]
+    fn unknown_keys_are_outside_the_content_hash_at_every_depth() {
+        let map = fixture_review_map();
+        let baseline = review_map_content_hash(&map);
+
+        let annotations: Vec<MapEdit> = vec![
+            (
+                "a top-level note",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["reviewer_note"] = json!("checked against the photo on 2026-05-01")
+                }),
+            ),
+            (
+                "a per-component note",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["components"][0]["datasheet_url"] = json!("https://example.invalid/r.pdf")
+                }),
+            ),
+            (
+                "a per-net note",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["nets"][0]["measured_with"] = json!("continuity tester")
+                }),
+            ),
+            (
+                "a scale_reference note",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["scale_reference"]["measured_from"] = json!("the silkscreen outline")
+                }),
+            ),
+        ];
+
+        for (what, annotate) in annotations {
+            let mut annotated = map.clone();
+            annotate(&mut annotated);
+            assert_eq!(
+                review_map_content_hash(&annotated),
+                baseline,
+                "{what} must not move the content hash"
+            );
+        }
+    }
+
+    /// D1's `""` → `null` normalization happens before the hash, so the value
+    /// retrace wrote and the value `save` persists are one value to the gate.
+    /// Otherwise the save that normalizes would revoke the approval it had
+    /// just matched.
+    #[test]
+    fn an_empty_string_hashes_as_the_null_save_writes_for_it() {
+        let mut with_null = fixture_review_map();
+        with_null["components"][0]["value"] = serde_json::Value::Null;
+        with_null["components"][0]["footprint_suggestion"] = serde_json::Value::Null;
+        let mut with_empty = fixture_review_map();
+        with_empty["components"][0]["value"] = json!("");
+        with_empty["components"][0]["footprint_suggestion"] = json!("");
+
+        assert_eq!(
+            review_map_content_hash(&with_null),
+            review_map_content_hash(&with_empty),
+            "\"\" and null are the same reading, so they must be the same digest"
+        );
+    }
 
     /// The other half: everything the reviewer actually approved is covered.
     #[test]

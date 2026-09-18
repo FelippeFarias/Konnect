@@ -267,6 +267,108 @@ async fn out_of_schema_keys_survive_a_save_and_load_round_trip() {
     );
 }
 
+/// Annotating a map that is already approved must not close the gate.
+///
+/// `SKILL.md` invites the reviewer to annotate freely and `design.md:98`
+/// promises "an unknown key can never move the hash and can therefore never
+/// grant or revoke approval on its own". It did: `review_map_content_hash`
+/// cloned the `components`, `nets` and `scale_reference` subtrees whole, so a
+/// note added *after* the approval changed the digest and revoked it.
+/// `out_of_schema_keys_survive_a_save_and_load_round_trip` annotates before
+/// `approve`, which is the one ordering that cannot see this.
+#[tokio::test]
+async fn annotations_added_after_approval_keep_the_approval_valid() {
+    let (ctx, defs) = loaded_toolset().await;
+    let project = tempfile::tempdir().expect("tempdir");
+    let project_dir = project.path().canonicalize().expect("canonical project");
+    let map_id = "e2e-late-annotations";
+    mint_map_dir(&project_dir, map_id);
+    let project_arg = project_dir.to_string_lossy().to_string();
+
+    ok(
+        &ctx,
+        &defs,
+        "save_photo_review_map",
+        json!({ "project_dir": project_arg, "map": review_map(map_id, "board.png") }),
+        "save",
+    )
+    .await;
+    ok(
+        &ctx,
+        &defs,
+        "approve_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "approve",
+    )
+    .await;
+
+    // Now annotate, the way the skill tells the reviewer to: keys at the top
+    // level, inside a component, inside a net and inside the scale reference.
+    let loaded = ok(
+        &ctx,
+        &defs,
+        "load_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "load after approval",
+    )
+    .await;
+    assert_eq!(loaded["approval_valid"], json!(true), "precondition");
+    let mut annotated = loaded["map"].clone();
+    annotated["reviewer_note"] = json!("checked against the photo on 2026-05-01");
+    annotated["components"][0]["datasheet_url"] = json!("https://example.invalid/ams1117.pdf");
+    annotated["nets"][0]["measured_with"] = json!("continuity tester");
+    annotated["scale_reference"]["measured_from"] = json!("the silkscreen outline");
+
+    let resaved = ok(
+        &ctx,
+        &defs,
+        "save_photo_review_map",
+        json!({ "project_dir": project_arg, "map": annotated.clone() }),
+        "save with late annotations",
+    )
+    .await;
+    assert_eq!(
+        resaved["approved"],
+        json!(true),
+        "an annotation is not review content, so it must not revoke approval: {resaved}"
+    );
+
+    let reloaded = ok(
+        &ctx,
+        &defs,
+        "load_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "load after annotating",
+    )
+    .await;
+    assert_eq!(reloaded["approval_valid"], json!(true));
+    assert_eq!(
+        reloaded["map"]["nets"][0]["measured_with"],
+        json!("continuity tester")
+    );
+    assert_eq!(
+        reloaded["map"]["scale_reference"]["measured_from"],
+        json!("the silkscreen outline")
+    );
+
+    // And the gate still closes on the thing it is for: one schema field.
+    let mut edited = reloaded["map"].clone();
+    edited["components"][0]["ref"] = json!("U9");
+    let revoked = ok(
+        &ctx,
+        &defs,
+        "save_photo_review_map",
+        json!({ "project_dir": project_arg, "map": edited }),
+        "save with a schema-field edit",
+    )
+    .await;
+    assert_eq!(
+        revoked["approved"],
+        json!(false),
+        "editing a reviewed field must still revoke: {revoked}"
+    );
+}
+
 /// save → load → approve → load → hand-edit → load → save, through the router.
 ///
 /// Every assertion here is about a transition between two tools, which is
