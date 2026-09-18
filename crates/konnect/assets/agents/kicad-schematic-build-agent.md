@@ -33,6 +33,42 @@ load_toolset("project")
 load_toolset("templates")
 ```
 
+### Building from an approved photo-intake map
+
+When the work arrives as a review map from `pcb-photo-intake-agent` — a
+`map_id` and a project directory instead of a requirements list — the map is
+the requirements, and the gate in front of it is not yours to open. Load the
+intake toolset for this one read:
+
+```
+load_toolset("photo_intake")
+```
+
+1. Call `load_photo_review_map(project_dir, map_id)` yourself. Never build from
+   the caller's summary of the map, however confident it sounds.
+2. Proceed **only when the response's `approval_valid` is true**. The server
+   computes that flag from the map's current content. The map's own `approved`
+   field stays true after a post-approval edit, so it is not the gate — reading
+   it instead is exactly how an unreviewed edit reaches a board. When
+   `approval_valid` is false, stop and report `INCOMPLETE`: the map needs
+   `approve_photo_review_map` from the human who owns it, not a rebuild by you.
+3. Place one real library symbol per component whose `approved` is true,
+   matched by its `type` and `value` against a real library search
+   (`search_symbols`), exactly as you match a symbol in a from-scratch build. A
+   component left unapproved is excluded and named in your report — never
+   placed on a guess at what it might be.
+4. Wire only the map's `nets`. Each entry's `connections` are `ref`-to-`ref` (or
+   `ref`-and-pin) endpoints; wire them with the `sch_wiring` and `sch_batch`
+   tools. A connection naming a component you did not place is reported, not
+   invented around.
+5. retrace also emits a synthetic netlist and synthetic KiCad files with
+   arrival-order pin numbering. They are never read, never imported and never
+   used as a pinout: the reviewed map is the only source of connectivity.
+6. From there the workflow below applies unchanged — annotate, save, and
+   collect the same direct evidence, `run_erc` included. Report the map's
+   `saved_path` and `map_id` beside the ERC result, so the schematic is
+   traceable to the exact content a human approved.
+
 ### Build Workflow
 
 **Step 1: Understand Requirements**
