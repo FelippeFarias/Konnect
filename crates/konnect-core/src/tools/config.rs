@@ -140,6 +140,19 @@ fn deep_merge(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_js
     }
 }
 
+/// Design D3's precedence, in one place: project config > user config >
+/// built-in default.
+///
+/// The built-in defaults are merged in explicitly rather than used only as a
+/// read fallback: a user whose `config.json` predates a new key would
+/// otherwise get no value for it at all, since [`read_config`] returns the
+/// file's contents whole when the file parses. Both the [`effective_config`]
+/// accessor and `get_effective_config` go through here, so the configuration
+/// a user inspects is the configuration the tools act on.
+fn layer_configs(user: &serde_json::Value, project: &serde_json::Value) -> serde_json::Value {
+    deep_merge(&deep_merge(&default_user_config(), user), project)
+}
+
 /// The merged configuration a Rust module should read: built-in defaults,
 /// overlaid with the user's config file, overlaid with the project's.
 ///
@@ -147,20 +160,13 @@ fn deep_merge(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_js
 /// `load_user_config`/`get_effective_config` are MCP tools, not functions, so
 /// a module such as `photo_intake` has no other way to read a preference the
 /// user persisted.
-///
-/// The built-in defaults are merged in explicitly rather than used only as a
-/// read fallback: a user whose `config.json` predates a new key would
-/// otherwise get no value for it at all, since [`read_config`] returns the
-/// file's contents whole when the file parses. `handle_get_effective_config`
-/// keeps its own (unchanged) behaviour — this accessor is additive.
 pub(crate) async fn effective_config(project_dir: Option<&Path>) -> serde_json::Value {
     let user = read_config(&user_config_path(), default_user_config()).await;
-    let user = deep_merge(&default_user_config(), &user);
     let project = match project_dir {
         Some(dir) => read_config(&project_config_path(dir), default_project_config()).await,
         None => default_project_config(),
     };
-    deep_merge(&user, &project)
+    layer_configs(&user, &project)
 }
 
 /// Set a value at a dot-notation path, e.g. "fab_constraints.fab_house" = "JLCPCB".
@@ -449,12 +455,14 @@ async fn handle_get_effective_config(
         default_project_config()
     };
 
-    let effective = deep_merge(&user_config, &project_config);
+    // The same layering the `effective_config` accessor performs, so the
+    // configuration a user inspects here is the one the tools act on.
+    let effective = layer_configs(&user_config, &project_config);
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "effective_config": effective,
-            "note": "Merged user defaults + project overrides. Use these values for all design decisions."
+            "note": "Merged built-in defaults + user config + project overrides. Use these values for all design decisions."
         }))
         .unwrap(),
     ))
@@ -596,6 +604,38 @@ mod dot_path_and_merge_tests {
         let project = json!({ "sourcing": { "avl": ["Vishay"] } });
         let merged = deep_merge(&user, &project);
         assert_eq!(merged["sourcing"]["avl"], json!(["Vishay"]));
+    }
+
+    /// Both readers of the effective configuration must layer it the same way.
+    ///
+    /// `handle_get_effective_config` used to merge the user file straight over
+    /// the project file, with no built-in defaults underneath, while the
+    /// `effective_config` accessor `photo_intake` reads layered the defaults
+    /// in. A user whose `config.json` predates a key therefore saw one value
+    /// in the tool and another in the tools that act on it. One function now
+    /// decides the precedence for both.
+    #[test]
+    fn layering_puts_built_in_defaults_under_a_config_file_that_predates_a_key() {
+        // A config.json written before `photo_intake` existed.
+        let user = json!({ "preferred_distributors": ["Digi-Key"] });
+        let layered = layer_configs(&user, &json!({}));
+        assert_eq!(
+            layered["photo_intake"]["retrace_timeout_seconds"], 120,
+            "a key the user's file never heard of must still have its default"
+        );
+        assert_eq!(layered["preferred_distributors"], json!(["Digi-Key"]));
+
+        // D3's precedence, end to end: project > user > built-in default.
+        let user = json!({ "photo_intake": { "retrace_timeout_seconds": 300 } });
+        let project = json!({ "photo_intake": { "retrace_timeout_seconds": 45 } });
+        assert_eq!(
+            layer_configs(&user, &project)["photo_intake"]["retrace_timeout_seconds"],
+            45
+        );
+        assert_eq!(
+            layer_configs(&user, &json!({}))["photo_intake"]["retrace_timeout_seconds"],
+            300
+        );
     }
 
     /// The photo-intake keys the `photo_intake` toolset reads must exist in

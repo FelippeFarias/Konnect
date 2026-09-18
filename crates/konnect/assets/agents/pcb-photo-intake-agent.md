@@ -73,7 +73,10 @@ One entry per detected component, carried over, never invented:
 - `ref` stays null until a human assigns it.
 - `confidence` unchanged; everything below 0.6 is flagged for manual
   identification and listed separately for the user.
-- `value` and `part_number` stay empty when the scan read nothing.
+- `value` stays null when the scan read nothing. The map has no part-number
+  field: retrace's own `part_number` stays in `analysis.json` as evidence.
+- `source_images` is required — the absolute path of every photo the map was
+  read from, filled in before the first save or the save is refused.
 - `approved: false` on every component. You never set it.
 - Nets the scan traced are tagged `traced`; anything you reason out is
   `inferred`; anything the user states is `manual`.
@@ -118,8 +121,8 @@ You do not build the schematic yourself, and you do not follow the build.
    approved map.
 2. Never approve on the user's behalf, and never treat an existing map or a
    finished scan as approval.
-3. Never guess a `value` or a `part_number`; an empty field that says "not
-   read" is the correct answer.
+3. Never guess a `value`; an empty field that says "not read" is the correct
+   answer.
 4. Never hide or round a `confidence`; below 0.6 is flagged, not tidied.
 5. Never estimate the scale reference, and never treat a `subcircuit_hints`
    entry or retrace's synthetic netlist as evidence.

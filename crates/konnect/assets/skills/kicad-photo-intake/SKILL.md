@@ -47,8 +47,8 @@ project's config, and a probe run against a different project can name an
 interpreter the scan never uses.
 
 Without the ML extras, retrace falls back to an OpenCV contour pass: coarse
-labels, `confidence` around 0.5, and no marking, `value` or `part_number` read
-at all. That is a usable starting point for a human review and a terrible source
+labels, `confidence` around 0.5, and no marking, `value` or part number read at
+all. That is a usable starting point for a human review and a terrible source
 of truth.
 
 ---
@@ -103,9 +103,14 @@ Each step ends with evidence. A step without its evidence leaves the intake
    - `confidence` copied unchanged. Anything **below 0.6 is flagged for manual
      identification** — list those rows separately for the user. Never round a
      confidence up, hide a low-confidence row, or "clean up" a coarse label.
-   - `value` and `part_number` stay empty when retrace read nothing. An empty
-     field is the honest answer; a plausible guess is a fabrication that will
-     be soldered.
+   - `value` stays null when retrace read nothing. An empty field is the
+     honest answer; a plausible guess is a fabrication that will be soldered.
+     The review map has no part-number field: retrace's own `part_number`
+     stays in `analysis.json` as evidence, and it reaches the schematic only
+     if a human puts it in `value`.
+   - `source_images` is **required**: put the absolute path of every photo the
+     map was read from in it before the first save, or the save is refused
+     with a schema error.
    - `approved: false` on every component. You never set this.
    - `nets` start from what the scan traced, tagged `traced`; anything you or
      the user reason out is `inferred` or `manual`. Tag it honestly.

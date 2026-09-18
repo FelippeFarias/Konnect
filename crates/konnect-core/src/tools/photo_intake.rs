@@ -2241,9 +2241,6 @@ mod scan_contract_tests {
     }
 }
 
-/// The synthetic board the live test scans. Drawn rather than checked in: no
-/// redistributable real-photo fixture exists, and a drawn board keeps the test
-/// honest about what it proves (plumbing, not recognition accuracy).
 #[cfg(test)]
 mod review_map_tests {
     use super::test_support::{response_json, response_text, test_ctx};
@@ -3014,6 +3011,9 @@ mod review_map_tests {
     }
 }
 
+/// The synthetic board the live tests scan. Drawn rather than checked in: no
+/// redistributable real-photo fixture exists, and a drawn board keeps the test
+/// honest about what it proves (plumbing, not recognition accuracy).
 #[cfg(test)]
 mod synthetic_board {
     use std::path::Path;

@@ -72,9 +72,11 @@ consuming one.
 | `bbox_px` | `[x, y, w, h]` in source-image pixels, copied verbatim from the scan. This is how a reviewer finds the part in the photo. |
 | `approved` | Per-component human decision. Components left `false` are skipped by schematic build, not guessed at. |
 
-A contour-only scan (`used_fallback: true`) never attempted marking, `value` or
-`part_number`. An empty field then means "not read", not "nothing printed on
-the part" — say which in the review.
+A contour-only scan (`used_fallback: true`) never attempted marking or
+`value` — the flag is true whenever either optional extra was missing. An empty
+field then means "not read", not "nothing printed on the part": say which in
+the review. There is no part-number field in this map; retrace's own
+`part_number` stays in `analysis.json` as evidence.
 
 ## `nets[]`
 
