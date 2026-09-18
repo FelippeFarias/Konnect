@@ -194,6 +194,25 @@ fn agents_make_claimed_evidence_executable() {
             &["sch_export", "pcb_export"][..],
             &["run_erc", "get_drc_violations", "INCOMPLETE"][..],
         ),
+        (
+            // Consumes a `design_brief` from `pcb-design-reconstruction-agent`;
+            // `pcb_export` is already loaded for DRC and also carries
+            // `get_drc_violations`, so no extra toolset is needed for the gate.
+            "kicad-pcb-layout-agent.md",
+            &["photo_intake", "pcb_export"][..],
+            &["load_photo_review_map", "approval_valid", "INCOMPLETE"][..],
+        ),
+        (
+            "pcb-design-reconstruction-agent.md",
+            &["photo_intake", "library"][..],
+            &[
+                "load_photo_review_map",
+                "approval_valid",
+                "search_symbols",
+                "search_footprints",
+                "INCOMPLETE",
+            ][..],
+        ),
     ];
     let mut missing = Vec::new();
 
@@ -244,6 +263,38 @@ fn skills_define_the_same_evidence_boundary_as_their_agents() {
                 "Evidence hierarchy",
                 "run_erc",
                 "get_drc_violations",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-board-dossier/SKILL.md",
+            &[
+                "prepare_board_photo",
+                "save_photo_review_map",
+                "observed",
+                "inferred",
+                "open_questions",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-design-reconstruction/SKILL.md",
+            &[
+                "load_photo_review_map",
+                "approval_valid",
+                "search_symbols",
+                "search_footprints",
+                "physical_constraints",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-photo-to-board/SKILL.md",
+            &[
+                "approve_photo_review_map",
+                "approval_valid",
+                "kicad-schematic-build-agent",
+                "kicad-pcb-layout-agent",
                 "INCOMPLETE",
             ][..],
         ),
