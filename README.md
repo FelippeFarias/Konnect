@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**231 tools across 22 on-demand toolsets.** Schematic capture, PCB layout and
+**232 tools across 22 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 231 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 232 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -307,7 +307,10 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   the interpreter with the `photo_intake.retrace_python_path` config key or the
   `RETRACE_PYTHON` environment variable, and run `check_retrace` to diagnose:
   it reports which interpreter resolved and which optional extras imported,
-  and never fails merely because `retrace` is absent.
+  and never fails merely because `retrace` is absent. The full photo →
+  dossier → design brief → schematic → board pipeline, its two human approval
+  gates and its honest limits are described in
+  [docs/PHOTO_TO_BOARD_WORKFLOW.md](docs/PHOTO_TO_BOARD_WORKFLOW.md).
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, and `rotate_component` can safely fall
   back to a closed board file when IPC is unreachable. `flip_component`

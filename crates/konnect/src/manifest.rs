@@ -158,6 +158,29 @@ pub const SKILLS: &[SkillManifest] = &[
             include_str!("../assets/skills/kicad-photo-intake/references/review-map-schema.md"),
         )],
     },
+    SkillManifest {
+        name: "kicad-board-dossier",
+        content: include_str!("../assets/skills/kicad-board-dossier/SKILL.md"),
+        references: &[(
+            "dossier-schema.md",
+            include_str!("../assets/skills/kicad-board-dossier/references/dossier-schema.md"),
+        )],
+    },
+    SkillManifest {
+        name: "kicad-design-reconstruction",
+        content: include_str!("../assets/skills/kicad-design-reconstruction/SKILL.md"),
+        references: &[(
+            "design-brief-schema.md",
+            include_str!(
+                "../assets/skills/kicad-design-reconstruction/references/design-brief-schema.md"
+            ),
+        )],
+    },
+    SkillManifest {
+        name: "kicad-photo-to-board",
+        content: include_str!("../assets/skills/kicad-photo-to-board/SKILL.md"),
+        references: &[],
+    },
 ];
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
@@ -178,6 +201,10 @@ pub const AGENTS: &[AgentManifest] = &[
     AgentManifest {
         filename: "pcb-photo-intake-agent.md",
         content: include_str!("../assets/agents/pcb-photo-intake-agent.md"),
+    },
+    AgentManifest {
+        filename: "pcb-design-reconstruction-agent.md",
+        content: include_str!("../assets/agents/pcb-design-reconstruction-agent.md"),
     },
 ];
 
