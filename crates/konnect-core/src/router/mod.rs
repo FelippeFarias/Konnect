@@ -347,6 +347,39 @@ mod tests {
         }
     }
 
+    /// The `photo_intake` toolset's five tools, in the order the LLM meets
+    /// them: probe, scan, then the three that own the review map's approval
+    /// gate. Order is asserted, not just membership, because `tools/list` is
+    /// read top to bottom and `check_retrace` is the one to call first when a
+    /// scan fails.
+    #[tokio::test]
+    async fn photo_intake_exposes_exactly_its_five_tools_in_order() {
+        let expected = [
+            "check_retrace",
+            "scan_pcb_photo",
+            "save_photo_review_map",
+            "load_photo_review_map",
+            "approve_photo_review_map",
+        ];
+
+        let registered = registry::tools_for("photo_intake").expect("photo_intake is registered");
+        let names: Vec<&str> = registered.iter().map(|def| def.name).collect();
+        assert_eq!(names, expected);
+
+        // And the same five arrive through the router the LLM actually uses.
+        let router = ToolRouter::new();
+        let loaded = router
+            .load("photo_intake")
+            .await
+            .expect("photo_intake loads");
+        let loaded_names: Vec<&str> = loaded.iter().map(|def| def.name).collect();
+        assert_eq!(loaded_names, expected);
+        assert_eq!(
+            router.find_toolset_for_tool("approve_photo_review_map"),
+            Some("photo_intake")
+        );
+    }
+
     #[test]
     fn no_toolset_has_duplicate_tool_names() {
         for meta in registry::ALL_TOOLSETS {

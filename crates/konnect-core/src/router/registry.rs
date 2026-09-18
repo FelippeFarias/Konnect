@@ -117,6 +117,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 9,
     },
     ToolsetMeta {
+        name: "photo_intake",
+        description: "PCB photo reverse engineering via the optional retrace package: capability probe, component scan, and the human-reviewed map its approval gate guards",
+        category: "integration",
+        tool_count: 5,
+    },
+    ToolsetMeta {
         name: "verification",
         description: "DRC, design rules, layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
@@ -188,6 +194,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
         "integration" => Some(integration::tools()),
+        "photo_intake" => Some(photo_intake::tools()),
         "verification" => Some(verification::tools()),
         "config" => Some(config::tools()),
         "design_review" => Some(design_review::tools()),

@@ -27,6 +27,7 @@ use crate::tool;
 use crate::tools::{require_str, ToolContext, ToolDef};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -561,6 +562,320 @@ fn retrace_unavailable_error(attempts: &[String]) -> CallToolResult {
     ))
 }
 
+// ─── Review map: schema, content hash, and paths ──────────────────────────────
+
+/// The review map's file name inside `<project>/.konnect/photo_intake/<map_id>/`.
+const REVIEW_MAP_FILE: &str = "review_map.json";
+
+/// `map_id` is a path component, so it is a token rather than a string: 1..=64
+/// characters of `[A-Za-z0-9_-]`. Stated once here, enforced twice — in the
+/// JSON Schema of the tools that take it directly, and in Rust for every tool,
+/// because `save_photo_review_map` carries it nested inside `map`, where a
+/// top-level schema keyword never reaches (design D13).
+const MAP_ID_PATTERN: &str = "^[A-Za-z0-9_-]{1,64}$";
+
+/// Net provenance. A closed vocabulary because `traced` is a claim about
+/// evidence: a reviewer reading "traced" must be able to trust that the
+/// connection came from the scan and not from a guess spelled differently.
+const NET_SOURCES: [&str; 3] = ["traced", "inferred", "manual"];
+
+/// A persisted review map, in design D8's canonical shape.
+///
+/// This struct is the *validator* for an incoming map, not the transport for a
+/// persisted one: `load_photo_review_map` returns the file's parsed
+/// `serde_json::Value` verbatim so a reviewer's hand edits — including keys
+/// this struct has never heard of — survive a round trip. `save` and `approve`
+/// parse into it to reject a malformed map before anything is written, then
+/// hash and store the JSON object itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhotoReviewMap {
+    /// Server-assigned: `scan_pcb_photo` mints it, nothing else does.
+    pub map_id: String,
+    /// Rewritten on every save; outside the content hash (D16).
+    #[serde(default)]
+    pub saved_at: Option<String>,
+    pub source_images: Vec<String>,
+    /// Always user-supplied — no scan can produce a physical scale.
+    pub scale_reference: ScaleReference,
+    #[serde(default)]
+    pub components: Vec<ReviewComponent>,
+    #[serde(default)]
+    pub nets: Vec<ReviewNet>,
+    /// Advisory and never evidence (D14): optional, may be absent entirely,
+    /// and outside the content hash so a hint can neither confer nor revoke a
+    /// human's approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subcircuit_hints: Option<Vec<RetracePatternMatch>>,
+    /// Server-owned. A client-supplied value is ignored and overwritten (D5).
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub approved_at: Option<String>,
+    #[serde(default)]
+    pub content_hash_at_approval: Option<String>,
+}
+
+/// The physical calibration the reviewer supplies, e.g. `board_edge_mm` / `50`
+/// or `package` / `0805`.
+///
+/// `kind` is deliberately not validated against a closed list: this change
+/// persists the scale reference without consuming it (Slice 2 does the
+/// consuming), so a new kind is additive and inert, and rejecting one here
+/// would be a gate on data no tool reads yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaleReference {
+    pub kind: String,
+    pub value: String,
+}
+
+/// One component under review. `confidence` is required and carried verbatim:
+/// the spec's flagging rule ("below 0.6 is flagged, never auto-corrected")
+/// only works if the number survives the round trip unrounded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewComponent {
+    /// retrace's own id (`C0000`), so every row is traceable to `analysis.json`.
+    pub component_id: String,
+    /// Assigned during review; absent before it.
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub value: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub footprint_suggestion: Option<String>,
+    pub confidence: f64,
+    /// `[x, y, w, h]` in source-image pixels, copied verbatim from retrace.
+    pub bbox_px: [i64; 4],
+    /// Per-component approval, set by a human during review.
+    #[serde(default)]
+    pub approved: bool,
+}
+
+/// One net, as `ref`-to-`ref`-or-pin connections plus where they came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewNet {
+    pub connections: Vec<String>,
+    pub source: String,
+}
+
+/// The fields the approval gate covers, named explicitly rather than derived
+/// by excluding others: an omission is then visible at this list instead of
+/// hiding in a denylist (design D16).
+const CONTENT_KEYS: [&str; 4] = ["source_images", "scale_reference", "components", "nets"];
+
+/// Everything outside the hash: identity, bookkeeping the tools write
+/// themselves (hashing it would make every save revoke its own approval), and
+/// the advisory hints. `CONTENT_KEYS` plus this is every key of design D8.
+/// Only the test that checks this split against the schema reads it, and it
+/// lives here rather than in that test because the split is the decision, not
+/// the assertion.
+#[allow(dead_code)]
+const UNHASHED_KEYS: [&str; 6] = [
+    "map_id",
+    "saved_at",
+    "approved",
+    "approved_at",
+    "content_hash_at_approval",
+    "subcircuit_hints",
+];
+
+/// SHA-256, lowercase hex, over a fresh object holding only [`CONTENT_KEYS`],
+/// cloned from `map` — the exact digest form `design_hash.rs:47` already
+/// produces. The one implementation of the gate's "is this still the content a
+/// human said yes to" question; `save_photo_review_map`,
+/// `approve_photo_review_map` and the schematic-build re-check (D6 step 3) all
+/// call it rather than each hashing their own selection.
+///
+/// Never hash the file's bytes: the user is *supposed* to hand-edit this JSON,
+/// and a whitespace- or key-order-sensitive digest would revoke approval on a
+/// reformat, which teaches people to re-approve without looking.
+///
+/// **Depends on `serde_json`'s `preserve_order` feature being off**, which
+/// makes `serde_json::Map` a `BTreeMap` and so emits object keys sorted at
+/// every depth. Turning it on later would silently change every stored hash
+/// and revoke every approval in the field; `Cargo.toml:30` declares
+/// `serde_json = "1"` with no features, and the feature appears nowhere in the
+/// workspace or lockfile.
+pub(crate) fn review_map_content_hash(map: &serde_json::Value) -> String {
+    let mut covered = serde_json::Map::new();
+    for key in CONTENT_KEYS {
+        covered.insert(
+            key.to_string(),
+            map.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    // Serializing a `Value` that was built by cloning cannot fail.
+    let bytes =
+        serde_json::to_vec(&serde_json::Value::Object(covered)).expect("a cloned Value serializes");
+    format!("{:x}", Sha256::digest(&bytes))
+}
+
+/// Whether the persisted map's own `approved` flag still describes its current
+/// content. Computed server-side so a consumer — the schematic-build re-check
+/// of D6 step 3 above all — re-checks the gate without reimplementing the hash.
+pub(crate) fn approval_is_valid(map: &serde_json::Value) -> bool {
+    map.get("approved") == Some(&serde_json::Value::Bool(true))
+        && map
+            .get("content_hash_at_approval")
+            .and_then(serde_json::Value::as_str)
+            == Some(review_map_content_hash(map).as_str())
+}
+
+// ─── Time ─────────────────────────────────────────────────────────────────────
+
+/// RFC 3339 UTC at second resolution (`2026-09-18T03:22:44Z`).
+///
+/// Hand-rolled because the workspace has no date crate at all — `chrono` and
+/// `time` appear in neither `Cargo.toml` nor `Cargo.lock` — and adding one to
+/// format two timestamps would be a larger change than the arithmetic it
+/// replaces. `civil_from_days` is Hinnant's algorithm, exact for every date
+/// after 0000-03-01.
+fn rfc3339_utc(unix_seconds: i64) -> String {
+    let (year, month, day) = civil_from_days(unix_seconds.div_euclid(86_400));
+    let second_of_day = unix_seconds.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3600,
+        (second_of_day / 60) % 60,
+        second_of_day % 60
+    )
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn now_rfc3339_utc() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    rfc3339_utc(seconds)
+}
+
+// ─── Review-map paths and validation ──────────────────────────────────────────
+
+/// Reject anything that is not [`MAP_ID_PATTERN`] *before* it reaches a path
+/// join. A token rule rejects `/`, `\`, `.`, `..`, `:` and NUL by construction
+/// rather than by blacklist, so there is no traversal spelling left to miss.
+fn validate_map_id(raw: &str) -> Result<(), String> {
+    let length = raw.chars().count();
+    let valid = (1..=64).contains(&length)
+        && raw.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "'map_id' must match {MAP_ID_PATTERN} (1-64 characters of A-Z a-z 0-9 _ -); got \
+             {raw:?}. No file was read or written."
+        ))
+    }
+}
+
+/// The directory of a map that already exists. Unlike [`prepare_map_dir`] it
+/// creates nothing: a `map_id` is server-assigned by `scan_pcb_photo` (D13
+/// rule 3), so a caller naming a directory that is not there is naming a map
+/// that does not exist, not asking for one to be minted.
+fn existing_map_dir(project_dir: &Path, map_id: &str) -> Result<PathBuf, String> {
+    validate_map_id(map_id)?;
+    let map_dir = project_dir
+        .join(".konnect")
+        .join("photo_intake")
+        .join(map_id);
+    let canonical = map_dir.canonicalize().map_err(|error| {
+        format!(
+            "No review map directory for map_id '{map_id}' under {} ({error}). Run \
+             scan_pcb_photo first — map ids are server-assigned.",
+            project_dir.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "'{map_id}' does not name a directory: {}",
+            canonical.display()
+        ));
+    }
+    if !canonical.starts_with(project_dir) {
+        return Err(format!(
+            "Refusing to read or write outside the project: {} resolves to {}, which is not under \
+             {}",
+            map_dir.display(),
+            canonical.display(),
+            project_dir.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Read the persisted map as a `Value`. Deliberately untyped: what is on disk
+/// is what a reviewer last edited, and `load` must hand it back as it found it.
+async fn read_review_map(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = tokio::fs::read_to_string(path).await.map_err(|error| {
+        format!(
+            "No review map at {} ({error}). Call save_photo_review_map first.",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "{} is not valid JSON ({error}). Fix the file by hand — it was left untouched.",
+            path.display()
+        )
+    })?;
+    if !value.is_object() {
+        return Err(format!("{} does not hold a JSON object.", path.display()));
+    }
+    Ok(value)
+}
+
+/// Pretty-printed for the same reason `write_config` (`config.rs:110`) is:
+/// this file exists to be opened and edited by a human.
+async fn write_review_map(path: &Path, map: &serde_json::Value) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(map).map_err(|error| error.to_string())?;
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+/// Parse an incoming map into [`PhotoReviewMap`] to reject a malformed one
+/// before anything is written, and check the one vocabulary the gate's meaning
+/// rests on.
+fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, String> {
+    let parsed: PhotoReviewMap = serde_json::from_value(map.clone()).map_err(|error| {
+        format!(
+            "the review map does not match the review-map schema: {error}. Nothing was written."
+        )
+    })?;
+    validate_map_id(&parsed.map_id)?;
+    for (index, net) in parsed.nets.iter().enumerate() {
+        if !NET_SOURCES.contains(&net.source.as_str()) {
+            return Err(format!(
+                "nets[{index}].source is {:?}; it must be one of {}. Nothing was written.",
+                net.source,
+                NET_SOURCES.join(", ")
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -614,6 +929,74 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["image_path", "project_dir"]
             }),
             |args, ctx| async move { handle_scan_pcb_photo(args, ctx).await }
+        ),
+        tool!(
+            "save_photo_review_map",
+            "Persist a photo review map as editable JSON under \
+             <project_dir>/.konnect/photo_intake/<map_id>/review_map.json. The map's approval \
+             state is server-owned: this tool never grants approval, and any edit to the \
+             reviewed content revokes an approval the map already had.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory the map belongs to."
+                    },
+                    "map": {
+                        "type": "object",
+                        "description": "The full review map. Its map_id must name a scan directory that already exists (scan_pcb_photo assigns it). Approval fields are ignored on input and rewritten by the server."
+                    }
+                },
+                "required": ["project_dir", "map"]
+            }),
+            |args, ctx| async move { handle_save_photo_review_map(args, ctx).await }
+        ),
+        tool!(
+            "load_photo_review_map",
+            "Return a persisted photo review map exactly as it is on disk, including edits made \
+             to the JSON file by hand, plus a server-computed approval_valid flag stating \
+             whether its recorded approval still covers its current content. Any consumer of a \
+             review map must check approval_valid, not the map's own flag.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory the map belongs to."
+                    },
+                    "map_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                        "description": "The map identifier assigned by scan_pcb_photo."
+                    }
+                },
+                "required": ["project_dir", "map_id"]
+            }),
+            |args, ctx| async move { handle_load_photo_review_map(args, ctx).await }
+        ),
+        tool!(
+            "approve_photo_review_map",
+            "Record explicit human approval of a persisted review map: sets its approved flag, \
+             stamps approved_at, and records the hash of the exact content approved. This is \
+             the only way a map becomes approved, and it must be called again after any edit \
+             to the map's components, nets, source images or scale reference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory the map belongs to."
+                    },
+                    "map_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                        "description": "The map identifier assigned by scan_pcb_photo."
+                    }
+                },
+                "required": ["project_dir", "map_id"]
+            }),
+            |args, ctx| async move { handle_approve_photo_review_map(args, ctx).await }
         ),
     ]
 }
@@ -761,6 +1144,174 @@ async fn handle_scan_pcb_photo(
         "duration_seconds": duration_seconds,
         "used_fallback": used_fallback,
         "fallback_evidence": fallback_evidence,
+    })))
+}
+
+/// `project_dir` + `map_id` → the review map's file, with every design D13
+/// rule applied. One implementation, shared by all three map tools, so the
+/// confinement check cannot drift between them.
+fn resolve_map_file(project_arg: &str, map_id: &str) -> Result<PathBuf, String> {
+    let project_dir = canonical_existing_dir(project_arg, "project_dir")?;
+    Ok(existing_map_dir(&project_dir, map_id)?.join(REVIEW_MAP_FILE))
+}
+
+async fn handle_save_photo_review_map(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let Some(map_arg) = args.get("map").filter(|value| value.is_object()) else {
+        return Ok(CallToolResult::error(
+            "'map' is missing or is not a JSON object.",
+        ));
+    };
+    let parsed = match validate_incoming_map(map_arg) {
+        Ok(parsed) => parsed,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let map_file = match resolve_map_file(&project_arg, &parsed.map_id) {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+
+    // Normalizing through the struct means the file is always in design D8's
+    // shape whatever the caller sent, and — the point of D16's float
+    // discipline — the object hashed below is the object written, never one
+    // re-derived from it.
+    let mut value = serde_json::to_value(&parsed)?;
+    let content_hash = review_map_content_hash(&value);
+
+    // Approval survives a save only when the content is exactly what was
+    // approved. The previous state is read from disk; the payload's own
+    // approval fields were never consulted and are about to be overwritten.
+    let previous = read_review_map(&map_file).await.ok();
+    let keeps_approval = previous.as_ref().is_some_and(|previous| {
+        previous.get("approved") == Some(&serde_json::Value::Bool(true))
+            && previous
+                .get("content_hash_at_approval")
+                .and_then(serde_json::Value::as_str)
+                == Some(content_hash.as_str())
+    });
+
+    value["saved_at"] = json!(now_rfc3339_utc());
+    value["approved"] = json!(keeps_approval);
+    // Cleared rather than kept on a revoking save: the only way back to
+    // `approved: true` is a human calling approve_photo_review_map again, so
+    // an edit-then-undo cannot silently restore a gate nobody re-opened.
+    value["approved_at"] = if keeps_approval {
+        previous
+            .as_ref()
+            .and_then(|previous| previous.get("approved_at").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    value["content_hash_at_approval"] = if keeps_approval {
+        json!(content_hash)
+    } else {
+        serde_json::Value::Null
+    };
+
+    if let Err(message) = write_review_map(&map_file, &value).await {
+        return Ok(CallToolResult::error(message));
+    }
+    info!(
+        map_id = %parsed.map_id,
+        components = parsed.components.len(),
+        nets = parsed.nets.len(),
+        approved = keeps_approval,
+        "[BETA] review map saved"
+    );
+
+    Ok(CallToolResult::json(&json!({
+        "map_id": parsed.map_id,
+        "saved_path": subprocess_arg(&map_file),
+        "approved": keeps_approval,
+    })))
+}
+
+async fn handle_load_photo_review_map(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let map_id = match require_str(args, "map_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let map_file = match resolve_map_file(&project_arg, &map_id) {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let map = match read_review_map(&map_file).await {
+        Ok(map) => map,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+
+    // The map is returned as found, hand edits and all — but whether its own
+    // `approved` flag still means anything is answered here rather than left
+    // to the caller, because a caller that recomputes the hash itself is a
+    // caller that can get it wrong.
+    Ok(CallToolResult::json(&json!({
+        "map": map,
+        "approval_valid": approval_is_valid(&map),
+        "saved_path": subprocess_arg(&map_file),
+    })))
+}
+
+async fn handle_approve_photo_review_map(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let map_id = match require_str(args, "map_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let map_file = match resolve_map_file(&project_arg, &map_id) {
+        Ok(path) => path,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let mut map = match read_review_map(&map_file).await {
+        Ok(map) => map,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    // A map broken by a hand edit is not approvable: approval is a statement
+    // about content a human read, and an unparseable component list is not
+    // content anyone read.
+    if let Err(message) = validate_incoming_map(&map) {
+        return Ok(CallToolResult::error(format!(
+            "{} cannot be approved: {message}",
+            map_file.display()
+        )));
+    }
+
+    // Hashed from the value just read, with no round trip in between (D16).
+    let content_hash = review_map_content_hash(&map);
+    let approved_at = now_rfc3339_utc();
+    map["approved"] = json!(true);
+    map["approved_at"] = json!(approved_at);
+    map["content_hash_at_approval"] = json!(content_hash);
+
+    if let Err(message) = write_review_map(&map_file, &map).await {
+        return Ok(CallToolResult::error(message));
+    }
+    info!(map_id = %map_id, "[BETA] review map approved");
+
+    Ok(CallToolResult::json(&json!({
+        "map_id": map_id,
+        "approved": true,
+        "approved_at": approved_at,
+        "content_hash_at_approval": content_hash,
     })))
 }
 
@@ -1135,7 +1686,16 @@ mod scan_contract_tests {
     #[test]
     fn photo_intake_exposes_its_tools_by_name() {
         let names: Vec<&str> = tools().iter().map(|tool| tool.name).collect();
-        assert_eq!(names, vec!["check_retrace", "scan_pcb_photo"]);
+        assert_eq!(
+            names,
+            vec![
+                "check_retrace",
+                "scan_pcb_photo",
+                "save_photo_review_map",
+                "load_photo_review_map",
+                "approve_photo_review_map"
+            ]
+        );
         assert!(
             tools()
                 .iter()
@@ -1284,6 +1844,718 @@ mod scan_contract_tests {
 /// The synthetic board the live test scans. Drawn rather than checked in: no
 /// redistributable real-photo fixture exists, and a drawn board keeps the test
 /// honest about what it proves (plumbing, not recognition accuracy).
+#[cfg(test)]
+mod review_map_tests {
+    use super::test_support::{response_json, response_text, test_ctx};
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../../tests/fixtures/photo_intake/analysis.json");
+
+    /// A project with one scan directory already minted, exactly as
+    /// `scan_pcb_photo` leaves it. Tests go through `prepare_map_dir` rather
+    /// than creating the directory themselves, because a `map_id` whose
+    /// directory the server never minted is a case production cannot reach.
+    fn scanned_project(map_id: &str) -> (tempfile::TempDir, PathBuf) {
+        let project = tempfile::tempdir().expect("temp project");
+        let canonical = project.path().canonicalize().expect("canonical project");
+        prepare_map_dir(&canonical, map_id).expect("scan directory");
+        (project, canonical)
+    }
+
+    fn map_file(project_canonical: &Path, map_id: &str) -> PathBuf {
+        project_canonical
+            .join(".konnect")
+            .join("photo_intake")
+            .join(map_id)
+            .join(REVIEW_MAP_FILE)
+    }
+
+    /// A minimal but complete map in design D8's shape.
+    fn sample_map(map_id: &str) -> serde_json::Value {
+        json!({
+            "map_id": map_id,
+            "saved_at": null,
+            "source_images": ["C:/boards/top.png"],
+            "scale_reference": { "kind": "board_edge_mm", "value": "50" },
+            "components": [
+                {
+                    "component_id": "C0000",
+                    "ref": "R1",
+                    "type": "resistor",
+                    "value": "10k",
+                    "footprint_suggestion": "Resistor_SMD:R_0805_2012Metric",
+                    "confidence": 0.82,
+                    "bbox_px": [295, 195, 51, 31],
+                    "approved": true
+                }
+            ],
+            "nets": [
+                { "connections": ["R1.1", "C2.2"], "source": "traced" }
+            ],
+            "approved": false,
+            "approved_at": null,
+            "content_hash_at_approval": null
+        })
+    }
+
+    /// The fixture's real scan, turned into a review map through the structs a
+    /// reviewer's client would use. Deterministic, so its digest can be pinned.
+    fn fixture_review_map() -> serde_json::Value {
+        let analysis: RetraceAnalysis = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let components: Vec<ReviewComponent> = analysis
+            .components
+            .iter()
+            .enumerate()
+            .map(|(index, component)| ReviewComponent {
+                component_id: component.id.clone(),
+                reference: Some(format!("R{}", index + 1)),
+                kind: component.label.clone(),
+                value: component.value.clone(),
+                footprint_suggestion: None,
+                confidence: component.confidence.unwrap_or_default(),
+                bbox_px: component.bbox,
+                approved: false,
+            })
+            .collect();
+        let map = PhotoReviewMap {
+            map_id: "fixture-map".to_string(),
+            saved_at: Some("2026-09-18T03:22:44Z".to_string()),
+            source_images: vec!["C:/boards/top.png".to_string()],
+            scale_reference: ScaleReference {
+                kind: "board_edge_mm".to_string(),
+                value: "50".to_string(),
+            },
+            components,
+            nets: vec![ReviewNet {
+                connections: vec!["R1.1".to_string(), "R2.2".to_string()],
+                source: "traced".to_string(),
+            }],
+            subcircuit_hints: Some(analysis.pattern_matches.clone()),
+            approved: false,
+            approved_at: None,
+            content_hash_at_approval: None,
+        };
+        serde_json::to_value(&map).expect("review map serializes")
+    }
+
+    async fn save(project: &Path, map: &serde_json::Value) -> CallToolResult {
+        handle_save_photo_review_map(
+            &json!({ "project_dir": project.to_string_lossy(), "map": map }),
+            &test_ctx(),
+        )
+        .await
+        .expect("save returns a result")
+    }
+
+    async fn load(project: &Path, map_id: &str) -> CallToolResult {
+        handle_load_photo_review_map(
+            &json!({ "project_dir": project.to_string_lossy(), "map_id": map_id }),
+            &test_ctx(),
+        )
+        .await
+        .expect("load returns a result")
+    }
+
+    async fn approve(project: &Path, map_id: &str) -> CallToolResult {
+        handle_approve_photo_review_map(
+            &json!({ "project_dir": project.to_string_lossy(), "map_id": map_id }),
+            &test_ctx(),
+        )
+        .await
+        .expect("approve returns a result")
+    }
+
+    // ─── Content hash (task 3.6, design D16) ─────────────────────────────────
+
+    /// Pinned, because the digest is persisted in every approved map in the
+    /// field: if a refactor changes what or how this hashes, every stored
+    /// approval silently becomes invalid, and only a pinned literal turns that
+    /// into a failing test rather than a support ticket.
+    ///
+    /// The literal was derived independently of this implementation — SHA-256
+    /// of Python's `json.dumps(covered, sort_keys=True, separators=(',', ':'))`
+    /// over the same four fields — so it pins the canonical form design D16
+    /// specifies (sorted keys at every depth, no insignificant whitespace),
+    /// not merely whatever `review_map_content_hash` happens to emit.
+    #[test]
+    fn the_content_hash_of_the_fixture_map_is_pinned() {
+        assert_eq!(
+            review_map_content_hash(&fixture_review_map()),
+            "18afc7b999d88ad5ec0320760e920b7099c257d809b5961b0e5a83d1afb0908a"
+        );
+    }
+
+    /// Bookkeeping the tools write themselves, and hints no tool reads, sit
+    /// outside the hash — otherwise every save would revoke its own approval,
+    /// and a re-scan's new hint could revoke a human's.
+    #[test]
+    fn saved_at_and_subcircuit_hints_are_outside_the_content_hash() {
+        let map = fixture_review_map();
+        let baseline = review_map_content_hash(&map);
+
+        for (key, value) in [
+            ("saved_at", json!("1999-01-01T00:00:00Z")),
+            ("subcircuit_hints", json!([])),
+            ("map_id", json!("a-different-id")),
+            ("approved", json!(true)),
+            ("approved_at", json!("1999-01-01T00:00:00Z")),
+            ("content_hash_at_approval", json!("deadbeef")),
+        ] {
+            let mut edited = map.clone();
+            edited[key] = value;
+            assert_eq!(
+                review_map_content_hash(&edited),
+                baseline,
+                "{key} must not affect the content hash"
+            );
+        }
+    }
+
+    /// One named edit to a review map, for the coverage table below.
+    type MapEdit = (&'static str, Box<dyn Fn(&mut serde_json::Value)>);
+
+    /// The other half: everything the reviewer actually approved is covered.
+    #[test]
+    fn editing_any_reviewed_field_changes_the_content_hash() {
+        let map = fixture_review_map();
+        let baseline = review_map_content_hash(&map);
+
+        let edits: Vec<MapEdit> = vec![
+            (
+                "components[0].ref",
+                Box::new(|map: &mut serde_json::Value| map["components"][0]["ref"] = json!("R9")),
+            ),
+            (
+                "components[0].value",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["components"][0]["value"] = json!("22k")
+                }),
+            ),
+            (
+                "components[0].confidence",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["components"][0]["confidence"] = json!(0.51)
+                }),
+            ),
+            (
+                "components[0].approved",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["components"][0]["approved"] = json!(true)
+                }),
+            ),
+            (
+                "components[0].bbox_px",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["components"][0]["bbox_px"] = json!([1, 2, 3, 4])
+                }),
+            ),
+            (
+                "component order",
+                Box::new(|map: &mut serde_json::Value| {
+                    let components = map["components"].as_array_mut().expect("components");
+                    components.swap(0, 1);
+                }),
+            ),
+            (
+                "nets[0].connections",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["nets"][0]["connections"] = json!(["R1.1", "R3.2"])
+                }),
+            ),
+            (
+                "nets[0].source",
+                Box::new(|map: &mut serde_json::Value| map["nets"][0]["source"] = json!("manual")),
+            ),
+            (
+                "source_images",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["source_images"] = json!(["C:/boards/bottom.png"])
+                }),
+            ),
+            (
+                "scale_reference.value",
+                Box::new(|map: &mut serde_json::Value| {
+                    map["scale_reference"]["value"] = json!("60")
+                }),
+            ),
+        ];
+
+        for (what, edit) in edits {
+            let mut edited = map.clone();
+            edit(&mut edited);
+            assert_ne!(
+                review_map_content_hash(&edited),
+                baseline,
+                "editing {what} must change the content hash"
+            );
+        }
+    }
+
+    /// D16's trade-off, made into a test: a field added to design D8 without a
+    /// decision about the hash is an unguarded field. Splitting every schema
+    /// key between the covered list and the excluded list forces that decision.
+    #[test]
+    fn every_schema_key_is_either_hashed_or_deliberately_not() {
+        let map = fixture_review_map();
+        let schema_keys: std::collections::BTreeSet<&str> = map
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let accounted: std::collections::BTreeSet<&str> = CONTENT_KEYS
+            .iter()
+            .chain(UNHASHED_KEYS.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            schema_keys, accounted,
+            "every review-map key must be listed in CONTENT_KEYS or UNHASHED_KEYS"
+        );
+    }
+
+    // ─── Structs (task 3.1) ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_review_map_round_trips_and_tolerates_absent_subcircuit_hints() {
+        let raw = sample_map("round-trip");
+        let parsed: PhotoReviewMap = serde_json::from_value(raw.clone()).expect("parses");
+        assert!(parsed.subcircuit_hints.is_none());
+        assert_eq!(parsed.components[0].reference.as_deref(), Some("R1"));
+        assert_eq!(parsed.components[0].kind.as_deref(), Some("resistor"));
+        assert_eq!(parsed.components[0].bbox_px, [295, 195, 51, 31]);
+
+        // Absent hints stay absent rather than becoming `null`, so a map that
+        // never had them hashes and reads identically before and after.
+        let reserialized = serde_json::to_value(&parsed).expect("serializes");
+        assert!(reserialized.get("subcircuit_hints").is_none());
+        assert_eq!(
+            review_map_content_hash(&reserialized),
+            review_map_content_hash(&raw)
+        );
+    }
+
+    // ─── Time ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rfc3339_utc_matches_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        // A leap day, which is where hand-rolled date arithmetic goes wrong.
+        assert_eq!(rfc3339_utc(1_709_208_000), "2024-02-29T12:00:00Z");
+        assert_eq!(rfc3339_utc(253_402_300_799), "9999-12-31T23:59:59Z");
+        assert!(now_rfc3339_utc().ends_with('Z'));
+    }
+
+    // ─── save_photo_review_map (tasks 3.2, 3.5) ──────────────────────────────
+
+    /// Spec scenario "a freshly scanned map persists as editable JSON".
+    #[tokio::test]
+    async fn a_freshly_scanned_map_persists_as_editable_json() {
+        let (project, canonical) = scanned_project("scan-1");
+        let saved = save(project.path(), &sample_map("scan-1")).await;
+        let body = response_json(&saved);
+        assert_eq!(body["map_id"], "scan-1");
+        assert_eq!(body["approved"], json!(false));
+
+        let path = map_file(&canonical, "scan-1");
+        assert_eq!(body["saved_path"], subprocess_arg(&path));
+        let on_disk = std::fs::read_to_string(&path).expect("file written");
+        assert!(
+            on_disk.contains("\n  \"components\""),
+            "the file a human is asked to edit is pretty-printed:\n{on_disk}"
+        );
+
+        let loaded = response_json(&load(project.path(), "scan-1").await);
+        let stored: serde_json::Value = serde_json::from_str(&on_disk).expect("parses");
+        assert_eq!(loaded["map"], stored);
+        assert_eq!(
+            loaded["map"]["components"],
+            sample_map("scan-1")["components"]
+        );
+        assert_eq!(loaded["map"]["nets"], sample_map("scan-1")["nets"]);
+    }
+
+    /// Spec scenario "low-confidence components are flagged, never
+    /// auto-corrected": the number survives unrounded and nothing is invented
+    /// to fill the fields the scan left empty.
+    #[tokio::test]
+    async fn low_confidence_components_are_flagged_never_auto_corrected() {
+        let (project, _canonical) = scanned_project("low-conf");
+        let mut map = sample_map("low-conf");
+        map["components"][0]["confidence"] = json!(0.43);
+        map["components"][0]["value"] = serde_json::Value::Null;
+        map["components"][0]["footprint_suggestion"] = serde_json::Value::Null;
+        save(project.path(), &map).await;
+
+        let loaded = response_json(&load(project.path(), "low-conf").await);
+        let component = &loaded["map"]["components"][0];
+        assert_eq!(component["confidence"], json!(0.43));
+        assert_eq!(component["value"], serde_json::Value::Null);
+        assert_eq!(component["footprint_suggestion"], serde_json::Value::Null);
+        assert!(
+            component.get("part_number").is_none(),
+            "no part number is synthesized: {component}"
+        );
+    }
+
+    /// Task 3.5 / spec scenario "unapproved map cannot reach schematic build":
+    /// saving is not approving, however the payload is spelled.
+    #[tokio::test]
+    async fn save_alone_never_approves() {
+        let (project, canonical) = scanned_project("never-approves");
+        let mut map = sample_map("never-approves");
+        map["approved"] = json!(true);
+        map["approved_at"] = json!("2026-01-01T00:00:00Z");
+        map["content_hash_at_approval"] = json!(review_map_content_hash(&map));
+
+        let body = response_json(&save(project.path(), &map).await);
+        assert_eq!(body["approved"], json!(false));
+
+        let stored: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(map_file(&canonical, "never-approves")).unwrap(),
+        )
+        .expect("parses");
+        assert_eq!(stored["approved"], json!(false));
+        assert_eq!(stored["approved_at"], serde_json::Value::Null);
+        assert_eq!(stored["content_hash_at_approval"], serde_json::Value::Null);
+        assert!(!approval_is_valid(&stored));
+        assert_eq!(
+            response_json(&load(project.path(), "never-approves").await)["approval_valid"],
+            json!(false)
+        );
+    }
+
+    /// Design D5: a save that changes nothing keeps the approval, so the tools
+    /// do not revoke a gate the human never re-opened over their own
+    /// `saved_at` rewrite.
+    #[tokio::test]
+    async fn resaving_identical_content_keeps_the_approval() {
+        let (project, _canonical) = scanned_project("idempotent");
+        save(project.path(), &sample_map("idempotent")).await;
+        approve(project.path(), "idempotent").await;
+
+        let body = response_json(&save(project.path(), &sample_map("idempotent")).await);
+        assert_eq!(body["approved"], json!(true));
+        let loaded = response_json(&load(project.path(), "idempotent").await);
+        assert_eq!(loaded["map"]["approved"], json!(true));
+        assert_eq!(loaded["approval_valid"], json!(true));
+        // The timestamp of the human's decision is not refreshed by a save.
+        assert!(loaded["map"]["approved_at"].is_string());
+    }
+
+    /// Spec scenario "editing an approved map revokes approval" — and the
+    /// undo does not quietly restore it: only a human calling
+    /// `approve_photo_review_map` can produce that state again.
+    #[tokio::test]
+    async fn editing_an_approved_map_revokes_approval_and_undo_does_not_restore_it() {
+        let (project, _canonical) = scanned_project("revoke");
+        save(project.path(), &sample_map("revoke")).await;
+        approve(project.path(), "revoke").await;
+
+        let mut edited = sample_map("revoke");
+        edited["components"][0]["value"] = json!("47k");
+        let body = response_json(&save(project.path(), &edited).await);
+        assert_eq!(body["approved"], json!(false));
+
+        let loaded = response_json(&load(project.path(), "revoke").await);
+        assert_eq!(loaded["map"]["approved"], json!(false));
+        assert_eq!(loaded["map"]["approved_at"], serde_json::Value::Null);
+        assert_eq!(
+            loaded["map"]["content_hash_at_approval"],
+            serde_json::Value::Null
+        );
+        assert_eq!(loaded["approval_valid"], json!(false));
+
+        // Reverting the edit restores the content, not the approval.
+        let reverted = response_json(&save(project.path(), &sample_map("revoke")).await);
+        assert_eq!(reverted["approved"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn save_rejects_a_malformed_map_and_an_unknown_net_source() {
+        let (project, canonical) = scanned_project("malformed");
+
+        let mut missing_scale = sample_map("malformed");
+        missing_scale
+            .as_object_mut()
+            .unwrap()
+            .remove("scale_reference");
+        let message = response_text(&save(project.path(), &missing_scale).await);
+        assert!(
+            message.contains("scale_reference") && message.contains("Nothing was written"),
+            "{message}"
+        );
+
+        let mut invented_source = sample_map("malformed");
+        invented_source["nets"][0]["source"] = json!("guessed");
+        let message = response_text(&save(project.path(), &invented_source).await);
+        assert!(message.contains("traced, inferred, manual"), "{message}");
+
+        assert!(
+            !map_file(&canonical, "malformed").exists(),
+            "a rejected map must not leave a file behind"
+        );
+    }
+
+    /// Design D13 rule 3: map ids are server-assigned, so a map whose scan
+    /// directory does not exist is a map that does not exist — never a
+    /// directory to mint on the caller's say-so.
+    #[tokio::test]
+    async fn save_refuses_a_map_id_no_scan_ever_assigned() {
+        let (project, canonical) = scanned_project("real-map");
+        let message = response_text(&save(project.path(), &sample_map("invented-map")).await);
+        assert!(message.contains("scan_pcb_photo"), "{message}");
+        assert!(
+            !canonical
+                .join(".konnect")
+                .join("photo_intake")
+                .join("invented-map")
+                .exists(),
+            "no directory is minted for an unknown map id"
+        );
+    }
+
+    // ─── load_photo_review_map (task 3.3) ────────────────────────────────────
+
+    /// Spec scenario "the review map survives across sessions": what comes
+    /// back is what is on disk, including edits made with a text editor
+    /// between sessions.
+    #[tokio::test]
+    async fn the_review_map_survives_across_sessions_with_hand_edits_intact() {
+        let (project, canonical) = scanned_project("sessions");
+        save(project.path(), &sample_map("sessions")).await;
+
+        let path = map_file(&canonical, "sessions");
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parses");
+        stored["components"][0]["ref"] = json!("R42");
+        stored["components"][0]["reviewer_note"] = json!("checked against the photo");
+        std::fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+
+        let loaded = response_json(&load(project.path(), "sessions").await);
+        assert_eq!(loaded["map"]["components"][0]["ref"], json!("R42"));
+        assert_eq!(
+            loaded["map"]["components"][0]["reviewer_note"],
+            json!("checked against the photo"),
+            "a key the struct has never heard of survives the round trip"
+        );
+        assert_eq!(loaded["map"], stored);
+    }
+
+    /// The orchestrator's decision, and design D6 step 3's reason for it: the
+    /// map's own `approved` flag is reported as found, while `approval_valid`
+    /// answers whether it still covers the content — server-side, so a
+    /// consumer never has to recompute the hash to re-check the gate.
+    #[tokio::test]
+    async fn load_reports_approval_valid_false_after_an_out_of_band_edit() {
+        let (project, canonical) = scanned_project("out-of-band");
+        save(project.path(), &sample_map("out-of-band")).await;
+        approve(project.path(), "out-of-band").await;
+
+        let before = response_json(&load(project.path(), "out-of-band").await);
+        assert_eq!(before["map"]["approved"], json!(true));
+        assert_eq!(before["approval_valid"], json!(true));
+
+        // Hand-edit the components straight in the file, bypassing save.
+        let path = map_file(&canonical, "out-of-band");
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parses");
+        stored["components"][0]["value"] = json!("1M");
+        std::fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+
+        let after = response_json(&load(project.path(), "out-of-band").await);
+        assert_eq!(
+            after["map"]["approved"],
+            json!(true),
+            "the file still says what it says"
+        );
+        assert_eq!(
+            after["approval_valid"],
+            json!(false),
+            "but the approval no longer covers this content"
+        );
+
+        // A reformat, by contrast, is not an edit: the hash is over content,
+        // not bytes.
+        std::fs::write(&path, serde_json::to_string(&stored).unwrap()).unwrap();
+        let compact = response_json(&load(project.path(), "out-of-band").await);
+        assert_eq!(compact["approval_valid"], json!(false));
+    }
+
+    /// Design D13 rule 2. The sentinel is a perfectly valid review map placed
+    /// outside the project: if a rejected `map_id` ever reached a path join,
+    /// this is the file that would come back.
+    #[tokio::test]
+    async fn map_id_traversal_is_rejected_and_reads_nothing() {
+        let (project, _canonical) = scanned_project("good-map");
+        let outside = tempfile::tempdir().expect("outside project");
+        let outside_canonical = outside.path().canonicalize().expect("canonical");
+        let stolen_dir = outside_canonical
+            .join(".konnect")
+            .join("photo_intake")
+            .join("secret");
+        std::fs::create_dir_all(&stolen_dir).unwrap();
+        std::fs::write(
+            stolen_dir.join(REVIEW_MAP_FILE),
+            r#"{"map_id": "secret", "stolen": true}"#,
+        )
+        .unwrap();
+        let outside_name = outside_canonical
+            .file_name()
+            .expect("temp dir name")
+            .to_string_lossy()
+            .into_owned();
+
+        let traversal = format!("../../../{outside_name}/.konnect/photo_intake/secret");
+        for bad in [
+            traversal.as_str(),
+            "..",
+            "../good-map",
+            "a/b",
+            r"a\b",
+            "",
+            "has space",
+            "dot.dot",
+            "C:",
+            &"x".repeat(65),
+        ] {
+            for result in [
+                load(project.path(), bad).await,
+                approve(project.path(), bad).await,
+            ] {
+                let message = response_text(&result);
+                assert!(
+                    message.contains("'map_id' must match"),
+                    "{bad:?} must be rejected as a token, got: {message}"
+                );
+                assert!(
+                    !message.contains("stolen"),
+                    "{bad:?} reached the filesystem: {message}"
+                );
+            }
+        }
+
+        // A map id that is a legal token but names another project's map is
+        // still not reachable: the directory is computed under this project.
+        let message = response_text(&load(project.path(), "secret").await);
+        assert!(message.contains("scan_pcb_photo"), "{message}");
+        assert!(!message.contains("stolen"), "{message}");
+    }
+
+    // ─── approve_photo_review_map (task 3.4) ─────────────────────────────────
+
+    /// Spec scenario "approval requires an explicit call": this is the action
+    /// that records the decision, the time it was taken, and exactly what was
+    /// decided about.
+    #[tokio::test]
+    async fn approve_records_the_hash_and_a_timestamp() {
+        let (project, canonical) = scanned_project("approve-1");
+        save(project.path(), &sample_map("approve-1")).await;
+
+        let body = response_json(&approve(project.path(), "approve-1").await);
+        assert_eq!(body["approved"], json!(true));
+        let approved_at = body["approved_at"].as_str().expect("approved_at");
+        assert!(
+            approved_at.ends_with('Z') && approved_at.len() == 20,
+            "{approved_at}"
+        );
+
+        let stored: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(map_file(&canonical, "approve-1")).unwrap(),
+        )
+        .expect("parses");
+        assert_eq!(stored["approved"], json!(true));
+        assert_eq!(stored["approved_at"], json!(approved_at));
+        assert_eq!(
+            stored["content_hash_at_approval"],
+            json!(review_map_content_hash(&stored)),
+            "the recorded hash is the hash of the content that was approved"
+        );
+        assert_eq!(
+            body["content_hash_at_approval"],
+            stored["content_hash_at_approval"]
+        );
+        assert!(approval_is_valid(&stored));
+    }
+
+    /// Approval is a statement about content a human read. A map broken by a
+    /// hand edit is not content anyone read, and approving it would record a
+    /// hash over a shape no consumer can use.
+    #[tokio::test]
+    async fn approve_refuses_a_map_broken_by_a_hand_edit() {
+        let (project, canonical) = scanned_project("broken");
+        save(project.path(), &sample_map("broken")).await;
+        let path = map_file(&canonical, "broken");
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parses");
+        stored["components"][0]["confidence"] = json!("very high");
+        std::fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+
+        let message = response_text(&approve(project.path(), "broken").await);
+        assert!(message.contains("cannot be approved"), "{message}");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parses");
+        assert_eq!(after["approved"], json!(false), "the file was left alone");
+    }
+
+    #[tokio::test]
+    async fn approving_a_map_that_was_never_saved_is_an_error_not_a_new_file() {
+        let (project, canonical) = scanned_project("scanned-not-saved");
+        let message = response_text(&approve(project.path(), "scanned-not-saved").await);
+        assert!(message.contains("save_photo_review_map"), "{message}");
+        assert!(!map_file(&canonical, "scanned-not-saved").exists());
+    }
+
+    // ─── Tool schemas (task 4.2, design D2) ──────────────────────────────────
+
+    fn schema_of(name: &str) -> serde_json::Value {
+        tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is defined"))
+            .input_schema
+    }
+
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_map_tool_schemas_match_design_d2() {
+        let save_schema = schema_of("save_photo_review_map");
+        assert_eq!(property_names(&save_schema), vec!["map", "project_dir"]);
+        assert_eq!(save_schema["required"], json!(["project_dir", "map"]));
+        assert_eq!(save_schema["properties"]["map"]["type"], json!("object"));
+
+        for name in ["load_photo_review_map", "approve_photo_review_map"] {
+            let schema = schema_of(name);
+            assert_eq!(
+                property_names(&schema),
+                vec!["map_id", "project_dir"],
+                "{name}"
+            );
+            assert_eq!(
+                schema["required"],
+                json!(["project_dir", "map_id"]),
+                "{name}"
+            );
+            assert_eq!(
+                schema["properties"]["map_id"]["pattern"],
+                json!(MAP_ID_PATTERN),
+                "{name} enforces the map_id token in its schema too"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod synthetic_board {
     use std::path::Path;
