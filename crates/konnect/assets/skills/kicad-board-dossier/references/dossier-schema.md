@@ -92,7 +92,7 @@ what lets a reviewer tell them apart without reading tone.
 | Field | Meaning |
 |---|---|
 | `position_px` | `[x, y]` of the hole centre in the named view's space. |
-| `role` | What kind of hole: `plated_corner`, `unplated`, a standoff, a keep-out hole. |
+| `role` | What kind of hole. **The string must literally contain `plated` or `unplated`** — `plated_corner`, `unplated`, `plated_standoff` — because plating is the one property a reader needs to filter on, and "corner hole" does not say it. When you cannot tell from the photo, say so in `notes` and use the word you can defend. |
 | `count` | How many holes this entry stands for, when several share a role and a description. |
 | `evidence` | Evidence pointers. |
 
@@ -102,7 +102,7 @@ what lets a reviewer tell them apart without reading tone.
 |---|---|
 | `type` | What it is, as seen: "2-pin screw terminal, 5.08mm pitch". |
 | `location_px` | `[x, y]` in the named view's space. |
-| `edge` | Which board edge it sits on: `bottom`, `left`, `top`, `right`, or `interior`. |
+| `edge` | Which board edge it sits on. **The string must start with `top`, `bottom`, `left` or `right`** — `bottom`, `bottom-left`, `right edge near the holes` — so the side is machine-readable and any refinement follows it. A connector that is not on an edge is `interior`. |
 | `basis` / `confidence` | As everywhere. |
 | `evidence` | Evidence pointers. |
 
@@ -117,13 +117,41 @@ One entry per **visual class** — what the part looks like, not what it does.
 | `count_method` | How that number was reached: `manual_count_by_region`, `blob_count`, `hough_circles`, or your own named method. **A count with no method is not a count.** |
 | `count_confidence` | 0..1, unrounded. |
 | `count_alternatives` | Array of `{method, count, note}` — a second method's number and why you did not use it. Present whenever two methods disagreed. |
-| `locations` | Array of `{region, view, count}`. The per-region counts **sum to** `count`; a total no region accounts for is not traceable. |
+| `locations` | Array — see below. The `observation` entries' counts **sum to** `count`; a total no location accounts for is not traceable. |
 | `retrace_component_ids` | Array of `scan_pcb_photo` component ids correlated to this class, or `[]`. |
 | `notes` | What was not legible at this resolution, e.g. resistor colour bands. |
 
 `count_alternatives` exists to **hold** disagreement, not to resolve it. Two
 methods giving different numbers is the only signal a reviewer has that a count
 is soft; recording only the trusted number throws it away.
+
+### `component_survey[].locations[]`
+
+| Field | Required | Meaning |
+|---|---|---|
+| `region` | yes | Where on the board, in words: "top-left", "near terminal", "right edge". |
+| `view` | yes | The view file this group was counted in, named exactly as an evidence pointer names one. |
+| `rect_px` | yes | `[x, y, w, h]` bounding the group inside that view, so the region is a rectangle a reviewer can open, not a description. |
+| `count` | yes | **Integer.** How many parts of this class are in that rectangle. Never prose, never absent, never "a row of 5" written in `region`. |
+| `kind` | yes | `observation` or `cross_check`. |
+
+**The reconciliation rule:** the class's `count` **equals the sum of `count`
+over the entries whose `kind` is `observation`**. That is the whole point of
+the list — a reviewer, or a script, adds the groups up and gets the total, or
+finds the discrepancy.
+
+- `observation` entries **partition** the class: disjoint regions, each part
+  counted once. Overlapping regions break the sum silently, which is worse than
+  an obviously wrong total.
+- `cross_check` entries are re-counts of ground an `observation` entry already
+  covers — a second method over the same region, a zoomed re-count, a count
+  from the other side of the board. They are **excluded from the sum** and
+  exist so a re-count is recorded rather than discarded.
+
+A dry run that wrote the per-group numbers into prose ("5 parts in a row") and
+mixed re-counts into the same list produced the right total and an unverifiable
+document: nothing could reconcile the groups to the class count. Put the number
+in `count`, and mark every re-count `cross_check`.
 
 ## `silkscreen_markings[]`
 

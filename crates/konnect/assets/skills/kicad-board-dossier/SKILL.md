@@ -137,15 +137,29 @@ with no stated method is not a count.
 
 Then:
 
-- `locations[]` carries one entry per region with its own `count` and the
-  `view` it was read from, and those counts **sum to** `count`. A total no
-  region accounts for is not traceable.
+- `locations[]` carries one entry per group, each with `region`, the `view` it
+  was counted in, the `rect_px` bounding it in that view, an **integer**
+  `count`, and `kind` — `observation` or `cross_check`.
+
+  **The class `count` equals the sum of `count` over the `observation`
+  entries.** That is what makes a total checkable: a reviewer adds the groups
+  up and either reconciles or finds the discrepancy. So keep the
+  `observation` regions **disjoint** — overlapping ones break the sum
+  silently — and mark every re-count of ground already covered (a second
+  method, a zoomed re-count, the same parts seen from the other side) as
+  `cross_check`, which is excluded from the sum.
+
+  Never write the per-group number in prose. "a row of 5 near the terminal" in
+  `region` with no `count` gives a document nobody can reconcile, even when
+  the total is right.
 - `count_confidence` is yours, unrounded.
-- When a second method gives a different number, record it in
-  `count_alternatives` with its own method, its number and a note saying why
-  you trust the one you put in `count`. **Two methods disagreeing is itself
+- When a second method gives a different number for the **whole class**, record
+  it in `count_alternatives` with its own method, its number and a note saying
+  why you trust the one you put in `count`. **Two methods disagreeing is itself
   evidence.** Collapsing it into the trusted number alone throws away the only
-  signal a reviewer has that the count is soft.
+  signal a reviewer has that the count is soft. (A second method over one
+  *region* is a `cross_check` entry in `locations[]`; `count_alternatives` is
+  for a rival total.)
 
 ### 4. Read the silkscreen, and only what is legible
 
@@ -179,12 +193,23 @@ for anything.
 
 ### 6. Physical — pixels always, millimeters only once a scale is resolved
 
-Record `board_size_px`, `mounting_holes[]` (each with `position_px`, a `role`
-such as plated corner or unplated, a `count`, and evidence), `connectors[]`
-(each with its `type`, `location_px`, the `edge` it sits on, `basis`,
-`confidence` and evidence), and `layers_visible` — which layers these
-photographs actually show, so nobody later reads silence about inner layers as
-an absence of them.
+Record `board_size_px`, `mounting_holes[]`, `connectors[]`, and
+`layers_visible` — which layers these photographs actually show, so nobody
+later reads silence about inner layers as an absence of them.
+
+Two strings in here are read by machine as well as by people, so they have a
+fixed shape:
+
+- **`mounting_holes[].role` literally contains `plated` or `unplated`** —
+  `plated_corner`, `unplated`, `plated_standoff`. Plating is the property a
+  reader filters on, and "corner hole" does not state it. Each entry also
+  carries `position_px`, a `count` when it stands for several identical holes,
+  and evidence.
+- **`connectors[].edge` starts with `top`, `bottom`, `left` or `right`** —
+  `bottom`, `bottom-left`, `right edge near the holes`. Any refinement follows
+  the side, so the side stays parseable. A connector that is not on an edge is
+  `interior`. Each entry also carries its `type`, `location_px`, `basis`,
+  `confidence` and evidence.
 
 **`board_size_mm` stays `null` until a scale is resolved**, and a scale is
 resolved in exactly two ways:
@@ -299,8 +324,9 @@ replaces it.
 1. **Never write a claim without evidence** — every claim-bearing object
    carries `basis`, `confidence`, and evidence entries shaped
    `{view, rect_px}` naming a view file or a `source_images` entry.
-2. **Never invent a count** — no method, no count; and `locations[]` sums to
-   `count`.
+2. **Never invent a count** — no method, no count; every `locations[]` entry
+   carries an integer `count` and a `kind`, and the `observation` entries sum
+   to the class `count`.
 3. **Never collapse disagreement** — two counts go in `count_alternatives`,
    two answers go in `hypotheses[]`, both with their own confidence.
 4. **Never estimate a scale** — `mm_per_px` and its `evidence` are written

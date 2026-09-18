@@ -111,7 +111,9 @@ checkable. Show, from `dossier`:
 - the `identity` claim and the silkscreen it was read from;
 - every `component_survey` class with its `count`, its `count_method`, and any
   `count_alternatives` — so a disagreement between two counting methods is
-  visible, not averaged away;
+  visible, not averaged away. Add the per-group `locations` counts up yourself:
+  the `observation` entries must sum to the class total, and a class where they
+  do not is the first thing to send back;
 - `physical`: hole positions, connector positions and edges, and the
   `scale_status` — **say plainly whether the board size in millimeters is
   known**, and what measurement would resolve it;
