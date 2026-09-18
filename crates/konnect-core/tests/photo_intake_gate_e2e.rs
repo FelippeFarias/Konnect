@@ -163,6 +163,110 @@ fn review_map(map_id: &str, image: &str) -> Value {
 
 // ─── The gate chain, no Python required ───────────────────────────────────────
 
+/// A reviewer's annotations must survive the call the skill tells them to make.
+///
+/// `SKILL.md` promises "hand edits survive and are the expected workflow" and
+/// then instructs the agent to re-save after any edit. `save` normalized
+/// through `PhotoReviewMap`, which has no catch-all, so that re-save silently
+/// deleted every key the struct does not name — top-level *and* per-component.
+/// The load path was already correct, and its test proved only the load path.
+#[tokio::test]
+async fn out_of_schema_keys_survive_a_save_and_load_round_trip() {
+    let (ctx, defs) = loaded_toolset().await;
+    let project = tempfile::tempdir().expect("tempdir");
+    let project_dir = project.path().canonicalize().expect("canonical project");
+    let map_id = "e2e-annotations";
+    mint_map_dir(&project_dir, map_id);
+    let project_arg = project_dir.to_string_lossy().to_string();
+
+    let mut incoming = review_map(map_id, "board.png");
+    incoming["reviewer_note"] = json!("checked against the photo on 2026-05-01");
+    incoming["components"][0]["datasheet_url"] = json!("https://example.invalid/ams1117.pdf");
+    incoming["components"][1]["why_unknown"] = json!("obscured by the connector");
+    incoming["nets"][0]["measured_with"] = json!("continuity tester");
+    // retrace writes "" where it read nothing; the save must still normalize
+    // that to null, or "read and empty" and "never read" become the same row.
+    incoming["components"][1]["value"] = json!("");
+
+    ok(
+        &ctx,
+        &defs,
+        "save_photo_review_map",
+        json!({ "project_dir": project_arg, "map": incoming }),
+        "save with annotations",
+    )
+    .await;
+
+    let loaded = ok(
+        &ctx,
+        &defs,
+        "load_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "load",
+    )
+    .await;
+    let map = &loaded["map"];
+    assert_eq!(
+        map["reviewer_note"],
+        json!("checked against the photo on 2026-05-01"),
+        "a top-level annotation was dropped by save: {map}"
+    );
+    assert_eq!(
+        map["components"][0]["datasheet_url"],
+        json!("https://example.invalid/ams1117.pdf"),
+        "a per-component annotation was dropped by save: {map}"
+    );
+    assert_eq!(
+        map["components"][1]["why_unknown"],
+        json!("obscured by the connector")
+    );
+    assert_eq!(map["nets"][0]["measured_with"], json!("continuity tester"));
+
+    // The schema fields still round-trip, and the server still owns approval.
+    assert_eq!(map["components"][0]["ref"], json!("U1"));
+    assert_eq!(map["components"][1]["confidence"], json!(0.5));
+    assert_eq!(
+        map["components"][1]["value"],
+        Value::Null,
+        "preserving unknown keys must not stop the schema keys being normalized"
+    );
+    assert_eq!(map["approved"], json!(false));
+    assert!(map["saved_at"].as_str().expect("saved_at").ends_with('Z'));
+
+    // And the gate still closes over them: approve, then re-save the loaded
+    // map unchanged, and the approval survives because the content did.
+    ok(
+        &ctx,
+        &defs,
+        "approve_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "approve",
+    )
+    .await;
+    let approved = ok(
+        &ctx,
+        &defs,
+        "load_photo_review_map",
+        json!({ "project_dir": project_arg, "map_id": map_id }),
+        "load after approval",
+    )
+    .await;
+    let resaved = ok(
+        &ctx,
+        &defs,
+        "save_photo_review_map",
+        json!({ "project_dir": project_arg, "map": approved["map"].clone() }),
+        "re-save unchanged",
+    )
+    .await;
+    assert_eq!(
+        resaved["approved"],
+        json!(true),
+        "re-saving the loaded map unchanged must not revoke approval — \
+         which it would if save rewrote the annotations away"
+    );
+}
+
 /// save → load → approve → load → hand-edit → load → save, through the router.
 ///
 /// Every assertion here is about a transition between two tools, which is

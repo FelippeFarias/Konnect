@@ -1336,6 +1336,47 @@ async fn handle_scan_pcb_photo(
     )))
 }
 
+/// Lay `normalized` over `incoming`, keeping every key `normalized` does not
+/// mention.
+///
+/// Objects merge key by key; arrays merge element by element with
+/// `normalized`'s length authoritative (a component the struct dropped for
+/// being malformed never gets here — `validate_incoming_map` refused the whole
+/// map first); everything else is replaced outright, `null` included, so
+/// D1's `""` → `null` normalization still lands.
+///
+/// Deliberately *not* `config::deep_merge`: that one treats a `null` overlay
+/// as "no opinion" and keeps the base value, which is exactly backwards here —
+/// "retrace read no marking" is the value being written.
+fn overlay_known_fields(
+    incoming: &serde_json::Value,
+    normalized: serde_json::Value,
+) -> serde_json::Value {
+    match (incoming, normalized) {
+        (serde_json::Value::Object(incoming), serde_json::Value::Object(normalized)) => {
+            let mut merged = incoming.clone();
+            for (key, value) in normalized {
+                let base = merged.get(&key).cloned().unwrap_or(serde_json::Value::Null);
+                merged.insert(key, overlay_known_fields(&base, value));
+            }
+            serde_json::Value::Object(merged)
+        }
+        (serde_json::Value::Array(incoming), serde_json::Value::Array(normalized)) => {
+            serde_json::Value::Array(
+                normalized
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| match incoming.get(index) {
+                        Some(base) => overlay_known_fields(base, value),
+                        None => value,
+                    })
+                    .collect(),
+            )
+        }
+        (_, normalized) => normalized,
+    }
+}
+
 /// `project_dir` + `map_id` → the review map's file, with every design D13
 /// rule applied. One implementation, shared by all three map tools, so the
 /// confinement check cannot drift between them.
@@ -1366,11 +1407,17 @@ async fn handle_save_photo_review_map(
         Err(message) => return Ok(CallToolResult::error(message)),
     };
 
-    // Normalizing through the struct means the file is always in design D8's
-    // shape whatever the caller sent, and — the point of D16's float
-    // discipline — the object hashed below is the object written, never one
-    // re-derived from it.
-    let mut value = serde_json::to_value(&parsed)?;
+    // The struct is the validator, not the transport. Normalizing through it
+    // puts the file in design D8's shape whatever the caller sent — but it has
+    // no catch-all, so serializing it alone deleted every key it does not
+    // name. `SKILL.md` promises hand edits survive and then tells the agent to
+    // re-save after every edit, which made that save the call that destroyed
+    // the reviewer's annotations. Layering the normalized value over the
+    // incoming one keeps both properties: D8's shape (and D1's empty-string
+    // normalization) win on the keys the struct owns, everything else is
+    // carried through untouched. The object hashed below is still the object
+    // written, never one re-derived from it.
+    let mut value = overlay_known_fields(map_arg, serde_json::to_value(&parsed)?);
     let content_hash = review_map_content_hash(&value);
 
     // Approval survives a save only when the content is exactly what was
