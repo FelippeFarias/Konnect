@@ -100,7 +100,10 @@ One image in, one view out; call it once per view. Make a view for each of:
 
 `label` each view for what it shows (`boardA_top_topleft_resistors`), because
 that label is the name every evidence pointer will carry. Unlabelled views are
-numbered, which makes an evidence pointer unreadable a week later.
+numbered, which makes an evidence pointer unreadable a week later. Labels are
+one-shot: reusing a label, or a number that collides after you deleted an
+earlier view, is refused rather than silently replacing the file — pick a
+new label if you meant a different crop.
 
 Coordinates: `crop` is interpreted in the **EXIF-oriented** space the response
 reports as `source_size_px`, not in whatever your own reader displayed. Call

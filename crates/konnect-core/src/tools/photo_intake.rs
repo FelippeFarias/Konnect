@@ -649,6 +649,21 @@ async fn handle_prepare_board_photo(
         None => format!("{}.png", next_view_number(&views_dir)),
     };
     let view_path = views_dir.join(file_name);
+    // Design fix (round-1 review MINOR-4): a reused `label`, or an
+    // auto-assigned number that collides after an earlier view was deleted,
+    // must never silently replace a file. Evidence pointers in an approved
+    // `dossier` name a `{view, rect_px}` pair, and a reviewer relies on that
+    // pair staying stable once approved — an overwritten view can turn an
+    // approved pointer into a picture of something else with no signal at
+    // all. Refuse instead, naming the path so the caller can pick a
+    // different label or remove the old file deliberately.
+    if view_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "{} already exists. prepare_board_photo never overwrites a view: choose a \
+             different label, or remove the existing file yourself if you mean to replace it.",
+            view_path.display()
+        )));
+    }
     if let Err(error) = rendered.image.save(&view_path) {
         return Ok(CallToolResult::error(format!(
             "Could not write {} ({error}).",
@@ -1847,7 +1862,10 @@ pub fn tools() -> Vec<ToolDef> {
              component markings the full photo is too coarse for. One image in, one view out: \
              call it once per view. EXIF orientation is applied first and reported, and crop is \
              interpreted in that oriented space. This tool decodes and re-encodes only — \
-             counting, classification and OCR are yours to do from the views it produces.",
+             counting, classification and OCR are yours to do from the views it produces. \
+             Refuses to overwrite an existing view file — a reused label, or an auto-assigned \
+             number that collides after an earlier view was deleted, is an error naming the \
+             path, never a silent replace.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4615,6 +4633,51 @@ mod board_view_tests {
             "the saved PNG's size is output_size_px, not an aspect-ratio rounding of it"
         );
         assert!(is_red(&view), "the crop landed on the marked corner");
+    }
+
+    /// Round-1 review MINOR-4: a reused `label` (or a colliding auto-assigned
+    /// number) must never silently replace a view. An approved dossier's
+    /// `{view, rect_px}` evidence pointer relies on the file it names staying
+    /// what it was when the pointer was written.
+    #[tokio::test]
+    async fn a_reused_label_is_refused_and_the_original_view_is_unchanged() {
+        let (project, canonical) = scanned_project("reused");
+        let source = write_source(
+            project.path(),
+            "boardA.png",
+            &encode(&corner_marked(40, 20, 10), image::ImageFormat::Png),
+        );
+        let base = json!({
+            "image_path": source.to_string_lossy(),
+            "project_dir": project.path().to_string_lossy(),
+            "map_id": "reused",
+            "crop": { "x": 0, "y": 0, "w": 10, "h": 10 },
+            "label": "boardA_zoom"
+        });
+
+        prepare(base.clone()).await;
+        let view = views_dir(&canonical, "reused").join("boardA_zoom.png");
+        let original_bytes = std::fs::read(&view).expect("the first view was written");
+
+        // Same label, a different crop this time — a naive re-save would
+        // silently swap the file's meaning under an unchanged evidence
+        // pointer.
+        let mut second = base.clone();
+        second["crop"] = json!({ "x": 10, "y": 0, "w": 10, "h": 10 });
+        let result = prepare(second).await;
+
+        assert!(result.is_error, "{}", response_text(&result));
+        assert!(
+            response_text(&result).contains(&view.display().to_string()),
+            "the error names the path that already exists: {}",
+            response_text(&result)
+        );
+
+        let bytes_after = std::fs::read(&view).expect("the original view still exists");
+        assert_eq!(
+            original_bytes, bytes_after,
+            "a refused overwrite must not touch the file already on disk"
+        );
     }
 
     /// The whole reason design D1 orients before it crops: a phone original
