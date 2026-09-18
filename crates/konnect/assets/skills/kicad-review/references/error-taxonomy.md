@@ -58,6 +58,38 @@
 | Missing courtyard | Footprint without courtyard layer |
 | Duplicate footprint | Two footprints with same reference |
 
+## Layout Quality Findings (heuristic until corroborated)
+
+DRC does not report these. They come from pad positions, trace lists,
+placement scores, and the rendered board, and they are classified only once
+a pad position, a trace, or a DRC item corroborates the picture.
+
+### CRITICAL
+
+| Finding | Meaning | Fix |
+|-------|---------|-----|
+| Pad outside outline or inside edge clearance | Anchor placed near the edge; the far pad left the board | Move the part inward; re-read `get_component_pads` |
+| Same-number pads not bridged | Switch or connector node open on copper | Add a trace between the two pad instances |
+| Trace narrower than the current record | Heating or voltage drop in service | Widen per the netclass record |
+
+### WARNING
+
+| Finding | Meaning | Fix |
+|-------|---------|-----|
+| Trace crosses a part body or courtyard | Wrong pad instance chosen, or placement not pin-aware | Reroute from the nearer pad; rotate or move the part |
+| Fast or sensitive trace over a plane slot | Return discontinuity | Reroute over continuous reference, or close the slot |
+| Decoupling loop long | Rail noise; schematic promise not kept | Move the cap to the pin; shorten the return |
+| Noise source beside a sensitive part | Coupling | Move the block; add distance or shielding copper |
+| Connector not at an edge; control unreachable | Assembly or use blocked | Move to the edge the enclosure needs |
+
+### SUGGESTION
+
+| Finding | Meaning |
+|-------|---------|
+| Acute angles, needless direction changes, needless vias | Yield and readability |
+| No test points on supply, GND, or debug signals | Harder bring-up |
+| References unreadable | Assembly and debug |
+
 ## Interpreting Results
 
 When `run_erc` or `get_drc_violations` returns results:

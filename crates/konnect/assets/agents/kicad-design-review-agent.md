@@ -36,7 +36,13 @@ If the project involves PCB layout, also load:
 ```
 load_toolset("pcb_components")
 load_toolset("pcb_routing")
+load_toolset("pcb_board")
+load_toolset("placement")
+load_toolset("project")
 ```
+
+and read the kicad-review skill's `references/layout-review.md` before
+Phase 3. Save the board first: DRC and renders read the saved file.
 
 ### Review Workflow
 
@@ -63,6 +69,23 @@ Execute in this order — do not skip steps:
 - Protection: evaluate exposed interfaces against the stated environment
 - Manufacturing: check footprint assignments, courtyard overlaps, silkscreen readability
 - Thermal: flag high-power components without thermal relief or heatsinking
+
+**Phase 3b: Layout Quality (when a PCB exists)**
+- Every pad of every part inside the outline and the edge clearance
+  (`get_component_pads` against `get_board_extents`); pads sharing a number
+  bridged by copper
+- Placement follows the circuit: blocks along the flow, connectors at edges,
+  controls reachable, noise sources away from sensitive parts, pins facing
+  their destinations (`score_placement`, `get_board_2d_view`)
+- Return paths: no fast or sensitive trace over a reference slot; power
+  returns not shared with sensitive measurements (`query_traces`, rendered
+  plane)
+- Widths and vias against the current record and `get_netclasses`
+- No trace crossing a part body; corners and vias reasonable
+- Assembly, test, and mechanical rows of the layout review table against the
+  constraint record
+- Corroborate every visual finding with a pad position, trace, or DRC item
+  before classifying it
 
 **Phase 4: Best Practice Checks**
 - Pull-ups on open-drain buses (I2C, reset lines)
@@ -98,6 +121,13 @@ Produce a structured Markdown report:
 ## SUGGESTION (nice to have)
 - [ ] Issue description — Rationale
 
+## Layout quality (PCB)
+- Placement: [blocks, flow, pin orientation — evidence]
+- Return paths: [per critical net — evidence]
+- Widths and vias: [against the record — evidence]
+- Assembly/test/mechanical: [evidence]
+- Rendered inspection: [what was seen]
+
 ## Checklist
 - [PASS/FAIL/BLOCKED/N/A] Datasheet-required support circuitry verified
 - [PASS/FAIL/BLOCKED/N/A] Interface protection requirements verified
@@ -106,6 +136,7 @@ Produce a structured Markdown report:
 - [PASS/FAIL/BLOCKED/N/A] DRC collected with `get_drc_violations`
 - [PASS/FAIL/BLOCKED/N/A] Footprint assignments verified
 - [PASS/FAIL/BLOCKED/N/A] Mechanical requirements verified
+- [PASS/FAIL/BLOCKED/N/A] Layout quality reviewed on the saved board (placement, return paths, widths, render)
 
 ## Verdict
 **READY FOR FAB** / **NOT READY — N critical issues** / **INCOMPLETE — required evidence blocked**

@@ -39,13 +39,35 @@
 - [ ] Keep-out zones around antennas/RF sections
 - [ ] Board dimensions match enclosure
 
+### Placement
+- [ ] Constraint record written (size, connectors, currents, voltages, edges, sensitivity, layers, fabricator, assembly)
+- [ ] Functional blocks grouped and ordered along the circuit flow
+- [ ] Every pad of every part inside the outline and the edge clearance (anchor is not the centre)
+- [ ] Parts rotated so pads face their destinations; airwires do not cross bodies
+- [ ] Connectors at edges; buttons, LEDs, displays, test points reachable in the enclosure
+- [ ] Noise sources (inductors, switching nodes, drivers) away from references, crystals, sensitive inputs
+- [ ] Decoupling at the pins it serves with a short loop to rail and return
+- [ ] Hot parts away from temperature-sensitive parts; dissipation planned
+- [ ] Pads sharing one number (switches, connectors) recorded for bridging
+
+### Return paths
+- [ ] A written return path for every critical net (plane, trace, layer changes, stitching vias)
+- [ ] No fast or sensitive trace over a slot or cutout in its reference
+- [ ] Power currents do not share a return segment with sensitive measurements
+- [ ] Ground not split by reflex; blocks separated over one continuous plane
+- [ ] Copper fills checked for islands and bottlenecks
+
 ### Routing
-- [ ] No unrouted nets (ratsnest clear)
-- [ ] Power traces adequately sized for current
+- [ ] Routed in criticality order (supply loops, decoupling → clocks/RF/pairs → sensitive analog → power → rest)
+- [ ] No unrouted nets (ratsnest clear), including bridged same-number pads
+- [ ] Power traces and vias sized from the current record, not a fixed table
+- [ ] Trace widths match the netclass record
+- [ ] No trace crossing a part body or courtyard; traces leave pads toward their destination
 - [ ] Differential pairs length-matched (USB, Ethernet)
 - [ ] No acute angles on traces (acid traps)
 - [ ] Via-in-pad only where needed (adds cost)
-- [ ] Ground pour on back (or both sides)
+- [ ] Ground pour on back (or both sides), refilled after the last change
+- [ ] Board saved before DRC and renders; rendered board inspected
 
 ### DFM (Design for Manufacturing)
 - [ ] All traces/spaces meet fab house minimums
@@ -78,3 +100,7 @@
 | BOM health | `check_bom_health(schematic_scope="hierarchy")` for a hierarchy root |
 | DFM audit | `audit_manufacturing` |
 | Full review | `run_design_review` |
+| Pads inside outline | `get_component_pads` against `get_board_extents` |
+| Placement quality | `score_placement`, `get_board_2d_view` |
+| Trace widths and paths | `query_traces`, `get_netclasses` |
+| Layout quality branch | `references/layout-review.md` |

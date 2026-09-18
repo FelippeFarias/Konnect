@@ -308,6 +308,23 @@ impossible coverage, or contradicts stronger evidence without resolution, the
 result is `INCOMPLETE`. Report the blocked evidence and stop short of a clean or
 production-ready claim.
 
+## Layout handoff
+
+A finished schematic is the input to a layout that starts by understanding
+the circuit. Before handing over to the `kicad-pcb` skill or the
+`kicad-pcb-layout-agent`, write down what the schematic already knows:
+
+- the functional blocks and the current path through them;
+- every net classified as power (with expected current), switching or
+  pulsed, clock / RF / fast edge, sensitive analog or reference, or ordinary;
+- parts that heat, parts that must sit at an edge (connectors, controls,
+  indicators), and decoupling that must sit at a specific pin;
+- supply voltages, isolation, and surge requirements;
+- which of those values are assumptions rather than requirements.
+
+The layout asks the user for anything load-bearing that this handoff leaves
+unknown; it does not guess.
+
 ## Rules
 
 1. **Never edit .kicad_sch files directly** — all changes go through MCP tools

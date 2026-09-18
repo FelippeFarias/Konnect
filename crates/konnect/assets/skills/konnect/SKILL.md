@@ -66,6 +66,8 @@ does not establish that a missing server-side check ran.
 | "Just patch line 247 of the .kicad_sch" | REFUSE | Explain risks, offer MCP alternative |
 | "Add ESD protection to USB lines" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Check if board is ready for fab" | 2 | Load `verification` + `design_review` toolsets |
+| "Layout the board" / "place and route" | 1 | Delegate the complete layout to `kicad-pcb-layout-agent`; for a bounded edit, the `kicad-pcb` skill with its methodology and gates |
+| "Move R5 next to U1" | 1 | `load_toolset("pcb_components")` then `get_component_pads` before `move_component` — place by pins, then check the outline |
 
 ## KiCAD 10 IPC API Reality
 
@@ -114,6 +116,12 @@ that agent until it hands back a saved, verified result.
   rework to `kicad-schematic-build-agent`. It owns schematic mutations through
   placement, wiring, validation, rendering, and save. The caller does not make
   concurrent schematic edits.
+- Delegate a complete PCB layout — placement and routing of a saved
+  schematic — to `kicad-pcb-layout-agent`. It owns board mutations through
+  constraints, sync, placement, netclasses, routing, zones, DRC, rendered
+  inspection, and save, following the `kicad-pcb` skill's methodology and its
+  placement and routing gates. The caller does not make concurrent board
+  edits.
 - Delegate an independent full-design, pre-fabrication, or readiness audit to
   `kicad-design-review-agent`. It gathers and reports evidence without mutating
   the design. Return fixes to the current design owner, then run a fresh review.
@@ -130,6 +138,7 @@ that agent until it hands back a saved, verified result.
 | Reset pull-up | 10k to VCC + 100nF to GND |
 | I2C pull-ups | 4.7k (standard), 2.2k (fast), 1k (fast+) — one set per bus |
 | LED resistor | R = (VCC - Vf) / If |
+| PCB layout order | Constraints → blocks and pins → return paths → route by criticality → save → DRC + rendered inspection (kicad-pcb `references/layout-methodology.md`) |
 
 ## Common Library IDs
 

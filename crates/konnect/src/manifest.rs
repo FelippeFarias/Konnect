@@ -69,6 +69,18 @@ pub const SKILLS: &[SkillManifest] = &[
                 "design-rules.md",
                 include_str!("../assets/skills/kicad-pcb/references/design-rules.md"),
             ),
+            (
+                "layout-methodology.md",
+                include_str!("../assets/skills/kicad-pcb/references/layout-methodology.md"),
+            ),
+            (
+                "placement-gate.md",
+                include_str!("../assets/skills/kicad-pcb/references/placement-gate.md"),
+            ),
+            (
+                "routing-gate.md",
+                include_str!("../assets/skills/kicad-pcb/references/routing-gate.md"),
+            ),
         ],
     },
     SkillManifest {
@@ -97,6 +109,10 @@ pub const SKILLS: &[SkillManifest] = &[
                 "design-checklist.md",
                 include_str!("../assets/skills/kicad-review/references/design-checklist.md"),
             ),
+            (
+                "layout-review.md",
+                include_str!("../assets/skills/kicad-review/references/layout-review.md"),
+            ),
         ],
     },
     SkillManifest {
@@ -116,6 +132,10 @@ pub const AGENTS: &[AgentManifest] = &[
     AgentManifest {
         filename: "kicad-schematic-build-agent.md",
         content: include_str!("../assets/agents/kicad-schematic-build-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-pcb-layout-agent.md",
+        content: include_str!("../assets/agents/kicad-pcb-layout-agent.md"),
     },
 ];
 

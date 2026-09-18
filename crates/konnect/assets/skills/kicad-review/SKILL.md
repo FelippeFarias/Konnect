@@ -34,6 +34,14 @@ load_toolset('sch_analysis')     # get net info, trace connections, inspect comp
 load_toolset('pcb_routing')      # query_traces, get_nets_list
 ```
 
+For the layout-quality branch of a PCB review:
+
+```
+load_toolset('pcb_components')   # get_component_pads, get_component_list, get_board_2d_view
+load_toolset('pcb_board')        # get_board_extents, get_layer_list
+load_toolset('placement')        # score_placement
+```
+
 Always call `get_active_toolsets()` first to see what is already loaded.
 
 ## Evidence hierarchy
@@ -66,6 +74,11 @@ unknown and `owner` is `null`; corroborate with
 - Read [`references/error-taxonomy.md`](references/error-taxonomy.md) when
   classifying a finding or assigning the final verdict. Direct ERC, DRC, and
   connectivity evidence outrank heuristic classifications.
+- Read [`references/layout-review.md`](references/layout-review.md) when the
+  project has a PCB. DRC proves rule compliance; this branch checks that the
+  placement follows the circuit, that return currents have a path, that
+  widths match the current record, and that the board can be assembled and
+  tested. Save before running it: DRC and renders read the saved file.
 
 ---
 
@@ -142,6 +155,34 @@ Checks PCB-level rules:
 - Courtyard overlaps
 
 **Every DRC error must be resolved or explicitly justified before manufacturing.**
+
+A passing DRC means the layout obeyed the rules it was given — not that the
+circuit will work. Incomplete rules approve a bad board. Check
+`get_design_rules` against the fabricator's contract before trusting a clean
+result, then run the layout-quality branch.
+
+---
+
+## Layout Quality (PCB)
+
+Run after ERC and DRC, on the saved board, following
+[`references/layout-review.md`](references/layout-review.md):
+
+1. `get_component_pads` for every part against `get_board_extents`: every pad
+   inside the outline and the edge clearance; pads that share a number are
+   bridged by copper.
+2. `score_placement` and `get_board_2d_view`: blocks grouped along the
+   circuit flow, connectors at edges, controls reachable, noise sources away
+   from sensitive parts, pins facing their destinations, no trace across a
+   part body.
+3. `query_traces` per critical net: width against `get_netclasses` and the
+   current record; the path against the return-path plan; no plane slot
+   crossed.
+4. Assembly, test, thermal, and mechanical rows of the review table against
+   the constraint record.
+
+A visual finding is heuristic until a pad position, trace list, or DRC item
+corroborates it. Report the corroboration with the finding.
 
 ---
 
@@ -246,6 +287,9 @@ report any disagreement.
 | DRC clearance violation            | May cause electrical short on fab board          |
 | Power pin unconnected              | IC will not operate                             |
 | Wrong voltage on IC power pin      | Exceeds absolute maximum, destroys part         |
+| Pad or copper outside the outline / inside edge clearance | Cut by the fabricator or broken ring |
+| Same-number pads not bridged (switch, connector) | Node open on the board; DRC unconnected item |
+| Trace narrower than the current record requires | Heating or voltage drop in service |
 
 ### WARNING — Should fix, design risk
 
@@ -257,6 +301,11 @@ report any disagreement.
 | Single-point-of-failure nets       | No redundancy for critical signals              |
 | Pull-up/pull-down missing          | Floating input, unpredictable behavior          |
 | Tight clearances (near DRC limit)  | Higher fab defect rate                          |
+| Fast or sensitive trace over a reference-plane slot | Return discontinuity, emissions, crosstalk |
+| Decoupling cap far from its pin / long loop | Rail noise; the schematic promise is not kept on copper |
+| Trace crossing a part body, or leaving a pad on the far side | Assembly risk; placement was not pin-aware |
+| Connector not at an edge / control unreachable in the enclosure | Product cannot be assembled or used |
+| Noise source beside a sensitive input, reference, or crystal | Coupling the datasheet warns about |
 
 ### SUGGESTION — Improvement opportunities
 
@@ -321,13 +370,14 @@ Present findings grouped by severity with actionable fix suggestions:
 ### Full Review (comprehensive)
 
 1. Load all review toolsets
-2. Run direct short/connectivity checks, `run_erc`, and `get_drc_violations`
+2. Save, then run direct short/connectivity checks, `run_erc`, and `get_drc_violations`
 3. `run_design_review()` — aggregate audit suite
 4. Check `status`, `coverage`, and `diagnostics`; never approve an incomplete review
-5. Reconcile aggregate or heuristic findings with stronger direct evidence
-6. Classify all gathered findings by severity
-7. Present report with fix suggestions
-8. Offer to fix CRITICAL issues immediately
+5. Layout quality (PCB): the branch above, per `references/layout-review.md`
+6. Reconcile aggregate or heuristic findings with stronger direct evidence
+7. Classify all gathered findings by severity
+8. Present report with fix suggestions, including the `Layout quality` block
+9. Offer to fix CRITICAL issues immediately
 
 ### Pre-Manufacturing Review
 

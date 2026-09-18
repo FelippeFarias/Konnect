@@ -75,6 +75,17 @@ load_toolset("templates")
 - If a required check cannot run or its coverage is structurally impossible,
   report `INCOMPLETE` and identify the blocked evidence
 
+**Step 8: Write the layout handoff**
+- The PCB layout starts by understanding the circuit; hand it what the
+  schematic already knows so it is not re-derived or guessed
+- Name the functional blocks and the current path through them
+- Classify every net: power (expected current), switching or pulsed, clock,
+  RF or fast edge, sensitive analog or reference, ordinary signal
+- Name the parts that heat, the parts that must sit at an edge (connectors,
+  controls, indicators), and the decoupling that must sit at a specific pin
+- State the supply voltages and any isolation or surge requirement
+- Mark every value that is an assumption rather than a requirement
+
 ### Placement Rules
 
 | Element | Position |
@@ -137,4 +148,12 @@ When the circuit is complete, provide:
 ## Unresolved Concerns
 - [Any design decisions that need user input]
 - [Component selections that depend on specific requirements]
+
+## Layout Handoff
+- Blocks and current path: [connector → protection → ... → load]
+- Net classes: [net → power (I) / switching / clock-RF / sensitive / ordinary]
+- Edge and access requirements: [connectors, controls, indicators]
+- Thermal and decoupling constraints: [part → requirement]
+- Supply voltages, isolation, surge: [values, or "unknown — ask"]
+- Assumptions: [each value not backed by a requirement]
 ```

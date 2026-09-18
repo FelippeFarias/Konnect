@@ -2,8 +2,9 @@
 name: kicad-pcb
 description: |
   Workflow skill for KiCAD PCB layout and routing via MCP tools. Triggers on: "layout the board",
-  "route traces", "PCB", "place footprints", "copper pour", "board outline", "differential pair",
-  "board setup", "track width", "via", "zone", "design rules", "stackup", "silkscreen".
+  "route traces", "PCB", "place footprints", "place components", "placement", "copper pour",
+  "board outline", "differential pair", "board setup", "track width", "via", "zone", "design rules",
+  "stackup", "silkscreen", "return path", "layout methodology", "spaghetti board".
 argument-hint: "[layout task]"
 ---
 
@@ -11,6 +12,18 @@ argument-hint: "[layout task]"
 
 This skill guides Claude to perform PCB layout using Konnect MCP tools.
 ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
+
+Layout is not "connect the schematic's dots". The order is: understand the
+circuit → write the constraints → plan layers and return currents → place by
+functional block with pins facing their destinations → validate the critical
+paths → route by criticality → review → measure. A visually tidy board is not
+necessarily an electrically good one; a good placement removes most routing
+problems before the first trace exists. Read
+[`references/layout-methodology.md`](references/layout-methodology.md) before
+any placement or routing task, and close the two gates —
+[`references/placement-gate.md`](references/placement-gate.md) before routing
+and [`references/routing-gate.md`](references/routing-gate.md) before claiming
+completion.
 
 ---
 
@@ -68,6 +81,15 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ### References by decision
 
+- Read [`references/layout-methodology.md`](references/layout-methodology.md)
+  at the start of any placement or routing work: constraint record,
+  block-and-flow placement, placement order, return-path planning, routing
+  priority, and the final review table.
+- Read [`references/placement-gate.md`](references/placement-gate.md) when
+  placement is believed done. Routing does not start until it passes.
+- Read [`references/routing-gate.md`](references/routing-gate.md) before the
+  first trace (pad selection and path rules) and again before reporting the
+  layout complete (post-routing evidence).
 - Read [`references/layer-reference.md`](references/layer-reference.md) when
   selecting a copper, fabrication, user, or mechanical layer or deciding which
   side owns an item.
@@ -79,21 +101,35 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ---
 
-## Layout Order
+## Layout Workflow
 
-Follow this sequence for a clean PCB workflow:
+Follow this sequence. Each phase ends with evidence; a phase without its
+evidence leaves the layout `INCOMPLETE`.
 
-1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
+0. **Understand the circuit** — read the net inventory from the saved
+   schematic (`export_netlist_summary`, `list_schematic_nets`,
+   `get_net_components` in `sch_analysis` / `sch_export`). Name the
+   functional blocks and the current path through them. Classify every net:
+   power (with current), switching or pulsed, clock/RF/fast edge, sensitive
+   analog or reference, ordinary signal. Use the schematic build's layout
+   handoff when one exists.
+1. **Constraint record** — fill the table in
+   `references/layout-methodology.md` section 1. Ask the user for any
+   load-bearing row the request does not establish (board size, connector
+   sides, enclosure, currents, voltages, layers, fabricator); do not assume.
+2. **Board outline, holes, rules** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
-   without it leaves two overlapping outlines and a DRC failure.
-2. **Update from schematic** — call `update_pcb_from_schematic` first with
+   without it leaves two overlapping outlines and a DRC failure. Add mounting
+   holes and keep-outs, then encode the fabricator limits with
+   `set_design_rules` and read them back with `get_design_rules`.
+3. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
    `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
-3. **Refresh changed libraries** — when a linked footprint library changed, use
+4. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
    it refreshes supported library-owned pads, graphics, attributes, metadata, and
@@ -103,11 +139,31 @@ Follow this sequence for a clean PCB workflow:
    `expected_plan_revision`. The requested board must be open in live KiCad, one
    apply is one undo entry, and unsupported or stale content returns a non-mutating
    conflict instead of silently dropping it.
-4. **Place components** — position all footprints
-5. **Route traces** — connect all nets
-6. **Copper pour** — add ground/power zones last
-7. **DRC** — run design rule check
-8. **Save** — `save_project`
+5. **Place by block and by pins** — placement order: mechanical and
+   connectors → large and hot parts → critical circuits → decoupling,
+   terminations, feedback, protection → the rest. Read `get_component_pads`
+   for every part before choosing its position and rotation, and turn it so
+   its pads face their destinations. Score with `score_placement`, render
+   with `get_board_2d_view`, and close `references/placement-gate.md`. On
+   `FAIL`, move parts; never route around a placement mistake.
+6. **Return-path plan and netclasses** — write where each critical net's
+   current returns; derive widths and vias from the sizing record and encode
+   them (`create_netclass`, `assign_net_to_class`, `set_predefined_sizes`),
+   read back (`get_netclasses`, `get_predefined_sizes`); write the routing
+   order by criticality.
+7. **Route by criticality** — supply loops and decoupling → clocks, RF,
+   pairs, controlled impedance → sensitive analog → main power → the rest →
+   tuning only where timing requires it. Follow the pad selection and path
+   rules in `references/routing-gate.md`.
+8. **Copper pour** — add ground/power zones last, then `refill_zones`.
+9. **Save, then DRC and rendered inspection** — `save_project` first: DRC
+   and renders read the saved file. `run_drc` with zero unrouted items and
+   zero errors, every warning adjudicated; `get_board_2d_view` inspected
+   against the routing gate's rendered list; `query_traces` per critical net
+   against the return-path plan. Close `references/routing-gate.md`.
+10. **Layout review** — for a board that will be fabricated, run the
+    `kicad-review` skill's layout-quality branch or delegate to
+    `kicad-design-review-agent`.
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
 
@@ -118,13 +174,42 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 ### Strategy
 
 - Group components by functional block (power, digital, analog, connectors)
+  and order the blocks along the circuit's flow: connector → protection →
+  filter → conditioning → converter → processor
 - Place ICs first, then their associated passives
-- Decoupling caps: within 2mm of their IC power pins, on same layer
+- Decoupling caps: within 2mm of their IC power pins, on same layer, with a
+  short loop to the rail and the return — loop area matters more than
+  visual proximity
 - Cable/EMI filter caps: on the connector's own pins, and judged against that
   connector rather than the nearest IC
-- Connectors: at board edges, accessible for cables
+- Connectors: at board edges, accessible for cables; buttons, LEDs, displays,
+  and test points where the enclosure lets a person reach them
 - High-frequency components: minimize trace lengths between them
-- Thermal considerations: power components away from sensitive analog
+- Thermal considerations: power components away from sensitive analog;
+  noise sources (inductors, switching nodes, drivers) away from references,
+  crystals, and high-impedance inputs
+- Place by pins, not by bodies: read `get_component_pads` before choosing a
+  rotation and turn each part so its pads face the pads they connect to.
+  Two adjacent parts still force a bad route when they are badly oriented
+- Reserve routing corridors between blocks; an over-packed board needs
+  detours and vias it did not need
+
+### The anchor is not the centre
+
+The placement coordinate is the footprint anchor, and for many footprints
+the anchor is pad 1 (axial resistors, pin headers, connectors). A part placed
+at x = 40 mm on a 50 mm board can have its other pad at 50.16 mm, outside
+the outline. Compute every part's real extent from `get_component_pads`
+after placing it, and compare every pad against the outline and the edge
+clearance before moving on. `run_drc` on the saved board is the final proof.
+
+### Footprints with repeated pad numbers
+
+Tactile switches and some connectors carry two pads with the same number:
+two copper islands that the part joins mechanically, not the board. Record
+them from `get_component_pads` during placement. Routing must start from the
+instance nearest the destination and bridge the pair with copper, or DRC
+reports an unconnected item.
 
 ### Placement Tools
 
@@ -167,6 +252,11 @@ board open live (fanout apply is the inverse: it REQUIRES the live board).
 - Use mm coordinates (KiCAD default for PCB)
 - Standard grid: 0.5mm for placement, 0.25mm for fine adjustment
 - Check component courtyard overlaps after placement
+- Check every pad of every part against the outline after placement
+- Look at the airwires before routing: many crossings mean badly oriented
+  parts or badly distributed blocks — fix placement, not routing
+- Render with `get_board_2d_view` and inspect the image; a successful render
+  command is not placement acceptance
 - Reference designator text: F.SilkS layer, 1mm height default
 
 ---
@@ -178,6 +268,20 @@ participating footprints. Use its returned board-space position, effective
 rotation, shape, size, drill, and per-copper-layer geometry; do not estimate
 copper extent from package family or a different pad in the footprint. A null
 geometry field is unavailable evidence, not a zero-size pad.
+
+Route in the written criticality order, not in the order the nets happen to
+appear. Path rules (full list in `references/routing-gate.md`):
+
+- Start each trace at the pad instance nearest its destination; when a pad
+  number appears at two positions, bridge the pair with copper.
+- A trace never crosses the body or courtyard of the part it leaves, nor of
+  any other part, unless the footprint was designed for it and the clearance
+  rules allow it. A diagonal across a switch to reach the next part is a
+  pad-choice or placement error.
+- Width comes from the netclass; corners at 45° or curved; no acute angles.
+- Keep the return path: a shorter trace that leaves its reference plane or
+  crosses a plane slot is worse than a longer one that keeps it.
+- Fix a wrong segment with `delete_trace` before laying its replacement.
 
 ### Routing Tools
 
@@ -203,6 +307,9 @@ route_pad_to_pad(board, net_name, ref1, pad1, ref2, pad2, layer?, width?)
 - Routes entirely on `layer` (default `F.Cu`) — it does not add a via. To
   change layer mid-route, place the via yourself with `add_via` and route each
   side separately
+- When it cannot resolve a reference that `get_component_list` does show,
+  route with `route_trace` between the exact pad coordinates read from
+  `get_component_pads`; never estimate a coordinate
 
 ### route_trace
 
@@ -346,11 +453,18 @@ Zones do not auto-update — stale fills cause DRC errors.
 
 ## Design Rule Check
 
-After completing layout:
+After completing layout, save first — `run_drc` reads the saved board file,
+so an unsaved board is judged on stale data (phantom "missing footprint"
+items are the usual symptom):
 
 ```
+save_project()
 run_drc()
 ```
+
+A passing DRC means the layout obeyed the rules it was given, not that the
+circuit works. Placement quality, return paths, and rendered inspection are
+separate acceptance evidence (`references/routing-gate.md`).
 
 Common DRC errors and fixes:
 - **Clearance violation**: move trace or component further apart
@@ -393,3 +507,12 @@ geometry is the board outline or a cutout the footprint carries itself.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete
+11. **Constraints and blocks before parts** — write the constraint record and
+    the block map before the first placement; ask for missing load-bearing values
+12. **Pins face destinations** — read `get_component_pads` before rotating a
+    part; check every pad against the outline; close the placement gate before
+    routing
+13. **Return path before signal** — write where each critical net's current
+    returns before routing it; never shorten a trace at the cost of its return
+14. **Save before evidence, inspect the render** — DRC and renders read the
+    saved file; "DRC passed" alone is not layout acceptance
