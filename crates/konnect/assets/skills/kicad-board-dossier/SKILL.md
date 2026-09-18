@@ -313,7 +313,7 @@ replaces it.
 
 | Claim | `basis` | Why |
 |---|---|---|
-| "The silkscreen reads `SEMAFARO 1.3 24V 03/2020`" | `observed` | You can point at the rectangle it was read from. |
+| "The silkscreen reads `SEMAFORO L3 24V 03/2020`" | `observed` | You can point at the rectangle it was read from (a marginal glyph, such as an `O`/`A` or `L3`/`1.3` that reads either way at this resolution, gets recorded as an alternative, not silently picked). |
 | "There are 19 axial resistors" | `observed` | A count from views, with a stated method and per-region sums. |
 | "The supply is 24 V" (printed beside the terminal) | `observed` | Read off the board. |
 | "The LEDs are in strings of 6" | `inferred` | The copper shows series chaining, not string length. |
