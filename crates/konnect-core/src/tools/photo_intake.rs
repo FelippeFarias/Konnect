@@ -265,9 +265,32 @@ fn scoped_home_dir() -> std::io::Result<tempfile::TempDir> {
 /// for the 260-character limit, not part of the path, and not every Python
 /// library accepts one — the same reason `portable_uri` (`library.rs:1818`)
 /// strips it. Separators are left native: the subprocess is a local one.
+///
+/// Which prefix it is decides what to strip, and getting that wrong is not
+/// cosmetic. `std::path::Prefix::VerbatimUNC` spells a network share as
+/// `\\?\UNC\srv\share\…`, so dropping the whole prefix yields
+/// `UNC\srv\share\…` — a **relative** path, which would send retrace's `-o`
+/// output into the server process's working directory rather than into the
+/// project. Only `VerbatimDisk` (`\\?\C:\…`) may lose its prefix outright;
+/// `VerbatimUNC` keeps a UNC root, and any other verbatim form (a volume
+/// GUID, a device path) means nothing without its prefix and is left as is.
 fn subprocess_arg(path: &Path) -> String {
     let raw = path.to_string_lossy().into_owned();
-    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+    let Some(rest) = raw.strip_prefix(r"\\?\") else {
+        return raw;
+    };
+    if let Some(share) = rest.strip_prefix(r"UNC\") {
+        return format!(r"\\{share}");
+    }
+    let mut start = rest.chars();
+    let verbatim_disk = matches!(
+        (start.next(), start.next()),
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic()
+    );
+    if verbatim_disk {
+        return rest.to_string();
+    }
+    raw
 }
 
 // ─── Interpreter discovery and capability probe ───────────────────────────────
@@ -1615,11 +1638,32 @@ mod runner_tests {
         );
     }
 
+    /// The two verbatim prefixes `canonicalize` produces, and a path with none.
+    ///
+    /// The UNC one is what bites: stripping the whole prefix from
+    /// `\\?\UNC\srv\share\proj` leaves `UNC\srv\share\proj`, a *relative*
+    /// path, so a project on a network share would hand retrace an output
+    /// directory under the server process's CWD instead of under the project.
     #[test]
     fn subprocess_arg_drops_the_windows_verbatim_prefix() {
+        // VerbatimDisk.
         assert_eq!(
             subprocess_arg(Path::new(r"\\?\C:\boards\top.png")),
             r"C:\boards\top.png"
+        );
+        // VerbatimUNC: the prefix becomes the UNC root, never nothing.
+        assert_eq!(
+            subprocess_arg(Path::new(r"\\?\UNC\srv\share\proj\top.png")),
+            r"\\srv\share\proj\top.png"
+        );
+        assert!(
+            !subprocess_arg(Path::new(r"\\?\UNC\srv\share\proj")).starts_with("UNC"),
+            "a UNC path must never come out relative"
+        );
+        // Anything else is meaningless without its prefix, so it is left alone.
+        assert_eq!(
+            subprocess_arg(Path::new(r"\\?\Volume{1a2b}\boards")),
+            r"\\?\Volume{1a2b}\boards"
         );
         assert_eq!(subprocess_arg(Path::new("/tmp/top.png")), "/tmp/top.png");
     }
