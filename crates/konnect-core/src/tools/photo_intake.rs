@@ -1069,7 +1069,7 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
 fn review_map_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "description": "The full review map. Its map_id must name a scan directory that already exists (scan_pcb_photo assigns it). Approval fields are ignored on input and rewritten by the server. Keys beyond these are preserved verbatim, so reviewer annotations survive a save.",
+        "description": "The full review map. Its map_id must name a scan directory that already exists (scan_pcb_photo assigns it). The tool-owned keys (approval_valid, approved, approved_at, content_hash_at_approval, saved_at) are dropped on input and re-derived from the stored record. Keys beyond these are preserved verbatim, so reviewer annotations survive a save.",
         "additionalProperties": true,
         "properties": {
             "map_id": {
@@ -1216,7 +1216,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Persist a photo review map as editable JSON under \
              <project_dir>/.konnect/photo_intake/<map_id>/review_map.json. The map's approval \
              state is server-owned: this tool never grants approval, and any edit to the \
-             reviewed content revokes an approval the map already had.",
+             reviewed content revokes an approval the map already had. Keys the tools own \
+             (approval_valid, approved, approved_at, content_hash_at_approval, saved_at) are \
+             ignored on input and re-derived from the stored record, so re-saving a map you \
+             loaded is safe; every other key is preserved verbatim.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1466,6 +1469,37 @@ fn overlay_known_fields(
     }
 }
 
+/// The names the tools own inside the review map: the bookkeeping `save` and
+/// `approve` write themselves, plus `approval_valid`, which `load` computes
+/// server-side and never persists.
+///
+/// A payload carrying them is not rejected — re-saving a map you loaded is the
+/// documented workflow, and a loaded map legitimately carries the four
+/// persisted ones — but the incoming values are dropped before anything is
+/// written, so the record on disk states only what the server decided. Without
+/// this, opening the schema (`additionalProperties: true`) let a caller
+/// persist `approval_valid: true` and `load` answer with two keys of that
+/// name, one forged and one computed.
+const TOOL_OWNED_KEYS: [&str; 5] = [
+    "approval_valid",
+    "approved",
+    "approved_at",
+    "content_hash_at_approval",
+    "saved_at",
+];
+
+/// The incoming map with [`TOOL_OWNED_KEYS`] removed, so the overlay carries
+/// through every *other* unknown key and none of these.
+fn without_tool_owned_keys(map: &serde_json::Value) -> serde_json::Value {
+    let mut stripped = map.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        for key in TOOL_OWNED_KEYS {
+            object.remove(key);
+        }
+    }
+    stripped
+}
+
 /// `project_dir` + `map_id` → the review map's file, with every design D13
 /// rule applied. One implementation, shared by all three map tools, so the
 /// confinement check cannot drift between them.
@@ -1506,7 +1540,15 @@ async fn handle_save_photo_review_map(
     // normalization) win on the keys the struct owns, everything else is
     // carried through untouched. The object hashed below is still the object
     // written, never one re-derived from it.
-    let mut value = overlay_known_fields(map_arg, serde_json::to_value(&parsed)?);
+    //
+    // `TOOL_OWNED_KEYS` is the one exception: those names are stripped from
+    // the incoming object first, so a payload cannot smuggle `approval_valid`
+    // (or a stale `approved`) past the overlay and into the record. The
+    // bookkeeping written below is derived only from what is on disk.
+    let mut value = overlay_known_fields(
+        &without_tool_owned_keys(map_arg),
+        serde_json::to_value(&parsed)?,
+    );
     let content_hash = review_map_content_hash(&value);
 
     // Approval survives a save only when the content is exactly what was
