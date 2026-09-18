@@ -64,30 +64,6 @@ fn text(result: &CallToolResult) -> String {
     }
 }
 
-/// Dispatch without the schema gate.
-///
-/// `save_photo_review_map` is the only caller, and only because of the defect
-/// pinned below as [`save_photo_review_map_accepts_a_real_review_map`]:
-/// `close_input_schema` inserts `additionalProperties: false` into the `map`
-/// property, which declares no `properties` of its own, so the published
-/// schema rejects every review map that has any content at all. Routing
-/// `save` through the validator here would fail this test at step 1 and hide
-/// the whole chain behind a defect that is already reported on its own.
-async fn call_bypassing_schema(
-    ctx: &Arc<ToolContext>,
-    defs: &[ToolDef],
-    name: &str,
-    args: Value,
-) -> CallToolResult {
-    let def = defs
-        .iter()
-        .find(|def| def.name == name)
-        .unwrap_or_else(|| panic!("{name} is in the photo_intake toolset"));
-    (def.handler)(&args, ctx.clone())
-        .await
-        .unwrap_or_else(|error| panic!("{name} handler returned Err: {error}"))
-}
-
 /// Dispatch and insist the call succeeded, returning its JSON payload.
 async fn ok(
     ctx: &Arc<ToolContext>,
@@ -96,31 +72,24 @@ async fn ok(
     args: Value,
     what: &str,
 ) -> Value {
-    let result = if name == "save_photo_review_map" {
-        call_bypassing_schema(ctx, defs, name, args).await
-    } else {
-        call(ctx, defs, name, args).await
-    };
+    let result = call(ctx, defs, name, args).await;
     assert!(!result.is_error, "{what} failed: {}", text(&result));
     payload(&result)
 }
 
 /// The published `save_photo_review_map` schema must accept a review map.
 ///
-/// It does not. `tools()` declares `map` as a bare `{"type": "object"}`, and
-/// `close_input_schema` (`tools/mod.rs:134`) then recurses into it and inserts
+/// It once did not: `tools()` declared `map` as a bare `{"type": "object"}`,
+/// and `close_input_schema` (`tools/mod.rs:134`) recursed into it and inserted
 /// `additionalProperties: false`. With no `properties` alongside it, the
-/// resulting subschema admits `{}` and nothing else — while `{}` is in turn
-/// refused by the handler's own `validate_incoming_map`. The MCP dispatcher
-/// validates before it dispatches (`mcp/handler.rs:366`), so no caller can
-/// ever save a review map, and the approval gate is unreachable in production.
+/// subschema admitted `{}` and nothing else — while `{}` is in turn refused by
+/// the handler's own `validate_incoming_map`. The MCP dispatcher validates
+/// before it dispatches (`mcp/handler.rs:366`), so no caller could ever save a
+/// review map and the approval gate was unreachable in production.
 ///
 /// Every unit test of this tool calls the handler directly and so never meets
-/// the validator. Ignored rather than red so that it does not turn the
-/// workspace's truth command into a false report of unrelated breakage;
-/// un-ignore it with the fix.
+/// the validator; this one validates and nothing else.
 #[test]
-#[ignore = "known defect: the save_photo_review_map schema rejects every non-empty map"]
 fn save_photo_review_map_accepts_a_real_review_map() {
     let defs = konnect_core::router::registry::tools_for("photo_intake")
         .expect("photo_intake is registered");

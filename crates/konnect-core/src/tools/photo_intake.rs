@@ -878,6 +878,109 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+/// The JSON Schema for `save_photo_review_map`'s `map` argument, spelled out
+/// rather than left as a bare `{"type": "object"}`.
+///
+/// `ToolDef::new` runs `close_input_schema` (`tools/mod.rs:134`), which inserts
+/// `additionalProperties: false` into every object subschema that does not
+/// declare one. A `map` with no `properties` therefore published a schema that
+/// accepted `{}` and nothing else, and the MCP dispatcher validates before it
+/// dispatches (`mcp/handler.rs:366`) — so no caller could ever save a review
+/// map. Keep this in sync with [`PhotoReviewMap`] (design D8);
+/// `the_map_schema_names_every_review_map_field` fails when they drift.
+///
+/// Every object a reviewer hand-edits is left open
+/// (`"additionalProperties": true`, which `entry().or_insert()` preserves):
+/// annotations that no tool reads must survive a save, so the schema may not
+/// refuse the keys the handler is required to persist.
+fn review_map_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": "The full review map. Its map_id must name a scan directory that already exists (scan_pcb_photo assigns it). Approval fields are ignored on input and rewritten by the server. Keys beyond these are preserved verbatim, so reviewer annotations survive a save.",
+        "additionalProperties": true,
+        "properties": {
+            "map_id": {
+                "type": "string",
+                "pattern": MAP_ID_PATTERN,
+                "description": "The map identifier assigned by scan_pcb_photo. Its scan directory must already exist."
+            },
+            "saved_at": {
+                "type": ["string", "null"],
+                "description": "Server-owned: rewritten on every save. Outside the approval hash."
+            },
+            "source_images": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Absolute paths of the photographs this map was read from. Required — populate it before the first save."
+            },
+            "scale_reference": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "kind": { "type": "string", "description": "e.g. board_edge_mm or package." },
+                    "value": { "type": "string", "description": "e.g. '50' or '0805'." }
+                },
+                "required": ["kind", "value"],
+                "description": "Always user-supplied; never estimated from pixels."
+            },
+            "components": {
+                "type": "array",
+                "description": "One entry per detected component, carried over from the scan and never invented.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "component_id": { "type": "string", "description": "The scan's own id, copied verbatim." },
+                        "ref": { "type": ["string", "null"], "description": "Reference designator, null until a human assigns it." },
+                        "type": { "type": ["string", "null"], "description": "Coarse class: resistor, capacitor, ic, connector, ..." },
+                        "value": { "type": ["string", "null"], "description": "Null when the scan read nothing. Never guess." },
+                        "footprint_suggestion": { "type": ["string", "null"], "description": "A suggestion only; schematic build resolves the real footprint." },
+                        "confidence": { "type": "number", "description": "The scan's own number, unrounded. Below 0.6 is flagged for manual identification." },
+                        "bbox_px": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": "[x, y, w, h] in source-image pixels, copied verbatim."
+                        },
+                        "approved": { "type": "boolean", "description": "Per-component human decision." }
+                    },
+                    "required": ["component_id", "confidence", "bbox_px"]
+                }
+            },
+            "nets": {
+                "type": "array",
+                "description": "Reviewed connectivity. retrace's synthetic netlist is never a source for this list.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "connections": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "ref-and-pin endpoints, e.g. R1.1."
+                        },
+                        "source": {
+                            "type": "string",
+                            "enum": NET_SOURCES,
+                            "description": "traced, inferred or manual - tagged honestly."
+                        }
+                    },
+                    "required": ["connections", "source"]
+                }
+            },
+            "subcircuit_hints": {
+                "type": "array",
+                "description": "The scan's pattern_matches, verbatim. Advisory and never evidence; outside the approval hash."
+            },
+            "approved": { "type": "boolean", "description": "Server-owned: ignored on input and rewritten." },
+            "approved_at": { "type": ["string", "null"], "description": "Server-owned: ignored on input and rewritten." },
+            "content_hash_at_approval": { "type": ["string", "null"], "description": "Server-owned: ignored on input and rewritten." }
+        },
+        "required": ["map_id", "source_images", "scale_reference"]
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -943,10 +1046,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "KiCad project directory the map belongs to."
                     },
-                    "map": {
-                        "type": "object",
-                        "description": "The full review map. Its map_id must name a scan directory that already exists (scan_pcb_photo assigns it). Approval fields are ignored on input and rewritten by the server."
-                    }
+                    "map": review_map_schema()
                 },
                 "required": ["project_dir", "map"]
             }),
@@ -2534,7 +2634,65 @@ mod review_map_tests {
         assert_eq!(property_names(&save_schema), vec!["map", "project_dir"]);
         assert_eq!(save_schema["required"], json!(["project_dir", "map"]));
         assert_eq!(save_schema["properties"]["map"]["type"], json!("object"));
+    }
 
+    /// The published `map` subschema must name every review-map field and must
+    /// stay open to the keys a reviewer adds by hand.
+    ///
+    /// Both halves are load-bearing. `ToolDef::new` closes any object
+    /// subschema that declares no `additionalProperties`, so a `map` with no
+    /// `properties` published a schema that accepted `{}` and nothing else and
+    /// no caller could save at all; and a *closed* `map` would refuse exactly
+    /// the annotations `save_photo_review_map` is required to persist.
+    #[test]
+    fn the_map_schema_names_every_review_map_field_and_stays_open() {
+        let map_schema = schema_of("save_photo_review_map")["properties"]["map"].clone();
+
+        let declared: std::collections::BTreeSet<String> = map_schema["properties"]
+            .as_object()
+            .expect("the map schema declares properties")
+            .keys()
+            .cloned()
+            .collect();
+        let actual: std::collections::BTreeSet<String> = fixture_review_map()
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            declared, actual,
+            "the map schema and PhotoReviewMap (design D8) have drifted"
+        );
+
+        for (what, subschema) in [
+            ("map", &map_schema),
+            (
+                "components[]",
+                &map_schema["properties"]["components"]["items"],
+            ),
+            ("nets[]", &map_schema["properties"]["nets"]["items"]),
+        ] {
+            assert_eq!(
+                subschema["additionalProperties"],
+                json!(true),
+                "{what} must stay open so hand annotations survive a save"
+            );
+        }
+
+        assert_eq!(
+            map_schema["properties"]["map_id"]["pattern"],
+            json!(MAP_ID_PATTERN),
+            "save enforces the map_id token in its schema too"
+        );
+        assert_eq!(
+            map_schema["properties"]["nets"]["items"]["properties"]["source"]["enum"],
+            json!(NET_SOURCES)
+        );
+    }
+
+    #[test]
+    fn the_load_and_approve_schemas_match_design_d2() {
         for name in ["load_photo_review_map", "approve_photo_review_map"] {
             let schema = schema_of(name);
             assert_eq!(
