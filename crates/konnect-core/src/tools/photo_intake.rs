@@ -1313,6 +1313,9 @@ const MIN_VIEW_SCALE: f64 = 0.25;
 const MAX_VIEW_SCALE: f64 = 4.0;
 const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 
+/// `[x, y, w, h]` of a crop rectangle, in oriented source-image pixel space.
+type CropRect = [u32; 4];
+
 /// One rendered view, still in memory: nothing is written until every bound
 /// has been checked, so a rejected call leaves no file and no `views/`
 /// directory behind.
@@ -1336,7 +1339,7 @@ struct RenderedView {
 /// coordinate space this tool used inspectable.
 fn render_view(
     image_path: &Path,
-    crop: Option<[u32; 4]>,
+    crop: Option<CropRect>,
     rotate: u32,
     scale: f64,
 ) -> Result<RenderedView, String> {
@@ -1484,7 +1487,7 @@ fn next_view_number(views_dir: &Path) -> usize {
 /// `crop`, `rotate` and `scale`, validated in Rust as well as in the schema:
 /// the schema is the MCP dispatcher's guard, and these handlers are also
 /// called directly.
-fn parse_crop(args: &serde_json::Value) -> Result<Option<[u32; 4]>, String> {
+fn parse_crop(args: &serde_json::Value) -> Result<Option<CropRect>, String> {
     let Some(crop) = args.get("crop").filter(|value| !value.is_null()) else {
         return Ok(None);
     };
