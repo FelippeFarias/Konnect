@@ -210,7 +210,22 @@ mod tests {
                         "save_photo_review_map/properties/map" |
                         "save_photo_review_map/properties/map/properties/scale_reference" |
                         "save_photo_review_map/properties/map/properties/components/items" |
-                        "save_photo_review_map/properties/map/properties/nets/items"
+                        "save_photo_review_map/properties/map/properties/nets/items" |
+                        // The two additive sections are the same document: a
+                        // human reads the dossier, edits it by hand, and the
+                        // skill tells the agent to re-save it. These six are
+                        // every singleton object node in them — arrays of
+                        // objects are declared without an `items` subschema, so
+                        // this list does not grow when an element gains a
+                        // field. A seventh path means the schema grew a nested
+                        // object or an `items`; fold that node's fields into
+                        // the skill reference doc instead of widening this.
+                        "save_photo_review_map/properties/map/properties/dossier" |
+                        "save_photo_review_map/properties/map/properties/dossier/properties/identity" |
+                        "save_photo_review_map/properties/map/properties/dossier/properties/physical" |
+                        "save_photo_review_map/properties/map/properties/dossier/properties/design_brief_seed" |
+                        "save_photo_review_map/properties/map/properties/design_brief" |
+                        "save_photo_review_map/properties/map/properties/design_brief/properties/physical_constraints"
                     ),
                         "unreviewed open input record: {path}"
                     );

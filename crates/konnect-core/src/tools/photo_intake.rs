@@ -690,6 +690,22 @@ pub struct PhotoReviewMap {
     /// human's approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subcircuit_hints: Option<Vec<RetracePatternMatch>>,
+    /// The board dossier (design D4): what the photos say this board is, with
+    /// an evidence pointer and a confidence behind every claim. Untyped on
+    /// purpose — it is reviewed content a human edits by hand, so the struct
+    /// validates its presence and shape, never its field list.
+    ///
+    /// `skip_serializing_if` is load-bearing, not cosmetic (design D6): the
+    /// save path overlays `to_value(&parsed)` onto the incoming map, so a
+    /// `None` that serialized as `null` would write `"dossier": null` into
+    /// every record, join the content hash, and revoke every approval in the
+    /// field on its next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dossier: Option<serde_json::Value>,
+    /// The design brief derived from the dossier (design D5). Optional,
+    /// untyped and skipped when absent for exactly the reasons above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_brief: Option<serde_json::Value>,
     /// Server-owned. A client-supplied value is ignored and overwritten (D5).
     #[serde(default)]
     pub approved: bool,
@@ -710,6 +726,17 @@ pub struct PhotoReviewMap {
 pub struct ScaleReference {
     pub kind: String,
     pub value: String,
+    /// Millimeters per pixel, present only when the agent tied the scale to a
+    /// named physical feature (design D3). Always paired with `evidence`: a
+    /// scale nobody can name evidence for stays unresolved rather than
+    /// estimated.
+    ///
+    /// Skipped when absent for design D6's reason — see [`PhotoReviewMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_per_px: Option<f64>,
+    /// The feature and reasoning the `mm_per_px` above rests on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 /// One component under review. `confidence` is required and carried verbatim:
@@ -747,6 +774,20 @@ pub struct ReviewNet {
 /// by excluding others: an omission is then visible at this list instead of
 /// hiding in a denylist (design D16).
 const CONTENT_KEYS: [&str; 4] = ["source_images", "scale_reference", "components", "nets"];
+
+/// Sections this change adds to the gate (design D6). Covered only when the
+/// saved map actually carries them, so a map written before this change —
+/// which never had them — hashes to exactly the bytes it always did.
+///
+/// A named `const` rather than two inline literals because
+/// `every_schema_key_is_either_hashed_or_deliberately_not` chains it: a third
+/// section added to the schema without a hash decision then fails the suite
+/// instead of shipping outside the gate.
+const OPTIONAL_CONTENT_KEYS: [&str; 2] = ["dossier", "design_brief"];
+
+/// Design D3's additions to the scale reference. Same conditional rule, same
+/// reason: a map whose scale was never resolved hashes as it always did.
+const SCALE_REFERENCE_OPTIONAL_CONTENT_KEYS: [&str; 2] = ["mm_per_px", "evidence"];
 
 /// Everything outside the hash: identity, bookkeeping the tools write
 /// themselves (hashing it would make every save revoke its own approval), and
@@ -816,6 +857,34 @@ fn hashed_fields(
     serde_json::Value::Object(covered)
 }
 
+/// [`hashed_fields`] plus keys that are covered only when the object actually
+/// carries them (design D6).
+///
+/// Separate from [`hashed_fields`] on purpose, not an `optional_keys`
+/// parameter added to it: that function's *unconditional* insert is what makes
+/// a component with no `ref` contribute a `"ref": null` member, and every
+/// digest stored in the field depends on it. Teaching it to skip absent keys
+/// would change the canonical bytes of every existing map and invalidate every
+/// approval already granted.
+fn hashed_fields_with_optional(
+    value: &serde_json::Value,
+    keys: &[&str],
+    optional_keys: &[&str],
+) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let serde_json::Value::Object(mut covered) = hashed_fields(value, keys, &[]) else {
+        return value.clone();
+    };
+    for key in optional_keys {
+        if let Some(field) = object.get(*key) {
+            covered.insert((*key).to_string(), field.clone());
+        }
+    }
+    serde_json::Value::Object(covered)
+}
+
 /// [`hashed_fields`] over an array, keeping stored order (design D16).
 fn hashed_elements(
     value: Option<&serde_json::Value>,
@@ -865,7 +934,11 @@ pub(crate) fn review_map_content_hash(map: &serde_json::Value) -> String {
             key.to_string(),
             match key {
                 "scale_reference" => match field {
-                    Some(value) => hashed_fields(value, &SCALE_REFERENCE_CONTENT_KEYS, &[]),
+                    Some(value) => hashed_fields_with_optional(
+                        value,
+                        &SCALE_REFERENCE_CONTENT_KEYS,
+                        &SCALE_REFERENCE_OPTIONAL_CONTENT_KEYS,
+                    ),
                     None => serde_json::Value::Null,
                 },
                 "components" => {
@@ -877,6 +950,22 @@ pub(crate) fn review_map_content_hash(map: &serde_json::Value) -> String {
                 _ => field.cloned().unwrap_or(serde_json::Value::Null),
             },
         );
+    }
+    // Design D6: the two additive sections join the hashed bytes only once the
+    // map carries them, so a map written before they existed hashes to exactly
+    // the bytes it always did — and adding one to an approved map moves the
+    // digest, which is what makes the second review checkpoint the same
+    // mechanism as the first.
+    //
+    // Cloned whole, with no field projection. The projection the three older
+    // sections get exists to keep tool-written bookkeeping and reviewer
+    // annotations nested in a machine-written record out of the gate; neither
+    // exists here — no tool writes into these two, and they *are* the reviewed
+    // content — so a key list would buy nothing and could only fail open.
+    for key in OPTIONAL_CONTENT_KEYS {
+        if let Some(section) = map.get(key) {
+            covered.insert(key.to_string(), section.clone());
+        }
     }
     // Serializing a `Value` that was built by cloning cannot fail.
     let bytes =
@@ -1027,6 +1116,18 @@ async fn write_review_map(path: &Path, map: &serde_json::Value) -> Result<(), St
         .map_err(|error| format!("Could not write {}: {error}", path.display()))
 }
 
+/// The JSON type name to quote back at a caller who sent the wrong shape.
+fn section_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Parse an incoming map into [`PhotoReviewMap`] to reject a malformed one
 /// before anything is written, and check the one vocabulary the gate's meaning
 /// rests on.
@@ -1037,6 +1138,22 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
         )
     })?;
     validate_map_id(&parsed.map_id)?;
+    // Design D6: on disk one of these sections is either a JSON object or not
+    // there at all. `Option<Value>` would happily carry a string, an array or
+    // a `null`, and a `null` is the dangerous one — it would reach the hash as
+    // a present-but-empty member and revoke an approval nobody edited. Refused
+    // here, with the alternative named, rather than silently normalized.
+    for key in OPTIONAL_CONTENT_KEYS {
+        if let Some(section) = map.get(key) {
+            if !section.is_object() {
+                return Err(format!(
+                    "'{key}' is present but is not a JSON object (got {}). Omit the key entirely \
+                     to remove the section. Nothing was written.",
+                    section_type_name(section)
+                ));
+            }
+        }
+    }
     for (index, net) in parsed.nets.iter().enumerate() {
         if !NET_SOURCES.contains(&net.source.as_str()) {
             return Err(format!(
@@ -1050,6 +1167,137 @@ fn validate_incoming_map(map: &serde_json::Value) -> Result<PhotoReviewMap, Stri
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
+
+/// The `dossier` subschema (design D4), lifted out of [`review_map_schema`]
+/// because one `json!` for the whole review map exceeds the macro recursion
+/// limit — and because the two additive sections are read on their own.
+///
+/// Every array of objects is declared with a prose `description` and **no**
+/// `items` subschema, following `subcircuit_hints`: the router's
+/// `fixed_records_are_closed_and_only_reviewed_maps_are_extensible` walker
+/// never descends into an array without `items`, so the open-record
+/// allowlist stays at design D7's six paths however many fields an element
+/// gains later. The per-field reference lives in the skill docs, where the
+/// writing agent actually reads it.
+fn dossier_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Optional board dossier: what the photos say this board is. Omit the key entirely when there is none — a null is rejected. Every claim carries basis (observed|inferred), a numeric confidence, and evidence entries shaped {view, rect_px, note?} naming a file in the map's views/ directory or one of source_images. Joins the approval hash the moment it is present, so adding it revokes an existing approval. Field-by-field reference: the kicad-board-dossier skill's dossier-schema.md.",
+        "properties": {
+            "identity": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "What this board is, as one claim.",
+                "properties": {
+                    "summary": { "type": "string", "description": "One sentence, quoting the silkscreen identity where there is one." },
+                    "basis": { "type": "string", "description": "observed or inferred." },
+                    "confidence": { "type": "number", "description": "0..1." },
+                    "evidence": { "type": "array", "description": "{view, rect_px:[x,y,w,h], note?} pointers." }
+                }
+            },
+            "physical": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Sizes, holes and connectors. Pixel values always; millimeters only once a scale is resolved.",
+                "properties": {
+                    "board_size_px": { "type": "array", "items": { "type": "integer" }, "description": "[w, h] in the oriented source space." },
+                    "board_size_mm": { "type": ["array", "null"], "description": "[w, h] in mm, null until a scale reference resolves one. Never estimated." },
+                    "scale_status": { "type": "string", "description": "Why board_size_mm is null, when it is." },
+                    "mounting_holes": { "type": "array", "description": "{position_px, role, count, evidence?} entries." },
+                    "connectors": { "type": "array", "description": "{type, location_px, edge, basis, confidence, evidence?} entries." },
+                    "layers_visible": { "type": "string", "description": "Which layers the photos actually show." }
+                }
+            },
+            "component_survey": {
+                "type": "array",
+                "description": "One entry per visual class: {visual_class, count, count_method, count_confidence, count_alternatives[], locations[], retrace_component_ids[], notes?}. Two methods disagreeing is evidence — record both rather than the trusted number alone."
+            },
+            "silkscreen_markings": {
+                "type": "array",
+                "description": "{text, location_px, basis, confidence, evidence[]} entries, read off the board and never inferred from context."
+            },
+            "topology_claims": {
+                "type": "array",
+                "description": "{claim_id, question, basis, evidence[], hypotheses[], resolution_path} entries. A question the evidence does not settle keeps every candidate as its own hypothesis {label, description, confidence, calculation, assumptions[]}, never one guess."
+            },
+            "retrace_correlation": {
+                "type": "array",
+                "description": "{component_id, bbox_px, visual_class, overlap_confidence} entries tying survey observations to scan_pcb_photo component ids."
+            },
+            "photo_views_used": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The view files the survey was read from."
+            },
+            "design_brief_seed": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A preliminary sketch of the implied design direction, distinct from the full design_brief.",
+                "properties": {
+                    "summary": { "type": "string", "description": "Topology idea, rough BOM shape, physical spec." },
+                    "depends_on_open_questions": { "type": "array", "items": { "type": "string" }, "description": "claim_id values this sketch rests on." }
+                }
+            },
+            "open_questions": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "What the photos could not settle. A gap belongs here, never filled with a plausible number."
+            }
+        }
+    })
+}
+
+/// The `design_brief` subschema (design D5). Same shape rules as
+/// [`dossier_schema`], same reason.
+fn design_brief_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Optional design brief derived from an approved dossier. Omit the key entirely when there is none — a null is rejected. Joins the approval hash the moment it is present, which is what makes the second review checkpoint the same mechanism as the first. Field-by-field reference: the kicad-design-reconstruction skill's design-brief-schema.md.",
+        "properties": {
+            "derived_from_dossier": { "type": "boolean", "description": "True when this brief was written from that map's approved dossier." },
+            "block_diagram": {
+                "type": "array",
+                "description": "{block, function, inputs[], outputs[]} entries."
+            },
+            "circuits": {
+                "type": "array",
+                "description": "{block, description, calculated_values[], derating_notes} entries; each calculated value states its formula and assumptions."
+            },
+            "bom": {
+                "type": "array",
+                "description": "{role, kicad_symbol, kicad_footprint, resolution_status, search_terms_used[], candidates[], value, quantity, source} entries. kicad_symbol/kicad_footprint come from search_symbols/search_footprints or are null with resolution_status 'unresolved' — writing one no search returned is this schema's single forbidden act."
+            },
+            "physical_constraints": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "The layout constraint record: one key per row of the kicad-pcb skill's layout-methodology reference. Every key is always present; a row with no answer is null or [] AND named in unresolved, which is what distinguishes 'asked, unknown' from 'never considered'.",
+                "properties": {
+                    "board_size_mm": { "type": ["array", "null"], "description": "[w, h] in mm, null until resolved." },
+                    "board_size_status": { "type": ["string", "null"], "description": "Why board_size_mm is null, when it is." },
+                    "mounting_holes": { "type": "array", "description": "{position_mm, position_px, diameter_mm} entries." },
+                    "enclosure": { "type": ["string", "null"], "description": "Enclosure constraint, or null." },
+                    "max_component_height_mm": { "type": ["number", "null"], "description": "Available height, or null." },
+                    "connector_edges": { "type": "array", "description": "{edge, type, pitch_mm, position_px} entries." },
+                    "user_facing_parts": { "type": "array", "description": "{role, why_user_facing} entries." },
+                    "net_currents": { "type": "array", "description": "{net, continuous_a, peak_a, basis, note} entries." },
+                    "net_voltages": { "type": "array", "description": "{net, nominal_v, surge_v, basis, note} entries." },
+                    "signal_speeds": { "type": "array", "description": "{net, frequency_hz, rise_time_ns} entries." },
+                    "sensitive_nets": { "type": "array", "description": "{net, why} entries." },
+                    "layer_count": { "type": ["integer", "null"], "description": "Layer count, or null." },
+                    "stackup": { "type": ["string", "null"], "description": "Stackup, or null." },
+                    "fabricator": { "type": ["string", "null"], "description": "Fabricator capability, or null." },
+                    "assembly_notes": { "type": ["string", "null"], "description": "Assembly and test process, or null." },
+                    "keep_outs": { "type": "array", "description": "{region_mm | region_px, why} entries." },
+                    "unresolved": { "type": "array", "items": { "type": "string" }, "description": "Every field above still unanswered. Layout refuses to proceed when it names board_size_mm, net currents, net voltages, connector edges or the enclosure." }
+                }
+            },
+            "assumptions": { "type": "array", "items": { "type": "string" }, "description": "What every calculation above rests on." },
+            "open_questions": { "type": "array", "items": { "type": "string" }, "description": "What the brief could not settle." }
+        }
+    })
+}
 
 /// The JSON Schema for `save_photo_review_map`'s `map` argument, spelled out
 /// rather than left as a bare `{"type": "object"}`.
@@ -1091,11 +1339,13 @@ fn review_map_schema() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": true,
                 "properties": {
-                    "kind": { "type": "string", "description": "e.g. board_edge_mm or package." },
-                    "value": { "type": "string", "description": "e.g. '50' or '0805'." }
+                    "kind": { "type": "string", "description": "e.g. board_edge_mm, package or mounting_hole_pitch." },
+                    "value": { "type": "string", "description": "e.g. '50' or '0805'." },
+                    "mm_per_px": { "type": "number", "description": "Millimeters per pixel, only once it is resolved from a named physical feature. Omit the key entirely when it is not — never estimate it, and never write it without evidence." },
+                    "evidence": { "type": "string", "description": "The feature and reasoning mm_per_px rests on, e.g. '21px between M3 hole centers, 5mm actual pitch stated by the user'. Required whenever mm_per_px is present." }
                 },
                 "required": ["kind", "value"],
-                "description": "Always user-supplied; never estimated from pixels."
+                "description": "User-supplied, or agent-resolved from a named physical feature; never estimated from pixels alone."
             },
             "components": {
                 "type": "array",
@@ -1147,6 +1397,8 @@ fn review_map_schema() -> serde_json::Value {
                 "type": "array",
                 "description": "The scan's pattern_matches, verbatim. Advisory and never evidence; outside the approval hash."
             },
+            "dossier": dossier_schema(),
+            "design_brief": design_brief_schema(),
             "approved": { "type": "boolean", "description": "Server-owned: ignored on input and rewritten." },
             "approved_at": { "type": ["string", "null"], "description": "Server-owned: ignored on input and rewritten." },
             "content_hash_at_approval": { "type": ["string", "null"], "description": "Server-owned: ignored on input and rewritten." }
@@ -2505,6 +2757,11 @@ mod review_map_tests {
             scale_reference: ScaleReference {
                 kind: "board_edge_mm".to_string(),
                 value: "50".to_string(),
+                // Left unresolved on purpose: the pinned digest below is the
+                // digest of a map written before this change, so the fixture
+                // must keep carrying none of the fields this change adds.
+                mm_per_px: None,
+                evidence: None,
             },
             components,
             nets: vec![ReviewNet {
@@ -2512,6 +2769,8 @@ mod review_map_tests {
                 source: "traced".to_string(),
             }],
             subcircuit_hints: Some(analysis.pattern_matches.clone()),
+            dossier: None,
+            design_brief: None,
             approved: false,
             approved_at: None,
             content_hash_at_approval: None,
@@ -2744,26 +3003,58 @@ mod review_map_tests {
         }
     }
 
-    /// D16's trade-off, made into a test: a field added to design D8 without a
-    /// decision about the hash is an unguarded field. Splitting every schema
-    /// key between the covered list and the excluded list forces that decision.
+    /// D16's trade-off, made into a test: a field added to the review map
+    /// without a decision about the hash is an unguarded field. Splitting
+    /// every schema key between the covered lists and the excluded list forces
+    /// that decision.
+    ///
+    /// Read off `review_map_schema()` rather than off the fixture map, because
+    /// design D6's two sections are exactly the keys a fixture written before
+    /// them does *not* carry — and they are the keys whose coverage most needs
+    /// guarding. The schema is also what a third section would have to be
+    /// added to, so this is where that addition fails the suite.
+    /// `the_map_schema_names_every_review_map_field_and_stays_open` keeps the
+    /// schema and [`PhotoReviewMap`] from drifting apart underneath it.
     #[test]
     fn every_schema_key_is_either_hashed_or_deliberately_not() {
-        let map = fixture_review_map();
-        let schema_keys: std::collections::BTreeSet<&str> = map
+        let schema = review_map_schema();
+        let schema_keys: std::collections::BTreeSet<&str> = schema["properties"]
             .as_object()
-            .expect("object")
+            .expect("the map schema declares properties")
             .keys()
             .map(String::as_str)
             .collect();
         let accounted: std::collections::BTreeSet<&str> = CONTENT_KEYS
             .iter()
             .chain(UNHASHED_KEYS.iter())
+            .chain(OPTIONAL_CONTENT_KEYS.iter())
             .copied()
             .collect();
         assert_eq!(
             schema_keys, accounted,
-            "every review-map key must be listed in CONTENT_KEYS or UNHASHED_KEYS"
+            "every review-map key must be listed in CONTENT_KEYS, OPTIONAL_CONTENT_KEYS or \
+             UNHASHED_KEYS"
+        );
+
+        // The same decision one level down: design D3's two additions to the
+        // scale reference are conditionally covered, and nothing else may
+        // appear there without joining one of the two lists.
+        let scale_keys: std::collections::BTreeSet<&str> = schema["properties"]["scale_reference"]
+            ["properties"]
+            .as_object()
+            .expect("the scale reference declares properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let scale_accounted: std::collections::BTreeSet<&str> = SCALE_REFERENCE_CONTENT_KEYS
+            .iter()
+            .chain(SCALE_REFERENCE_OPTIONAL_CONTENT_KEYS.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            scale_keys, scale_accounted,
+            "every scale_reference key must be listed in SCALE_REFERENCE_CONTENT_KEYS or \
+             SCALE_REFERENCE_OPTIONAL_CONTENT_KEYS"
         );
     }
 
@@ -2785,6 +3076,406 @@ mod review_map_tests {
         assert_eq!(
             review_map_content_hash(&reserialized),
             review_map_content_hash(&raw)
+        );
+    }
+
+    // ─── The two additive sections (tasks 2.1 and 2.4, design D4/D5/D6) ──────
+
+    /// A dossier small enough to read in a diff but carrying one instance of
+    /// every shape design D4 declares: a claim object with an evidence
+    /// pointer, an array of objects, and a nested singleton object.
+    fn sample_dossier() -> serde_json::Value {
+        json!({
+            "identity": {
+                "summary": "24 V LED lamp module",
+                "basis": "observed",
+                "confidence": 0.95,
+                "evidence": [
+                    { "view": "boardA_zoom3.png", "rect_px": [30, 430, 180, 24], "note": "silkscreen identity line" }
+                ]
+            },
+            "physical": {
+                "board_size_px": [410, 445],
+                "board_size_mm": null,
+                "scale_status": "unresolved — no scale reference supplied",
+                "mounting_holes": [{ "position_px": [18, 20], "role": "plated_corner", "count": 4 }],
+                "connectors": [{ "type": "2-pin screw terminal", "edge": "bottom", "basis": "observed", "confidence": 0.9 }],
+                "layers_visible": "top silkscreen + bottom copper only"
+            },
+            "component_survey": [
+                {
+                    "visual_class": "led_5mm_clear",
+                    "count": 107,
+                    "count_method": "blob_count_hsv",
+                    "count_confidence": 0.8,
+                    "count_alternatives": [{ "method": "hough_circles", "count": 63 }],
+                    "locations": [{ "region": "full board", "view": "boardA_top.png", "count": 107 }],
+                    "retrace_component_ids": []
+                }
+            ],
+            "silkscreen_markings": [
+                { "text": "24V", "location_px": [15, 410], "basis": "observed", "confidence": 0.9 }
+            ],
+            "topology_claims": [
+                {
+                    "claim_id": "string-length",
+                    "question": "How many LEDs per series string?",
+                    "basis": "inferred",
+                    "hypotheses": [
+                        { "label": "A", "description": "6 per string", "confidence": 0.6, "calculation": "6 x 2.1V = 12.6V", "assumptions": ["Vf 2.1V"] },
+                        { "label": "B", "description": "8-10 per string", "confidence": 0.3, "calculation": null, "assumptions": [] }
+                    ],
+                    "resolution_path": "count LEDs along one serpentine trace"
+                }
+            ],
+            "retrace_correlation": [
+                { "component_id": "C0000", "bbox_px": [100, 120, 20, 20], "overlap_confidence": 0.7 }
+            ],
+            "photo_views_used": ["boardA_top.png"],
+            "design_brief_seed": {
+                "summary": "N strings of 6x 5mm LEDs + one series resistor each",
+                "depends_on_open_questions": ["string-length"]
+            },
+            "open_questions": ["exact board size in mm — no scale reference supplied"]
+        })
+    }
+
+    /// The design-brief counterpart, carrying the one field design D5 calls
+    /// the schema's single forbidden act if faked: an unresolved BOM entry.
+    fn sample_design_brief() -> serde_json::Value {
+        json!({
+            "derived_from_dossier": true,
+            "block_diagram": [
+                { "block": "led_string_1", "function": "6x LED series string", "inputs": ["24V_RAIL", "GND"], "outputs": [] }
+            ],
+            "circuits": [
+                {
+                    "block": "led_string_1",
+                    "description": "6 LEDs in series + 1 series resistor",
+                    "calculated_values": [
+                        { "parameter": "R1", "value_ohms": 620, "formula": "(24V - 6*2.1V) / 0.02A", "assumptions": ["Vf=2.1V"] }
+                    ],
+                    "derating_notes": "0.25 W dissipated; use 1/2 W axial"
+                }
+            ],
+            "bom": [
+                {
+                    "role": "LED (5mm, through-hole)",
+                    "kicad_symbol": "Device:LED",
+                    "kicad_footprint": "LED_THT:LED_D5.0mm",
+                    "resolution_status": "resolved",
+                    "search_terms_used": ["LED"],
+                    "candidates": [],
+                    "quantity": 107,
+                    "source": "matched"
+                }
+            ],
+            "physical_constraints": {
+                "board_size_mm": null,
+                "board_size_status": "pending scale resolution",
+                "mounting_holes": [{ "position_mm": null, "position_px": [18, 20], "diameter_mm": 3.2 }],
+                "enclosure": null,
+                "max_component_height_mm": null,
+                "connector_edges": [{ "edge": "bottom", "type": "2-pin screw terminal", "pitch_mm": 5.08 }],
+                "user_facing_parts": [],
+                "net_currents": [{ "net": "24V_RAIL", "continuous_a": 0.38, "basis": "inferred" }],
+                "net_voltages": [{ "net": "24V_RAIL", "nominal_v": 24, "basis": "observed" }],
+                "signal_speeds": [],
+                "sensitive_nets": [],
+                "layer_count": null,
+                "stackup": null,
+                "fabricator": null,
+                "assembly_notes": null,
+                "keep_outs": [],
+                "unresolved": ["board_size_mm", "enclosure", "layer_count"]
+            },
+            "assumptions": ["Vf averaged at 2.1V"],
+            "open_questions": ["string length not yet resolved"]
+        })
+    }
+
+    fn map_with_both_sections(map_id: &str) -> serde_json::Value {
+        let mut map = sample_map(map_id);
+        map["dossier"] = sample_dossier();
+        map["design_brief"] = sample_design_brief();
+        map
+    }
+
+    /// Spec scenarios "a dossier persists like any other reviewed section" and
+    /// "a design brief persists additively": both sections survive the
+    /// validator-then-overlay write path byte for byte, nested arrays and
+    /// evidence pointers included.
+    #[tokio::test]
+    async fn a_map_with_both_new_sections_round_trips_through_save_and_load() {
+        let (project, _canonical) = scanned_project("both-sections");
+        let map = map_with_both_sections("both-sections");
+        save(project.path(), &map).await;
+
+        let loaded = response_json(&load(project.path(), "both-sections").await);
+        assert_eq!(loaded["map"]["dossier"], sample_dossier());
+        assert_eq!(loaded["map"]["design_brief"], sample_design_brief());
+    }
+
+    /// Design D6: on disk a section is either an object or not there. A
+    /// `null` is refused with a message that names the alternative, so the
+    /// "absent vs null" ambiguity never reaches the hash.
+    #[tokio::test]
+    async fn save_rejects_a_new_section_that_is_present_but_not_an_object() {
+        let (project, canonical) = scanned_project("not-an-object");
+
+        for (key, value) in [
+            ("dossier", serde_json::Value::Null),
+            ("dossier", json!("a sentence")),
+            ("design_brief", serde_json::Value::Null),
+            ("design_brief", json!([])),
+        ] {
+            let mut map = sample_map("not-an-object");
+            map[key] = value.clone();
+            let message = response_text(&save(project.path(), &map).await);
+            assert!(
+                message.contains(key)
+                    && message.contains("Omit")
+                    && message.contains("Nothing was written"),
+                "{key} = {value}: {message}"
+            );
+        }
+
+        assert!(
+            !map_file(&canonical, "not-an-object").exists(),
+            "a rejected map must not leave a file behind"
+        );
+    }
+
+    /// Design D7: the two sections are optional additions to an existing
+    /// record, and every level a human hand-edits stays open.
+    #[test]
+    fn the_map_schema_declares_both_sections_optional_and_open() {
+        let map_schema = schema_of("save_photo_review_map")["properties"]["map"].clone();
+        let required = map_schema["required"].as_array().expect("required");
+
+        for section in OPTIONAL_CONTENT_KEYS {
+            assert!(
+                !required.iter().any(|name| name == section),
+                "{section} must stay optional — a map written before this change has none"
+            );
+            assert_eq!(
+                map_schema["properties"][section]["additionalProperties"],
+                json!(true),
+                "{section} must stay open so hand annotations survive a save"
+            );
+        }
+
+        // Design D7: every array of objects is declared without an `items`
+        // subschema, so the open-record allowlist stays at its six paths
+        // instead of growing an entry per element field.
+        for (section, arrays) in [
+            (
+                "dossier",
+                vec![
+                    "component_survey",
+                    "silkscreen_markings",
+                    "topology_claims",
+                    "retrace_correlation",
+                ],
+            ),
+            ("design_brief", vec!["block_diagram", "circuits", "bom"]),
+        ] {
+            for array in arrays {
+                let node = &map_schema["properties"][section]["properties"][array];
+                assert_eq!(node["type"], json!("array"), "{section}.{array}");
+                assert!(
+                    node.get("items").is_none(),
+                    "{section}.{array} must declare no items subschema (design D7)"
+                );
+            }
+        }
+    }
+
+    /// Design D6, case (1): the first checkpoint. A map approved while it had
+    /// no dossier is describing content the reviewer never saw once one
+    /// arrives, so the approval must not survive it.
+    #[tokio::test]
+    async fn adding_a_dossier_to_an_approved_map_revokes_its_approval() {
+        let (project, _canonical) = scanned_project("dossier-added");
+        let map = sample_map("dossier-added");
+        save(project.path(), &map).await;
+        approve(project.path(), "dossier-added").await;
+        assert_eq!(
+            response_json(&load(project.path(), "dossier-added").await)["approval_valid"],
+            json!(true),
+            "the map is approved before the dossier arrives"
+        );
+
+        let mut with_dossier = map.clone();
+        with_dossier["dossier"] = sample_dossier();
+        assert_ne!(
+            review_map_content_hash(&map),
+            review_map_content_hash(&with_dossier),
+            "a dossier must join the hashed bytes"
+        );
+
+        let saved = response_json(&save(project.path(), &with_dossier).await);
+        assert_eq!(saved["approved"], json!(false));
+        let loaded = response_json(&load(project.path(), "dossier-added").await);
+        assert_eq!(loaded["approval_valid"], json!(false));
+        assert_eq!(loaded["map"]["approved_at"], serde_json::Value::Null);
+        assert_eq!(
+            loaded["map"]["content_hash_at_approval"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// Design D6, case (2): the second checkpoint, through the same
+    /// mechanism. Re-approving the dossier does not pre-approve the design
+    /// brief that follows it.
+    #[tokio::test]
+    async fn adding_a_design_brief_revokes_a_re_approved_dossier_only_map() {
+        let (project, _canonical) = scanned_project("brief-added");
+        let mut with_dossier = sample_map("brief-added");
+        with_dossier["dossier"] = sample_dossier();
+        save(project.path(), &with_dossier).await;
+        approve(project.path(), "brief-added").await;
+        assert_eq!(
+            response_json(&load(project.path(), "brief-added").await)["approval_valid"],
+            json!(true),
+            "checkpoint one: the dossier is approved"
+        );
+
+        let mut with_brief = with_dossier.clone();
+        with_brief["design_brief"] = sample_design_brief();
+        assert_ne!(
+            review_map_content_hash(&with_dossier),
+            review_map_content_hash(&with_brief)
+        );
+
+        assert_eq!(
+            response_json(&save(project.path(), &with_brief).await)["approved"],
+            json!(false),
+            "checkpoint two: the brief needs its own approval"
+        );
+        assert_eq!(
+            response_json(&load(project.path(), "brief-added").await)["approval_valid"],
+            json!(false)
+        );
+    }
+
+    /// Design D6, case (3): the same conditional rule one level down. A scale
+    /// the agent resolved is covered; one that was never resolved contributes
+    /// exactly the two members it always did.
+    #[test]
+    fn resolving_a_scale_reference_changes_the_hash_and_leaving_it_unresolved_does_not() {
+        let base = sample_map("scale");
+        let baseline = review_map_content_hash(&base);
+
+        for (what, field, value) in [
+            ("mm_per_px", "mm_per_px", json!(0.24)),
+            (
+                "evidence",
+                "evidence",
+                json!("21px between M3 hole centers, 5mm pitch stated by the user"),
+            ),
+        ] {
+            let mut resolved = base.clone();
+            resolved["scale_reference"][field] = value;
+            assert_ne!(
+                review_map_content_hash(&resolved),
+                baseline,
+                "a scale reference gaining {what} must move the digest"
+            );
+        }
+
+        // The other direction: an unresolved scale reference serializes to
+        // exactly `{kind, value}` — no null members — so its contribution to
+        // the digest is byte-identical to what this function produced before
+        // design D3 added the pair.
+        let unresolved = serde_json::to_value(ScaleReference {
+            kind: "board_edge_mm".to_string(),
+            value: "50".to_string(),
+            mm_per_px: None,
+            evidence: None,
+        })
+        .expect("serializes");
+        assert_eq!(
+            unresolved,
+            json!({ "kind": "board_edge_mm", "value": "50" })
+        );
+        let mut through_the_struct = base.clone();
+        through_the_struct["scale_reference"] = unresolved;
+        assert_eq!(review_map_content_hash(&through_the_struct), baseline);
+    }
+
+    /// Design D6, case (4): a removal is a real removal. The record written is
+    /// the overlay over the *incoming* map, not a merge onto the stored one,
+    /// so a key the caller omits is genuinely gone afterwards — and the gate
+    /// closes in that direction too.
+    #[tokio::test]
+    async fn removing_an_approved_dossier_drops_the_section_and_revokes_approval() {
+        let (project, _canonical) = scanned_project("dossier-removed");
+        let mut with_dossier = sample_map("dossier-removed");
+        with_dossier["dossier"] = sample_dossier();
+        save(project.path(), &with_dossier).await;
+        approve(project.path(), "dossier-removed").await;
+
+        assert_eq!(
+            response_json(&save(project.path(), &sample_map("dossier-removed")).await)["approved"],
+            json!(false)
+        );
+        let loaded = response_json(&load(project.path(), "dossier-removed").await);
+        assert!(
+            loaded["map"].get("dossier").is_none(),
+            "the section is gone from the record, not left behind as null: {}",
+            loaded["map"]
+        );
+        assert_eq!(loaded["approval_valid"], json!(false));
+    }
+
+    /// Design D6, case (5) — the `skip_serializing_if` guard, and the reason
+    /// this change is safe to ship against maps already approved in the field.
+    ///
+    /// Without `skip_serializing_if = "Option::is_none"` on the four new
+    /// fields, `serde_json::to_value(&parsed)` emits `"dossier": null`, the
+    /// save path's overlay writes that null into every record, `map.get`
+    /// answers `Some(Null)`, the conditional insert fires, and every
+    /// pre-existing approval is revoked by a save that changed nothing.
+    /// Mirrors `a_review_map_round_trips_and_tolerates_absent_subcircuit_hints`.
+    #[tokio::test]
+    async fn a_map_with_neither_new_section_survives_a_save_round_trip_unchanged() {
+        let raw = sample_map("no-sections");
+        let parsed: PhotoReviewMap = serde_json::from_value(raw.clone()).expect("parses");
+        assert!(parsed.dossier.is_none() && parsed.design_brief.is_none());
+
+        let reserialized = serde_json::to_value(&parsed).expect("serializes");
+        for absent in OPTIONAL_CONTENT_KEYS {
+            assert!(
+                reserialized.get(absent).is_none(),
+                "an absent {absent} must stay absent, never serialize as null"
+            );
+        }
+        for absent in SCALE_REFERENCE_OPTIONAL_CONTENT_KEYS {
+            assert!(
+                reserialized["scale_reference"].get(absent).is_none(),
+                "an unresolved scale_reference.{absent} must stay absent"
+            );
+        }
+        assert_eq!(
+            review_map_content_hash(&reserialized),
+            review_map_content_hash(&raw)
+        );
+
+        // And the property that actually matters in the field: approving a map
+        // that has neither section, then re-saving exactly what `load` handed
+        // back, keeps the approval.
+        let (project, _canonical) = scanned_project("no-sections");
+        save(project.path(), &raw).await;
+        approve(project.path(), "no-sections").await;
+        let loaded = response_json(&load(project.path(), "no-sections").await);
+        assert_eq!(loaded["approval_valid"], json!(true));
+
+        let resaved = response_json(&save(project.path(), &loaded["map"]).await);
+        assert_eq!(
+            resaved["approved"],
+            json!(true),
+            "re-saving an untouched map must not revoke its approval"
         );
     }
 
@@ -3207,11 +3898,16 @@ mod review_map_tests {
             .keys()
             .cloned()
             .collect();
+        // The fixture carries none of design D6's optional sections — that is
+        // what keeps its pinned digest the digest of a pre-change map — so the
+        // schema legitimately declares those two keys and the fixture does
+        // not. Everything else must match key for key.
         let actual: std::collections::BTreeSet<String> = fixture_review_map()
             .as_object()
             .expect("object")
             .keys()
             .cloned()
+            .chain(OPTIONAL_CONTENT_KEYS.iter().map(|key| (*key).to_string()))
             .collect();
         assert_eq!(
             declared, actual,
