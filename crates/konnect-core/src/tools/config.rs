@@ -50,6 +50,15 @@ fn default_user_config() -> serde_json::Value {
                 "connector": { "current": 0.80 },
                 "regulator": { "power": 0.70, "current": 0.80 }
             }
+        },
+        // Photo-intake (`retrace`) preferences. All three are safe when
+        // untouched: a null interpreter means "discover one", an empty
+        // extras list means "expect nothing", and the timeout is sized
+        // against the scan the tool actually runs, not a KiCad render.
+        "photo_intake": {
+            "retrace_python_path": null,
+            "retrace_extras_expected": [],
+            "retrace_timeout_seconds": 120
         }
     })
 }
@@ -129,6 +138,29 @@ fn deep_merge(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_js
         (_, overlay) if !overlay.is_null() => overlay.clone(),
         (base, _) => base.clone(),
     }
+}
+
+/// The merged configuration a Rust module should read: built-in defaults,
+/// overlaid with the user's config file, overlaid with the project's.
+///
+/// This exists because `config.rs` otherwise exposes only [`tools`] —
+/// `load_user_config`/`get_effective_config` are MCP tools, not functions, so
+/// a module such as `photo_intake` has no other way to read a preference the
+/// user persisted.
+///
+/// The built-in defaults are merged in explicitly rather than used only as a
+/// read fallback: a user whose `config.json` predates a new key would
+/// otherwise get no value for it at all, since [`read_config`] returns the
+/// file's contents whole when the file parses. `handle_get_effective_config`
+/// keeps its own (unchanged) behaviour — this accessor is additive.
+pub(crate) async fn effective_config(project_dir: Option<&Path>) -> serde_json::Value {
+    let user = read_config(&user_config_path(), default_user_config()).await;
+    let user = deep_merge(&default_user_config(), &user);
+    let project = match project_dir {
+        Some(dir) => read_config(&project_config_path(dir), default_project_config()).await,
+        None => default_project_config(),
+    };
+    deep_merge(&user, &project)
 }
 
 /// Set a value at a dot-notation path, e.g. "fab_constraints.fab_house" = "JLCPCB".
@@ -564,6 +596,62 @@ mod dot_path_and_merge_tests {
         let project = json!({ "sourcing": { "avl": ["Vishay"] } });
         let merged = deep_merge(&user, &project);
         assert_eq!(merged["sourcing"]["avl"], json!(["Vishay"]));
+    }
+
+    /// The photo-intake keys the `photo_intake` toolset reads must exist in
+    /// the defaults with the documented values — a missing key would send
+    /// every scan down interpreter discovery with no timeout of its own.
+    #[test]
+    fn default_photo_intake_config_is_present_with_documented_values() {
+        let user = default_user_config();
+        assert_eq!(user["photo_intake"]["retrace_python_path"], json!(null));
+        assert_eq!(user["photo_intake"]["retrace_extras_expected"], json!([]));
+        assert_eq!(user["photo_intake"]["retrace_timeout_seconds"], 120);
+    }
+
+    /// Project config wins over user config for a `photo_intake.*` key, and
+    /// the keys the project does not mention survive the merge.
+    #[tokio::test]
+    async fn effective_config_lets_the_project_override_a_photo_intake_key() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let config_dir = project.path().join(".konnect");
+        std::fs::create_dir_all(&config_dir).expect("create .konnect");
+        std::fs::write(
+            config_dir.join("project.json"),
+            serde_json::to_string_pretty(&json!({
+                "photo_intake": { "retrace_timeout_seconds": 300 }
+            }))
+            .unwrap(),
+        )
+        .expect("write project config");
+
+        let effective = effective_config(Some(project.path())).await;
+
+        assert_eq!(effective["photo_intake"]["retrace_timeout_seconds"], 300);
+        assert_eq!(
+            effective["photo_intake"]["retrace_python_path"],
+            json!(null),
+            "a key the project does not mention must survive from the user layer"
+        );
+    }
+
+    /// The user layer is the base, not a replacement: a project object that
+    /// names one `photo_intake` key must not erase the others.
+    #[test]
+    fn project_photo_intake_overlay_keeps_unmentioned_user_keys() {
+        let user = json!({
+            "photo_intake": {
+                "retrace_python_path": "C:/py/python.exe",
+                "retrace_timeout_seconds": 120
+            }
+        });
+        let project = json!({ "photo_intake": { "retrace_timeout_seconds": 45 } });
+        let merged = deep_merge(&user, &project);
+        assert_eq!(merged["photo_intake"]["retrace_timeout_seconds"], 45);
+        assert_eq!(
+            merged["photo_intake"]["retrace_python_path"],
+            "C:/py/python.exe"
+        );
     }
 
     #[test]
