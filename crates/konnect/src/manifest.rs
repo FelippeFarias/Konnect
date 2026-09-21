@@ -34,10 +34,16 @@ pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
         name: "konnect",
         content: include_str!("../assets/skills/konnect/SKILL.md"),
-        references: &[(
-            "reliability-contract.md",
-            include_str!("../../../docs/RELIABILITY_CONTRACT.md"),
-        )],
+        references: &[
+            (
+                "reliability-contract.md",
+                include_str!("../../../docs/RELIABILITY_CONTRACT.md"),
+            ),
+            (
+                "operating-notes.md",
+                include_str!("../assets/skills/konnect/references/operating-notes.md"),
+            ),
+        ],
     },
     SkillManifest {
         name: "kicad-schematic",
@@ -50,6 +56,14 @@ pub const SKILLS: &[SkillManifest] = &[
             (
                 "wiring-patterns.md",
                 include_str!("../assets/skills/kicad-schematic/references/wiring-patterns.md"),
+            ),
+            (
+                "design-calculations.md",
+                include_str!("../assets/skills/kicad-schematic/references/design-calculations.md"),
+            ),
+            (
+                "interface-design.md",
+                include_str!("../assets/skills/kicad-schematic/references/interface-design.md"),
             ),
         ],
     },
@@ -80,6 +94,10 @@ pub const SKILLS: &[SkillManifest] = &[
             (
                 "routing-gate.md",
                 include_str!("../assets/skills/kicad-pcb/references/routing-gate.md"),
+            ),
+            (
+                "routing-playbook.md",
+                include_str!("../assets/skills/kicad-pcb/references/routing-playbook.md"),
             ),
         ],
     },
@@ -112,6 +130,18 @@ pub const SKILLS: &[SkillManifest] = &[
             (
                 "layout-review.md",
                 include_str!("../assets/skills/kicad-review/references/layout-review.md"),
+            ),
+            (
+                "verification-traps.md",
+                include_str!("../assets/skills/kicad-review/references/verification-traps.md"),
+            ),
+            (
+                "datasheet-audit.md",
+                include_str!("../assets/skills/kicad-review/references/datasheet-audit.md"),
+            ),
+            (
+                "review-orchestration.md",
+                include_str!("../assets/skills/kicad-review/references/review-orchestration.md"),
             ),
         ],
     },

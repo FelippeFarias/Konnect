@@ -383,6 +383,58 @@ set_footprint_models(
 
 ---
 
+## Footprints Against the Purchased Part
+
+A footprint is accepted for the part that will actually be bought, not for
+the part its name comes from. On one production board these slipped through
+until an independent review:
+
+- **THT holes from the purchased part's drawing.** A clone terminal block on
+  a brand-name footprint had 1.30 mm holes where its maker asks for 1.50 mm
+  (pin diagonal 1.20 mm). Use the maker's recommended hole, or at least the
+  pin diagonal plus 0.2–0.3 mm, and remember the fabricator's plated-hole
+  tolerance.
+- **Pitch and land pattern of the real part.** 5.00 mm versus 5.08 mm pitch
+  terminal blocks accumulate error across positions; an inductor substitute
+  with the same body needed 2.8 × 5.7 mm pads instead of 2.35 × 5.10 mm.
+  Re-check the land pattern after every stock-driven substitution.
+- **Stock footprints against the fabricator.** The stock ESP32-S3-WROOM-1
+  footprint carries 0.2 mm thermal-via drills, below a common 0.3 mm
+  two-layer minimum, and no antenna keepout rule area. Make a project copy,
+  fix it, add the keepout, and point the symbol at the copy.
+- **Pads sharing a number.** `edit_footprint_pad` with `match_all` changes
+  every pad with that number: on that module 12 thermal vias and the SMD
+  thermal pad are all pad 41, and the SMD pad received a drill. Rename,
+  edit, and rename back, then verify with `get_footprint_info`.
+- **Library silkscreen** often uses 0.12 mm lines, below many fabricators'
+  minimum; fix the width in project copies.
+- **Paste-only apertures** under a thermal pad are normal in module and QFN
+  footprints; count them before calling a pad unpasted.
+- **Intentional deviations live in a project library.** A drill, land
+  pattern, or keepout edited only on the board is reverted by the next
+  Update Footprints from Library, and the permanent library-mismatch warning
+  hides real mismatches.
+- **3D models are part of the part.** Confirm each referenced model file
+  resolves, align a third-party model by the footprint's mechanical datums
+  (alignment holes) and check it in a render, keep project models under
+  `${KIPRJMOD}/3dmodels`, and update the model when the part changes (lens
+  colour, a taller can). Flag approximate models.
+
+### Pinout evidence
+
+- Take pinouts from the manufacturer's rendered package drawing; a
+  text-extracted mirror of one ESD array's pin table named pins that do not
+  exist. Cross-check the table, the drawing, and the logic symbol, and look
+  for duplicate pin numbers (one datasheet lists SRCK on pin 15 and pin 13).
+- Same-package variants can swap pins: AP2114H and AP2114HA are both SOT-223
+  with different pinouts. Record the full suffix with the pin map.
+- A pin-compatible stand-in symbol is acceptable only after a pin-by-pin
+  comparison of both datasheets, documented on the sheet; ground the union of
+  pins that are NC on one part and ground on the other when both parts must
+  fit.
+
+---
+
 ## Library Registration
 
 ### Register a Symbol Library

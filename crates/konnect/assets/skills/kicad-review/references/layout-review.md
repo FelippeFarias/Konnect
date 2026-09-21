@@ -32,6 +32,13 @@ Save first (`save_project`): DRC and the renders read the saved file.
 | Test | Supply, GND, programming, and key signals reachable without stubs on fast lines | Rendered view; net list |
 | Mechanical | Holes, connectors, and heights match the enclosure | Constraint record; `get_board_extents`; `check_clearance` |
 | Placement quality | Blocks grouped along the flow; pins face destinations; airwires do not cross bodies | `score_placement`; rendered view; `get_component_pads` |
+| Ground robustness | No articulation point at an IC ground; every island connected at least twice; stitching gaps bounded | Graph of GND copper (tracks, vias, pads, filled islands); Tarjan articulation points |
+| Decoupling effectiveness | Copper path cap → pin and via count, not straight-line distance; severity from the current that pin really carries | Shortest path over the net's tracks; `query_traces` |
+| Return detours | Path through ground copper from a switching regulator to sensitive grounds compared with the straight line | Breadth-first search through both layers and vias |
+| Joints | Track ends centred on vias; no via in an SMD pad opening | DRC warnings reviewed one by one; pad-opening geometry |
+| Silkscreen meaning | Each legend nearest its own part or pin; rotated text rendered and read | Word positions against pads; rendered image |
+| Edge and depaneling | Pad-to-edge distances where the board is V-cut or broken off after assembly | `get_component_pads` against `get_board_extents` |
+| Hot pads | Copper connected to each part dissipating more than about 0.3 W, against the area the datasheet's θJA assumes | Copper area by radius; datasheet |
 
 ## Layout findings and severity
 
@@ -50,9 +57,20 @@ Save first (`save_project`): DRC and the renders read the saved file.
 | No test points on supply, GND, or debug signals | SUGGESTION | Harder bring-up |
 | Reference designators unreadable or under parts | SUGGESTION | Assembly and debug |
 | DRC or render collected from an unsaved board | INCOMPLETE | The evidence describes a stale file |
+| A single-path track-to-via joint where the track copper does not reach the barrel (measured) | CRITICAL | Connectivity passes; the joint opens in production |
+| An IC ground pad whose only path to the plane is one pad, via, or neck (articulation point) | WARNING, CRITICAL when that path is another part's pad or a single via under an ESD or interface device | One defect disconnects the IC's ground |
+| A net narrower than its netclass without a recorded capacity check | CRITICAL when it carries supply current; WARNING otherwise | DRC does not enforce netclass widths |
+| A via inside an SMD pad opening | WARNING | Solder wicks down the bare hole and starves the joint |
+| A silkscreen legend nearer another pin or part than its own | WARNING | Field wiring errors |
+| A clean result from a disabled or never-requested check | INCOMPLETE | The check could not fail (`verification-traps.md`) |
 
 A visual finding is heuristic until a pad position, trace list, or DRC item
 corroborates it; report the corroboration, not only the picture.
+
+Some of these measurements need geometry that Konnect does not expose yet
+(articulation points, copper path length, joint contact, word positions).
+When the tools available cannot collect one, mark that check blocked and
+name the method, rather than reporting it as passed.
 
 ## Report additions
 

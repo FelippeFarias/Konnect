@@ -262,6 +262,65 @@ fn skills_define_the_same_evidence_boundary_as_their_agents() {
     );
 }
 
+/// The One Rule's single exception keeps every guard that made script edits
+/// survivable on a real project: board file only, a named missing capability,
+/// KiCad closed with a dated copy, a save that leaves the project file alone,
+/// and DRC with parity afterwards. The scripts that failed there (a save that
+/// never happened, track ends snapped to the wrong pad of the same net) were
+/// caught only by these checks, so none of them may drop out of the guidance.
+#[test]
+fn scripted_board_fallback_stays_guarded() {
+    let konnect = include_str!("../assets/skills/konnect/SKILL.md");
+    let notes = include_str!("../assets/skills/konnect/references/operating-notes.md");
+    let one_rule = section(konnect, "## The One Rule", "## Protected Files");
+    let procedure = section(notes, "## 6. Scripted board fallback", "\n## 7.");
+
+    for marker in [
+        "Scripted board fallback",
+        "Board file only",
+        "missing capability",
+        "No lock files",
+        "dated copy",
+        "schematic parity",
+    ] {
+        assert!(
+            one_rule.contains(marker),
+            "konnect skill's One Rule lost a fallback guard: {marker}"
+        );
+    }
+    assert!(
+        konnect.contains("never replaces a server that is not connected"),
+        "konnect skill lets the board fallback stand in for a missing server"
+    );
+
+    for marker in [
+        "Not a way around a tool's refusal",
+        "no lock file remains",
+        "project file's hash",
+        "`pcbnew.SaveBoard(path, board, True)`",
+        "`run_drc` (schematic parity included)",
+        "restore the dated copy",
+    ] {
+        assert!(
+            procedure.contains(marker),
+            "operating notes' fallback procedure lost a guard: {marker}"
+        );
+    }
+}
+
+/// The text from the `start` heading up to the next `end` marker, so a guard
+/// quoted elsewhere in the file cannot satisfy a check on this section.
+fn section<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let from = text
+        .find(start)
+        .unwrap_or_else(|| panic!("missing section `{start}`"));
+    let rest = &text[from..];
+    let to = rest[start.len()..]
+        .find(end)
+        .map_or(rest.len(), |i| i + start.len());
+    &rest[..to]
+}
+
 /// Manufacturing guidance must describe evidence the released tools actually
 /// return, and it must remain safe while artifact verification is implemented
 /// independently in #270. v0.10.0 claimed four validations the handler did not
@@ -677,6 +736,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "kicad_sch",
         "kicad_pcb",
         "kicad_pro",
+        "kicad_dru",
         "kicad_sym",
         "no_connect",
         "power_in",
@@ -708,6 +768,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "match_all",
         "replace_existing",
         "roundrect_rratio",
+        // KiCad custom-rule (`.kicad_dru`) constraint keyword quoted in rule
+        // examples, not a callable tool.
+        "track_width",
         // Structured MCP error discriminant, not a callable tool.
         "unsafe_file_fallback",
         // Structured manufacturing response field, not a callable tool.

@@ -7,14 +7,46 @@ description: "Mandatory operating rules for ANY task involving KiCAD projects. L
 
 ## The One Rule
 
-**KiCAD source files are not text files.** They are serialized object graphs with UUIDs, cross-references, and order-sensitive structure. Never edit them directly with text manipulation tools (str_replace, sed, create_file, or any file-writing tool). All modifications go through Konnect MCP tools.
+**KiCAD source files are not text files.** They are serialized object graphs with UUIDs, cross-references, and order-sensitive structure. Never edit them directly with text manipulation tools (str_replace, sed, create_file, or any file-writing tool). All modifications go through Konnect MCP tools; the scripted board fallback below is the single, guarded exception.
 
 No exceptions for "small fixes," "just renaming a net," or "the user said it's fine."
+
+The rule protects the project's design files. A disposable copy made outside
+the project folder — to measure a saved board, run DRC experiments, or
+simulate placement and routing — may be created and changed with KiCad's own
+Python API (never with text tools). Nothing from such a copy reaches the
+project except through Konnect tools, KiCad's own import (a Specctra session
+imported by the user), actions the user takes in the KiCad GUI, or the
+verified script re-run on the board under the scripted board fallback.
+
+**Scripted board fallback.** When the connected Konnect server has no tool
+for a change the board needs, the project's `.kicad_pcb` may be changed with
+KiCad's own Python API, run by KiCad's bundled interpreter, only when all of
+these hold (procedure in [the operating notes](references/operating-notes.md)
+§6):
+
+- **Board file only.** Schematic sheets, libraries, library tables, and the
+  project file stay with Konnect tools and the KiCad GUI. Anything that must
+  match the schematic (parts with symbols, footprint IDs, values, fields,
+  nets) changes in the schematic and reaches the board through
+  `update_pcb_from_schematic` or KiCad's Update PCB from Schematic.
+- **A missing capability, named.** Never a shortcut around a tool that
+  exists or around a tool's refusal; the report names the capability for the
+  Konnect roadmap.
+- **KiCad closed and a restorable copy first.** No lock files beside the
+  board or the project file, and a dated copy of the saved board.
+- **Verified or restored.** The save landed, the project file is unchanged,
+  only the intended objects changed, and DRC with schematic parity shows no
+  new violation; otherwise the dated copy goes back.
+
+Only the session that owns the design runs it. Subagents and parallel
+sessions stay read-only, and the bundled agents return the gap to their
+caller.
 
 ## Protected Files — NEVER Edit Directly
 
 - `*.kicad_sch` — schematic sheets
-- `*.kicad_pcb` — PCB layout
+- `*.kicad_pcb` — PCB layout (the scripted board fallback is its only path outside Konnect tools, and it never uses text tools)
 - `*.kicad_pro` — project configuration
 - `*.kicad_sym` / `*.kicad_mod` — symbol/footprint libraries
 - `fp-lib-table` / `sym-lib-table` — library tables
@@ -26,7 +58,7 @@ If asked to directly edit any of these:
 
 ### Channel 1: Konnect MCP (for ALL modifications)
 
-All writes go through MCP tools. Check they are available first (`list_toolboxes`). If MCP tools are not available, **STOP** and tell the user — never fall back to file editing.
+All writes go through MCP tools. Check they are available first (`list_toolboxes`). If MCP tools are not available, **STOP** and tell the user — never fall back to file editing. The scripted board fallback covers a capability the connected server lacks; it never replaces a server that is not connected.
 
 ### Channel 2: Exported netlists/BOMs (for reads and analysis)
 
@@ -48,8 +80,48 @@ does not establish that a missing server-side check ran.
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
 4. **Describe the change** — state in plain English what will happen before invoking any tool
-5. **Execute** — use Konnect MCP tools only
+5. **Execute** — use Konnect MCP tools; the scripted board fallback only under The One Rule's conditions
 6. **Verify** — re-query the design to confirm the change landed correctly
+
+## Operating Realities
+
+Read [the operating notes](references/operating-notes.md) before the first
+mutation in a session where KiCad is open, before asking the user to act in
+the GUI, and whenever a tool cannot do what the task needs. The rules that
+cost the most when ignored:
+
+- **KiCad open owns the files.** Check for lock files before any file-level
+  write. KiCad rewrites the project file when it saves the board, silently
+  discarding netclasses and rules written by tools; write them with the board
+  closed or in Board Setup and read them back after KiCad's next save.
+- **Schematic tools write to disk.** An open schematic editor holds an older
+  copy: the user reloads or closes it choosing not to save, once per phase.
+- **Save after every live batch** (`save_project`) and confirm the file
+  changed; checks and renders read the saved file.
+- **One writer per file and one owner per design.** Never run two write tools
+  on the same sheet in parallel.
+- **Load a tool's schema before its first call**; never create test objects
+  in the live design to discover parameters.
+- **Verify every write where it landed** (saved file, exported netlist, fresh
+  query), not in the tool's message.
+- **Back up restorably before risky edits**: a dated copy of the saved board
+  file, or KiCad's undo for a single IPC batch. `snapshot_project` exports
+  PDFs only and cannot restore anything. Without a restorable backup, do not
+  make the destructive edit. Never move a routed footprint without
+  re-routing it.
+- **When a tool cannot make a change**, say which capability is missing. For
+  a change to the board alone, either give the user the exact KiCad GUI
+  action (menu path, what to tick, what not to click) from the operating
+  notes, or apply the scripted board fallback (The One Rule; operating notes
+  §6); every other file goes through the GUI. KiCad's own Python may always
+  measure a saved board or simulate on a scratch copy.
+- **Decide the obvious; ask about trade-offs.** Make clear engineering calls
+  with data and report them; ask the user only about product intent, cost,
+  and appearance, with numbers and a recommended option. Record every option
+  the user declines as an open risk.
+- **Readiness is earned, not declared.** Never call a design verified or
+  ready from your own pass; the `kicad-review` skill defines the evidence and
+  the readiness levels.
 
 ## Decision Tree
 
@@ -64,6 +136,7 @@ does not establish that a missing server-side check ran.
 | "Add track widths to the PCB dropdown" | 1 | `load_toolset("verification")` then `set_predefined_sizes` |
 | "Export Gerbers" | 1 | `load_toolset("pcb_export")` then `export_gerber` |
 | "Just patch line 247 of the .kicad_sch" | REFUSE | Explain risks, offer MCP alternative |
+| A board change no loaded or available tool can make (track ends, bulk silkscreen width) | Gap | Name the missing capability; give the KiCad GUI action or apply the scripted board fallback (The One Rule) |
 | "Add ESD protection to USB lines" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Check if board is ready for fab" | 2 | Load `verification` + `design_review` toolsets |
 | "Layout the board" / "place and route" | 1 | Delegate the complete layout to `kicad-pcb-layout-agent`; for a bounded edit, the `kicad-pcb` skill with its methodology and gates |
@@ -128,6 +201,13 @@ that agent until it hands back a saved, verified result.
 - Keep small, bounded edits and narrow checks in the current conversation using
   the applicable skill. Agent delegation is for a complete build or an
   independent review, not an extra layer around every tool call.
+- For a pre-fabrication review with several reviewers, follow the
+  `kicad-review` skill's `references/review-orchestration.md`: build each brief
+  from the files, state premises as "believed; verify", tell reviewers which
+  tools exist, require the complete report in the final message, and
+  re-verify every finding that would change the design before acting on it.
+  Subagent findings and their proposed fixes were wrong often enough on a
+  real project that relaying them unverified cost rework.
 
 ## Design Rules Quick Reference
 
@@ -137,8 +217,9 @@ that agent until it hands back a saved, verified result.
 | Crystal load caps | CL = (C1*C2)/(C1+C2) + Cstray (Cstray ~ 3-5pF) |
 | Reset pull-up | 10k to VCC + 100nF to GND |
 | I2C pull-ups | 4.7k (standard), 2.2k (fast), 1k (fast+) — one set per bus |
-| LED resistor | R = (VCC - Vf) / If |
-| PCB layout order | Constraints → blocks and pins → return paths → route by criticality → save → DRC + rendered inspection (kicad-pcb `references/layout-methodology.md`) |
+| LED resistor | Size at both corners (Vf min with supply max against the derated forward current; Vf max with supply min against brightness), never at a typical Vf (kicad-schematic `references/design-calculations.md`) |
+| PCB layout order | Constraints → blocks and pins → return paths → route by criticality → save → DRC + rendered inspection (kicad-pcb `references/layout-methodology.md`, `references/routing-playbook.md`) |
+| Trusting a clean check | Only if it could have failed: no constraint at 0, parity requested, custom rules present, command recorded (kicad-review `references/verification-traps.md`) |
 
 ## Common Library IDs
 

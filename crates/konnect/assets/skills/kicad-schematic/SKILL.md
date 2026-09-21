@@ -37,6 +37,47 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ---
 
+## Before Placing Parts: Requirements, Architecture, Values
+
+A schematic can pass ERC and every connectivity check with wrong values: on
+the reference project (a 344-part LED display built in 30 minutes) three
+blocking power defects and more than ten value errors surfaced a day after
+the schematic was called "verified". Do this first:
+
+1. **Requirements traced to evidence.** When cloning or replacing a reference
+   product, build an interface inventory with one row per element, its
+   evidence (manual page, silkscreen designator, photo), and the decision
+   (replicate or omit). When the user asks to replicate only the reference's
+   interfaces, omit what the reference lacks even if the request lists it as
+   an example, and confirm the omission with the user; every extra connector
+   pin brings protection, thermal, and BOM obligations.
+2. **Operating environment.** Indoor or outdoor, maximum ambient, sun,
+   enclosure material and sealing. It sets every derating.
+3. **Effective configuration.** Read `get_effective_config` before choosing
+   parts: derating classes, default passive sizes, naming. Applying it after
+   the build forced part changes.
+4. **Architecture checkpoint.** For a design from scratch, show the user a
+   one-page brief before placing parts: the interface inventory, the
+   topology with its alternatives and their sensitivity (for LED displays,
+   resistor-ballasted versus constant-current drivers), the power tree with
+   its budget, the provisional MCU pin plan, and open questions.
+5. **Values from datasheets and worst cases.** Open the manufacturer
+   datasheet for every IC and every power, protection, or interface passive,
+   and size values at both corners. Read
+   [`references/design-calculations.md`](references/design-calculations.md)
+   when choosing or sizing any LED, resistor power, fuse or PTC, TVS, series
+   diode, regulator, capacitor, or anything thermal. Read
+   [`references/interface-design.md`](references/interface-design.md) when
+   designing RS-485/RS-232, USB-C, level translation, long clock or data
+   lines, MCU pin plans, power-up and enable states, or connectors that mate
+   with existing equipment.
+6. **Parts that can be bought.** When the fabricator assembles the board,
+   check the distributor's stock, library class, and exact suffix while
+   choosing, and confirm a part meeting a requirement exists before writing
+   the requirement into the design.
+
+---
+
 ## Component Placement
 
 Read [`references/common-lib-ids.md`](references/common-lib-ids.md) when choosing
@@ -215,6 +256,36 @@ Bulk-modify component properties (values, footprints, fields) across multiple co
 - 3+ components: batch operations
 - Mixed operations (place + wire): do placement batch first, then wiring batch
 
+### Repeated blocks
+
+- Probe the tool's behaviour first in a disposable scratch sheet or project,
+  never in the user's design: two or three symbols show how rotation maps to
+  pin direction and whether power symbols connect by pin coincidence;
+  confirm with `export_netlist_summary`.
+- Symbol variants of one family can have different anchors and mirroring (a
+  2-pin terminal-block symbol has its origin on pin 1, the 3-pin one on the
+  middle pin). After replacing or placing one at the same coordinates, check
+  each pin's net; a mirrored or offset symbol leaves pins silently
+  unconnected.
+- Compute each block's components and wires from one parameter table, then
+  apply the block with one `batch_place_components` and one `batch_add_wire`
+  call. `batch_place_components` does not number references, so encode the
+  block index in them (digit n → U1n, Rn01…, Dn01…), which also lets BOM,
+  placement, and layout scripts map reference to position.
+- Build, validate, and render the first instance completely, fix the
+  generator rather than the sheet, and only then replicate.
+- In a sheet placed several times, local labels are per instance while global
+  labels and power symbols are shared; a daisy chain whose data nets differ
+  per instance needs hierarchical pins or separate sheet files with distinct
+  global names. One multi-instance sheet applies a later topology change once
+  instead of per file.
+- Never run two write tools on the same schematic file in parallel: each is a
+  read-modify-write of the file, and one update can be lost. Parallelise only
+  across different files, and read back after any accidental overlap.
+- `batch_edit_schematic_components` updates existing fields only; a new
+  custom property needs `add_component_annotation`. Keep ratings in the Value
+  (`22uF 25V`), where the BOM export and the assembler read them.
+
 ---
 
 ## Common Patterns
@@ -229,7 +300,7 @@ Place resistor (Device:R) vertically. Connect one pin to the signal net via `con
 Two resistors in series, vertically aligned. Top to input net, middle junction to output net, bottom to GND. Use `connect_to_net` for input/output, `add_power_symbol` for GND.
 
 ### LED with Current-Limiting Resistor
-Resistor in series with LED. Connect resistor to signal/power, resistor to LED anode, LED cathode to GND. R = (Vsupply - Vf) / If. Typical: 330R for 3.3V, 470R for 5V.
+Resistor in series with LED. Connect resistor to signal/power, resistor to LED anode, LED cathode to GND. Size R at both corners, not at a typical Vf: the low-Vf, high-supply corner must stay under the LED's forward-current limit derated at the maximum internal ambient, and the high-Vf, low-supply corner must still meet the brightness requirement. Solve indicator LEDs far below their test current against the diode curve. Method and worked numbers: `references/design-calculations.md` §2.
 
 ### Bypass/Decoupling Filter
 For analog circuits: 100nF ceramic + 10uF electrolytic in parallel, close to power pins. Place ceramic closest to IC.
@@ -269,7 +340,27 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 5. Run `find_orphan_items` as a heuristic and corroborate its findings.
 6. Run direct KiCad ERC with `run_erc` and classify every violation.
 7. Run `render_schematic_png` with inline output and inspect the actual image.
+   On large sheets an inline image can exceed the tool-result limit; render
+   to a file and read the file instead.
 8. Fix findings and repeat every check invalidated by the edits.
+9. Assert the design intent against the netlist of the saved schematic
+   (chain order, shared clocks, every string from its resistor through N LEDs
+   to its driver pin, interface nets, every single-pin net an intentional
+   no-connect) — by script over the exported netlist where a shell is
+   available, otherwise with `export_netlist_summary` and
+   `get_net_components`. The netlist is the connectivity ground truth: pin
+   queries return a null net for wire-only nets. Parse an exported netlist as
+   S-expressions — regular expressions over KiCad 10's multi-line netlist
+   silently match nothing.
+10. Check references across all sheets after adding symbols; power symbols
+    added per sheet have collided with existing references while ERC stayed
+    clean.
+
+ERC plus a netlist check proves the wiring matches the intent; it does not
+prove the values. A completion claim also needs the worst-case records of
+`references/design-calculations.md` for every power, protection, LED,
+interface, and thermal-relevant part. Without them, report "connectivity
+verified, design values not reviewed".
 
 ---
 
@@ -320,6 +411,13 @@ the circuit. Before handing over to the `kicad-pcb` skill or the
 - parts that heat, parts that must sit at an edge (connectors, controls,
   indicators), and decoupling that must sit at a specific pin;
 - supply voltages, isolation, and surge requirements;
+- which assignments are interchangeable and may be swapped to suit the
+  layout — GPIO functions behind a pin matrix, driver outputs mapped by
+  firmware, the position of a series part inside a string — so the layout can
+  match them to geometry and hand the swaps back;
+- the operating environment and the firmware requirements the hardware
+  relies on (register clear before enable, GPIO initial levels, thermal
+  derating);
 - which of those values are assumptions rather than requirements.
 
 The layout asks the user for anything load-bearing that this handoff leaves
@@ -337,3 +435,10 @@ unknown; it does not guess.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
 10. **Batch for bulk** — use batch toolset for 3+ repetitive operations
+11. **Values from datasheets at worst case** — never from habit or a typical
+    value; keep the record in `references/design-calculations.md` form
+12. **One writer per file** — never two write tools on the same sheet at once
+13. **Notes are part of the design** — sheet notes, pin maps, and firmware
+    requirements change in the same edit as the circuit they describe
+14. **Ratings in the Value** — voltage, power, dielectric where they decide the
+    purchase; the Value names the part actually ordered

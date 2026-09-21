@@ -12,6 +12,9 @@ argument-hint: "[layout task]"
 
 This skill guides Claude to perform PCB layout using Konnect MCP tools.
 ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
+The only exception is the konnect skill's scripted board fallback, for a
+change no tool can make: KiCad's own Python API with KiCad closed, never a
+text tool.
 
 Layout is not "connect the schematic's dots". The order is: understand the
 circuit → write the constraints → plan layers and return currents → place by
@@ -20,10 +23,13 @@ paths → route by criticality → review → measure. A visually tidy board is 
 necessarily an electrically good one; a good placement removes most routing
 problems before the first trace exists. Read
 [`references/layout-methodology.md`](references/layout-methodology.md) before
-any placement or routing task, and close the two gates —
-[`references/placement-gate.md`](references/placement-gate.md) before routing
-and [`references/routing-gate.md`](references/routing-gate.md) before claiming
-completion.
+any placement or routing task, use
+[`references/routing-playbook.md`](references/routing-playbook.md) for the
+techniques that make routing clean (layer plan, planar fan-out, bus lanes,
+repeated blocks, dense corners, autorouter policy, ground), and close the two
+gates — [`references/placement-gate.md`](references/placement-gate.md) before
+routing and [`references/routing-gate.md`](references/routing-gate.md) before
+claiming completion.
 
 ---
 
@@ -85,6 +91,11 @@ Always call `get_active_toolsets()` first to see what is already loaded.
   at the start of any placement or routing work: constraint record,
   block-and-flow placement, placement order, return-path planning, routing
   priority, and the final review table.
+- Read [`references/routing-playbook.md`](references/routing-playbook.md)
+  before placing a board with repeated blocks, interchangeable driver outputs,
+  long buses, a module, or a dense connector corner, and again before the
+  first trace: it records how a 400 mm production board was routed cleanly
+  after two autorouter attempts were rejected.
 - Read [`references/placement-gate.md`](references/placement-gate.md) when
   placement is believed done. Routing does not start until it passes.
 - Read [`references/routing-gate.md`](references/routing-gate.md) before the
@@ -116,12 +127,25 @@ evidence leaves the layout `INCOMPLETE`.
 1. **Constraint record** — fill the table in
    `references/layout-methodology.md` section 1. Ask the user for any
    load-bearing row the request does not establish (board size, connector
-   sides, enclosure, currents, voltages, layers, fabricator); do not assume.
+   sides, enclosure, operating environment, currents, voltages, layers,
+   fabricator and panel configuration); do not assume.
 2. **Board outline, holes, rules** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
-   without it leaves two overlapping outlines and a DRC failure. Add mounting
+   without it leaves two overlapping outlines and a DRC failure. A notch or
+   cutout on an edge is drawn by breaking that edge into segments around it; a
+   rectangle drawn over the edge line makes a self-intersecting outline (four
+   invalid-outline errors). Any outline change needs a zone refill and a
+   regeneration of every fabrication file. Add mounting
    holes and keep-outs, then encode the fabricator limits with
    `set_design_rules` and read them back with `get_design_rules`.
+   `set_design_rules` covers clearance, trace width, via drill, via size, and
+   hole-to-hole only; copper-to-edge, hole clearance, annular ring, minimum
+   connection width, silkscreen clearance, and text size need KiCad's Board
+   Setup or custom rules. A constraint left at 0 disables its check. While
+   KiCad holds the board open, its next save rewrites the project file and
+   silently discards rules and netclasses written by tools: write them with
+   the board closed, or have the user set them in Board Setup, and read them
+   back after KiCad's next save.
 3. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
@@ -129,6 +153,24 @@ evidence leaves the layout `INCOMPLETE`.
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
+   - Konnect's schematic tools write the files on disk, so an open schematic
+     editor holds an older copy: ask the user to close it and choose not to
+     save (or to reload), once per phase.
+   - A changed footprint library ID is reported as a conflict: delete the
+     unrouted footprint and sync again, or have the user run KiCad's Update
+     PCB from Schematic (F8).
+   - A new series part that splits a routed net can be refused as a routed-pad
+     net change, even after the copper on both nets is deleted; do not delete
+     routing to satisfy the check. The native path is KiCad's Update PCB from
+     Schematic, with "Delete footprints with no symbols" unchecked so
+     board-only holes and fiducials survive; then re-route the affected copper
+     and run DRC with schematic parity.
+   - After F8 the new footprints follow the cursor; the user clicks to drop
+     them. Pressing Esc cancels their insertion, and while parts are on the
+     cursor IPC answers "not ready".
+   - Removing a symbol leaves its footprint, branch tracks, and trunk
+     overhangs on the board: delete them, trim trunks back to the last tap,
+     and confirm with DRC dangling-track items and schematic parity.
 4. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
@@ -143,8 +185,13 @@ evidence leaves the layout `INCOMPLETE`.
    connectors → large and hot parts → critical circuits → decoupling,
    terminations, feedback, protection → the rest. Read `get_component_pads`
    for every part before choosing its position and rotation, and turn it so
-   its pads face their destinations. Score with `score_placement`, render
-   with `get_board_2d_view`, and close `references/placement-gate.md`. On
+   its pads face their destinations. Assign interchangeable outputs in the
+   geometric order of their loads and do the pin-swap pass
+   (`references/routing-playbook.md` §2). Apply each batch with
+   `set_component_placements` and `save_project` immediately — unsaved IPC
+   placement is lost if the editor closes. Score with `score_placement`, render
+   with `get_board_2d_view`, and close `references/placement-gate.md`,
+   including its silkscreen and assembly-data section. On
    `FAIL`, move parts; never route around a placement mistake.
 6. **Return-path plan and netclasses** — write where each critical net's
    current returns; derive widths and vias from the sizing record and encode
@@ -154,13 +201,21 @@ evidence leaves the layout `INCOMPLETE`.
 7. **Route by criticality** — supply loops and decoupling → clocks, RF,
    pairs, controlled impedance → sensitive analog → main power → the rest →
    tuning only where timing requires it. Follow the pad selection and path
-   rules in `references/routing-gate.md`.
-8. **Copper pour** — add ground/power zones last, then `refill_zones`.
+   rules in `references/routing-gate.md` and the techniques in
+   `references/routing-playbook.md`. Iterate on a scratch copy and transfer
+   verified copper to the live board in the playbook's order.
+8. **Copper pour** — add ground/power zones last, then `refill_zones`. Stitch
+   the layers, give every IC ground its own vias, and prove the ground with a
+   connectivity graph and articulation points, not with a picture.
 9. **Save, then DRC and rendered inspection** — `save_project` first: DRC
    and renders read the saved file. `run_drc` with zero unrouted items and
-   zero errors, every warning adjudicated; `get_board_2d_view` inspected
-   against the routing gate's rendered list; `query_traces` per critical net
-   against the return-path plan. Close `references/routing-gate.md`.
+   zero errors, every warning adjudicated, and schematic parity actually
+   checked; before trusting a clean result, rule out the traps in the
+   `kicad-review` skill's `references/verification-traps.md` (disabled
+   checks, missing parity, unenforced netclass widths, tangential via joints).
+   `get_board_2d_view` inspected against the routing gate's rendered list;
+   `query_traces` per critical net against the return-path plan. Close
+   `references/routing-gate.md`.
 10. **Layout review** — for a board that will be fabricated, run the
     `kicad-review` skill's layout-quality branch or delegate to
     `kicad-design-review-agent`.
@@ -203,6 +258,19 @@ the outline. Compute every part's real extent from `get_component_pads`
 after placing it, and compare every pad against the outline and the edge
 clearance before moving on. `run_drc` on the saved board is the final proof.
 
+### Rotation, origins, and saving
+
+- Confirm which side pad 1 landed on from `get_component_pads` after every
+  rotation; do not infer it from the angle. A wrong assumption crossed two
+  supply nets without any DRC error.
+- IPC rejects non-90° rotation for footprints that contain rounded-rectangle
+  graphics; design arrays and glyphs on an orthogonal grid, with diagonals as
+  staircases.
+- For THT parts whose origin is pad 1 (5 mm LEDs, headers), measure spacing
+  and alignment from pad midpoints, never from origins.
+- `save_project` after every live batch and read the result back from the
+  file.
+
 ### Footprints with repeated pad numbers
 
 Tactile switches and some connectors carry two pads with the same number:
@@ -231,7 +299,10 @@ after its own plan, so a change is judged before it is made:
 
 1. `score_placement` — 0-100 with named deductions; hard failures (courtyard
    overlaps, parts outside the outline) decide the verdict regardless of the
-   number, and a board with no outline can never pass. `interface_filter_caps`
+   number, and a board with no outline can never pass. The checks use
+   bounding boxes, so confirm a hard failure against KiCad's DRC (real
+   courtyard polygons) before moving parts: an L-shaped module courtyard
+   produced false failures on a real board. `interface_filter_caps`
    lists caps that were within their family limit of a connector carrying every
    one of their nets: that is cable filtering, so the decoupling rule was
    answered rather than skipped. They are not defects to "fix" by dragging them
@@ -348,7 +419,15 @@ create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?
 ```
 
 The class is written to the project's `.kicad_pro` file, which is where KiCad
-has kept netclasses since v7 — the board file is not modified.
+has kept netclasses since v7 — the board file is not modified. While KiCad
+holds the board open, its next save rewrites that file: classes and
+assignments written by a tool reverted to the default class twice on the
+reference project. Create classes with the board closed or in Board Setup,
+serialise the writes, and read them back with `get_netclasses` after KiCad's
+next save. Give every power and switch-node net an explicit schematic name;
+auto-generated names such as `Net-(J2-Pin_1)` break when references change.
+A netclass width is the routing default, not a DRC minimum — see
+`references/trace-width-table.md` for enforcing it.
 
 Before creating or updating a class, read `get_netclasses` and the applicable
 design-rule/trace-sizing references. Derive width, clearance, gap, drill, and
@@ -420,6 +499,16 @@ Zones do not auto-update — stale fills cause DRC errors.
 - Leave spoke thermal reliefs for through-hole pads (easier soldering)
 - Use keepout zones to prevent copper in sensitive areas
 - Zone clearance typically 0.3-0.5mm from traces
+- Set a minimum fill width (0.25 mm on the reference board) so slivers do not
+  form, remove islands, and give every remaining island at least two
+  connections to the plane
+- Stitch the two layers on a grid and at every IC ground pin; the playbook
+  lists the site-acceptance rules
+- The zone's clearance to NPTH holes comes from Board Setup's hole clearance,
+  not from the zone; a local clearance on the NPTH pad fixes a violation there
+- Konnect cannot delete a zone or set thermal spoke width and gap; a wrong
+  zone needs the KiCad GUI. Never create a test zone on the live board to
+  discover a tool's parameters
 
 ---
 
@@ -503,7 +592,9 @@ geometry is the board outline or a cutout the footprint carries itself.
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
 7. **KiCAD normally must be running** — use guarded closed-board paths only when a
    tool explicitly offers them. Treat `unsafe_file_fallback` as a human recovery
-   boundary; other PCB edits still require the live IPC connection.
+   boundary; other PCB edits still require the live IPC connection, except a
+   change no tool can make, which goes through the konnect skill's scripted
+   board fallback (KiCad closed, a dated copy first, DRC with parity after)
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete
@@ -516,3 +607,18 @@ geometry is the board outline or a cutout the footprint carries itself.
     returns before routing it; never shorten a trace at the cost of its return
 14. **Save before evidence, inspect the render** — DRC and renders read the
     saved file; "DRC passed" alone is not layout acceptance
+15. **Scratch first, then transfer** — iterate on a disposable copy outside
+    the project where KiCad's Python is available (the konnect One Rule sets
+    the limits), or in small undoable IPC batches where only Konnect tools
+    are; the live board receives verified placement and copper in a fixed
+    order, saved after every batch, through Konnect tools, the user's
+    Specctra import, or the scripted board fallback
+16. **Never move a routed footprint by shifting track ends** — move it, rip up
+    and re-route its connections, with a restorable backup first (a dated copy
+    of the saved board, or KiCad's undo for one IPC batch; `snapshot_project`
+    writes PDFs only)
+17. **Prove the checks could fail** — rule configuration read back after
+    KiCad's last save, parity actually requested, netclass widths audited;
+    every number in a report carries the command that produced it
+18. **Autorouted copper is a draft** — accepted per net on DRC, length, via
+    count, and a rendered image, never on "0 unrouted"

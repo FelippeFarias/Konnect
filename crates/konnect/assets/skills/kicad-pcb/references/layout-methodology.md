@@ -36,6 +36,10 @@ schematic and the request do not establish; do not invent a value.
 | Layer count and stackup | Decide return references, impedance, and routing freedom. |
 | Fabricator capability | Sets widths, spacings, drills, annular rings, and other limits. |
 | Assembly and test process | Decides accessibility, test points, and part spacing. |
+| Order and panel configuration (assembly tier, edge rails, V-cut or routed edges, who adds fiducials and tooling holes) | V-cut edges need more copper-to-edge clearance and keep solder joints away from the break line; the tier can fix the reflow profile. |
+| Operating environment (indoor/outdoor, maximum ambient, sun, enclosure sealing) | Sets the internal temperature every derating uses; an outdoor sealed box reversed three closed decisions on the reference project. |
+| Which copper layer is the reference plane | Decides where long runs may go and how long a plane cut may be. |
+| Mechanical facts per connector (where the supply, cables, and glands are) | Decides which edge each connector faces; ask per connector instead of inferring from a photo. |
 
 A digital signal of apparently low frequency still needs high-speed care
 when its edges are fast.
@@ -75,6 +79,21 @@ processing, interfaces, sensors, power stage, and so on.
 - **Reserve routing corridors.** An over-packed board needs detours, vias,
   and bottlenecks it did not need.
 - **Never sacrifice electrical paths to align parts for looks.**
+- **Group by function and by who uses the part**, not by shortest wire:
+  service controls (reset, boot) beside the programming connector and apart
+  from operator keys; indicator LEDs in one labelled block; repeated passives
+  in aligned banks rather than scattered beside each load. A placement made
+  "for connection convenience" worked electrically and was rejected by the
+  user as chaotic.
+- **Get the block floorplan approved first** when the user reviews placement:
+  block names, relative positions, and the connector each block sits against,
+  shown as an ASCII sketch or render, before moving parts.
+- **Place from connectivity, not from a reference board's photo.** Copying a
+  reference layout without its pin assignment copies its look, not its
+  routability: the result forced long runs across every digit.
+- **Make fan-outs planar while placing**: assign interchangeable outputs in
+  the geometric order of their loads and plan pin swaps now. The techniques
+  are in [`routing-playbook.md`](routing-playbook.md) §2.
 
 ### Placement order
 
@@ -130,6 +149,13 @@ its reference, following the lowest-impedance path.
   poorly planned split.**
 - Do not assume any copper fill is a good ground: it can form islands,
   bottlenecks, and long detours.
+- On two layers, long tracks side by side on the plane layer merge into a
+  slot. Decide where long buses run before routing, and keep edge-sensitive
+  lines (clock, latch) apart from each other with static nets between them.
+- "GND is one connected group" does not prove a robust return. Every IC
+  ground pad needs its own path to the plane — at least two for ESD arrays,
+  transceivers, and bus buffers — and no pad, via, or neck may be the only
+  link (an articulation point) for an IC ground.
 
 **Rule of thumb:** for every critical connection ask "where does its current
 come back?" and write the answer down.
@@ -230,7 +256,11 @@ The problem normally starts in placement, not in routing.
   return, fabrication, and performance.
 - **Go back to placement when detours multiply.** Do not keep adding vias.
 - Use automated routing as an aid, never as a substitute for constraints and
-  technical review.
+  technical review. An autorouted board is a draft until each net passes the
+  acceptance in [`routing-playbook.md`](routing-playbook.md) §6; "0 unrouted"
+  is not a quality verdict.
+- **Solve a repeated block once and replicate it** so identical blocks carry
+  identical copper ([`routing-playbook.md`](routing-playbook.md) §4).
 
 Layer crossings are normal. The goal is not to eliminate them but to keep
 them from causing discontinuities, coupling, and needless complexity.
@@ -274,6 +304,28 @@ For critical designs, add simulation and prototype measurement.
 
 The `kicad-review` skill's `references/layout-review.md` turns this table
 into a tool-backed review branch.
+
+---
+
+## 9. Work on a copy, show it, then transfer
+
+- Iterate placement and routing on a disposable copy of the board outside the
+  project (changed only with KiCad's own Python, per the konnect One Rule) and
+  rebuild it from scratch on every iteration; with Konnect tools only, work in
+  small undoable IPC batches instead. The live board changes only after the
+  result is verified — and, when the user asked to review it, approved —
+  through Konnect tools, the user's Specctra import, or, for what no tool can
+  do, the konnect skill's scripted board fallback. Some
+  users forbid any routing before they have seen the placement; treat that
+  as a hard stop.
+- Show evidence the user can judge: each copper layer rendered separately,
+  zoomed crops of dense areas, and the DRC and connectivity numbers with the
+  commands that produced them.
+- Transfer in a fixed order with a check after each step, and save after
+  every live batch ([`routing-playbook.md`](routing-playbook.md) §9).
+- Present choices with a picture and numbers and mark the recommended option.
+  Record every option the user declines as an open risk: declined items came
+  back as review findings on the reference project.
 
 ---
 

@@ -35,9 +35,14 @@
 
 ## Pattern 4: LED with Current Limiting Resistor
 ```
-    GPIO_OUT ──── R1 330Ω ──── D1 LED ──── GND
+    GPIO_OUT ──── R1 ──── D1 LED ──── GND
 ```
-**Tools**: Place R1 (330) and D1 (LED) → `connect_pins` (R1 pin 2 to D1 anode, **pin 2**) → `connect_to_net` (R1 pin 1, net "GPIO_OUT") → `add_power_symbol` (GND on D1 cathode, **pin 1**)
+**Tools**: Place R1 and D1 (LED) → `connect_pins` (R1 pin 2 to D1 anode, **pin 2**) → `connect_to_net` (R1 pin 1, net "GPIO_OUT") → `add_power_symbol` (GND on D1 cathode, **pin 1**)
+
+R1 comes from a worst-case record, not a habitual 330 Ω: both Vf corners
+and both supply corners against the derated forward current, solved on the
+diode curve when the LED runs far below its test current
+(`design-calculations.md` §2).
 
 > In KiCad's `Device:LED` the pins are **1 = K (cathode), 2 = A (anode)** — the
 > cathode is pin 1, not pin 2. Current flows anode → cathode, so the resistor
@@ -65,6 +70,35 @@
     D- ──────────── USB_DM
 ```
 **Tools**: Use `search_templates("usb_c_5v_sink")` first — the templates toolset has this pre-built.
+
+Checklist for a device port: one 5.1 kΩ resistor per CC pin (never one
+shared), no Rp; every VBUS pin connected, 1–10 µF of bulk plus the ESD
+array's own 100 nF beside it; D+/D− straight through the ESD array; shield
+to GND through 1 MΩ ∥ 4.7 nF; no extra capacitance on D±. Details in
+`interface-design.md` §3.
+
+## Pattern 7: DC Input Protection Chain
+```
+    J (+V) ── F (fuse/PTC) ──┬── D (series Schottky or ideal diode) ──┬── +V rail
+                             │                                         │
+                          TVS to GND                             bulk + 100 nF
+```
+Order matters: the TVS goes after the fuse and **before** the series diode,
+so a reverse surge does not fall entirely on the diode. A connector pin that
+exports the rail needs its own clamp. Size the PTC hold current at the
+hottest local temperature and its V_max above the TVS clamp
+(`design-calculations.md` §3).
+
+## Pattern 8: RS-485 Half-Duplex Node
+```
+    J (A,B) ── PTC ── TVS ── 10 Ω ──┬── bias + switchable 120 Ω ── transceiver A/B
+                                     │
+    DE + /RE tied, pull-down (receive at boot);  RO pull-up (idle high while transmitting)
+```
+Compute fail-safe bias with each termination option, the driver load with the
+bias network in parallel, and bias-resistor power at the common-mode
+extremes; add the series resistors when the TVS clamp exceeds the
+transceiver's absolute maximum (`interface-design.md` §1).
 
 ## Wiring Decision Guide
 

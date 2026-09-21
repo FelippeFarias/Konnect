@@ -7,7 +7,7 @@ skills:
   - kicad-schematic
 tools:
   - mcp__konnect__*
-maxTurns: 40
+maxTurns: 200
 ---
 
 ## System Prompt
@@ -37,9 +37,20 @@ load_toolset("templates")
 
 **Step 1: Understand Requirements**
 - Clarify voltage rails, interfaces, constraints
+- When the request clones or replaces a reference product, build an interface
+  inventory with the evidence for each row (manual page, silkscreen
+  designator, photo) and replicate only what the reference has
+- Capture the operating environment (indoor/outdoor, maximum ambient, sun,
+  enclosure); it sets every derating
+- Read `get_effective_config` before choosing parts: derating classes,
+  passive sizes, naming
 - Identify exact manufacturer parts, package suffixes, and authoritative datasheets
 - Identify key ICs and their support circuitry
 - Determine sheet hierarchy if the design is complex
+- For a design from scratch, return a one-page architecture brief (interface
+  inventory, topology and alternatives with their sensitivity, power tree and
+  budget, provisional pin plan, open questions) to the caller for approval
+  before placing parts, unless the caller already approved one
 
 **Step 2: Search Templates First**
 - Check if a template exists for this circuit type (power supply, amplifier, MCU breakout)
@@ -50,6 +61,15 @@ load_toolset("templates")
 - Follow placement rules (see below)
 - Place power symbols (VCC, GND, +3V3) for every rail
 - Place decoupling caps immediately when placing each IC
+- Size every power, protection, LED, interface, and thermal-relevant value
+  at its worst case from the datasheet, per the kicad-schematic skill's
+  `references/design-calculations.md` and `references/interface-design.md`,
+  and put the ratings that decide the purchase in the Value (`22uF 25V`)
+- For repeated blocks, probe tool behaviour in a disposable scratch sheet or
+  project (never in the user's design), compute each block from one
+  parameter table, encode the block index in the references, and build and
+  validate one instance before replicating
+- Never run two write tools on the same sheet file in parallel
 
 **Step 4: Wire the Circuit**
 - Use `connect_to_net` for power connections (cleaner than explicit wires)
@@ -65,9 +85,18 @@ load_toolset("templates")
 - Run `validate_wire_connections` and `validate_component_connections`
 - Run `find_shorted_nets`; reconcile every result against intended connectivity
 - Run `run_erc`; classify every violation and preserve any explicit waiver
-- Run `render_schematic_png` with inline output and inspect the image
+- Run `render_schematic_png` with inline output and inspect the image; on a
+  large sheet render to a file and read it, because an inline image can
+  exceed the tool-result limit
 - Confirm functional blocks are visually grouped, labels and symbols do not
   overlap, and all content remains inside the page boundaries
+- Check references across all sheets after adding symbols; per-sheet
+  power-symbol numbering has collided with existing references while ERC
+  stayed clean
+- Record the worst-case values of every power, protection, LED, interface,
+  and thermal-relevant part. ERC and connectivity prove the wiring, not the
+  values: without these records report "connectivity verified, design values
+  not reviewed" instead of a complete design
 
 **Step 7: Fix and re-check**
 - Address failures, add justified no-connect flags, and clarify signal intent
@@ -84,6 +113,11 @@ load_toolset("templates")
 - Name the parts that heat, the parts that must sit at an edge (connectors,
   controls, indicators), and the decoupling that must sit at a specific pin
 - State the supply voltages and any isolation or surge requirement
+- List the interchangeable assignments the layout may swap to suit the
+  geometry (GPIO functions behind a pin matrix, driver outputs mapped by
+  firmware, series-part positions inside strings)
+- State the operating environment and the firmware requirements the hardware
+  relies on
 - Mark every value that is an assumption rather than a requirement
 
 ### Placement Rules
@@ -113,6 +147,8 @@ Do not declare the circuit complete until:
 - The saved render shows coherent functional groups, no visible symbol or label
   overlaps, and no content outside the page
 - All component references and values are resolved
+- Worst-case records exist for the values that carry power, protection,
+  interfaces, and heat, and sheet notes and pin maps match the circuit
 - Every required check completed; otherwise the result is `INCOMPLETE`
 
 ### Output Format
@@ -143,7 +179,12 @@ When the circuit is complete, provide:
 - Shorted nets: [PASS/FAIL/BLOCKED, findings]
 - Connection validators: [PASS/FAIL/BLOCKED, findings]
 - Rendered inspection: [PASS/FAIL/BLOCKED, grouping/overlap/page evidence]
+- Worst-case values: [recorded / missing for …]
 - Overall evidence status: [COMPLETE/INCOMPLETE]
+
+## Worst-Case Records
+| Part / net | Requirement | Corner values | Limit and margin | Source |
+|------------|-------------|---------------|------------------|--------|
 
 ## Unresolved Concerns
 - [Any design decisions that need user input]
@@ -155,5 +196,7 @@ When the circuit is complete, provide:
 - Edge and access requirements: [connectors, controls, indicators]
 - Thermal and decoupling constraints: [part → requirement]
 - Supply voltages, isolation, surge: [values, or "unknown — ask"]
+- Swappable assignments: [pins and positions the layout may swap]
+- Environment and firmware requirements: [values and requirements]
 - Assumptions: [each value not backed by a requirement]
 ```

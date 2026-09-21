@@ -58,6 +58,22 @@ A weaker finding may ask a question; it does not override stronger contradictory
 evidence. Any required check that did not run, returned impossible coverage, or
 remains inconsistent with stronger evidence makes the verdict `INCOMPLETE`.
 
+Rules that kept this hierarchy honest on a production board declared ready
+five times before it really was:
+
+- A check passes only if it ran in a mode that could fail. Give every number
+  the command or tool call and flags that produced it; a missing flag or a
+  missing result key is blocked evidence, not zero.
+- Severity follows a documented limit. A file fact that violates a datasheet
+  absolute maximum, the maker's recommended land pattern, a fabricator rule,
+  or an app-note requirement at a defined worst case can be critical; an
+  estimate built on assumed parameters (θJA on this copper, nH per mm,
+  enclosure temperature) states its assumptions and ranks below it.
+- A fix is closed by re-measuring the defect location, and a finding is
+  refuted only by measuring its whole population ("n of N checked").
+- A proposed fix is part of the finding and is validated (DRC and the
+  calculation on a scratch copy) before it is recommended.
+
 DRC violation items carry `owner` and `ownership_status`. That is direct
 evidence, not a heuristic: `owner.kind: "footprint"` means the offending
 geometry belongs to `owner.reference`'s own artwork, so the remedy is a
@@ -79,6 +95,21 @@ unknown and `owner` is `null`; corroborate with
   placement follows the circuit, that return currents have a path, that
   widths match the current record, and that the board can be assembled and
   tested. Save before running it: DRC and renders read the saved file.
+- Read [`references/verification-traps.md`](references/verification-traps.md)
+  before reporting any clean ERC, DRC, parity, connectivity, or
+  fabrication result, and before stating a readiness level. It lists the
+  checks that are silently disabled, the metrics that lie, and the three
+  readiness levels.
+- Read [`references/datasheet-audit.md`](references/datasheet-audit.md) for
+  every IC block in a full or pre-fabrication review, and after any part
+  substitution: compare against the manufacturer's application circuit,
+  equations, and layout section, and check that symbol, BOM part, footprint,
+  and datasheet describe the same part.
+- Read [`references/review-orchestration.md`](references/review-orchestration.md)
+  when running a full or pre-fabrication review, with or without subagents,
+  and after every batch of fixes (its regression phase): freeze and
+  inventory, dimension reviewers, a findings ledger, independent
+  verification, a coverage critic, and the decision packet.
 
 ---
 
@@ -160,6 +191,16 @@ A passing DRC means the layout obeyed the rules it was given — not that the
 circuit will work. Incomplete rules approve a bad board. Check
 `get_design_rules` against the fabricator's contract before trusting a clean
 result, then run the layout-quality branch.
+
+`get_design_rules` returns five values only. Read the project's full rule
+configuration too: a constraint left at 0 is a disabled check (minimum
+connection width and silkscreen clearance at 0 hid a 0.15 mm neck and 18
+silkscreen overlaps), ignored severities hide whole classes, and a custom
+rule overrides Board Setup even when it is looser. `run_drc` includes
+schematic parity (but not items excluded in the GUI); when collecting DRC
+with kicad-cli directly, pass `--schematic-parity --severity-all` — without
+the parity flag the list comes back empty and reads as zero. The full list of
+traps is in `references/verification-traps.md`.
 
 ---
 
@@ -352,9 +393,17 @@ Present findings grouped by severity with actionable fix suggestions:
 - Warnings: X (recommended)
 - Suggestions: X (optional)
 - Verdict: [LOOKS GOOD / NEEDS ATTENTION / NOT READY / INCOMPLETE]
+- Readiness level: [files match the board / ready for a pilot run / ready for production / none]
 - Coverage status: [complete / partial / failed]
 - Coverage diagnostics: [none, or each unevaluated sheet/object/audit]
+- Checked and correct: [one line per block, with the method]
+- Open questions: [items only the user, the supplier, or a prototype can answer]
 ```
+
+Each finding also carries its action: fix before fabrication, order note,
+firmware requirement, documentation only, or none. Only "fix before
+fabrication" blocks the order; a real but harmless item is reported, not
+turned into work.
 
 ---
 
@@ -381,13 +430,23 @@ Present findings grouped by severity with actionable fix suggestions:
 
 ### Pre-Manufacturing Review
 
-1. Full review (above)
-2. Run `validate_for_manufacturing()`, then inspect `verdict`, `issues`, and
+1. Full review (above), structured per `references/review-orchestration.md`
+2. Datasheet conformance for every IC block (`references/datasheet-audit.md`)
+3. Run `validate_for_manufacturing()`, then inspect `verdict`, `issues`, and
    `drc` against the handler's limited contract; it does not replace outline,
    drill, silkscreen, artifact, BOM/CPL, or order-preview acceptance
-3. Verify BOM completeness
-4. Check part availability (if targeting specific fab house)
-5. Final verdict: ready to manufacture or not
+4. Verify BOM completeness and integrity: every Value names the ordered part
+   with its ratings, one rating per Value + footprint group, a distributor
+   code and full manufacturer suffix on every line
+5. Check part availability (if targeting specific fab house), including the
+   lot ceiling (stock ÷ quantity per board) and binned parts
+6. Turn every "not verifiable" item that depends on the user (enclosure,
+   ambient, installed cables) into a question now
+7. Final verdict and readiness level (`references/verification-traps.md` §6)
+
+After any fix batch, run the regression phase of
+`references/review-orchestration.md` before offering fabrication files; the
+fixer's own confirmation is not verification.
 
 ---
 
@@ -404,3 +463,11 @@ Present findings grouped by severity with actionable fix suggestions:
 9. **Re-run after fixes** — always verify fixes resolved the issue and created no new ones
 10. **Document waivers** — if user explicitly waives a warning, note it in the report
 11. **Never soften `INCOMPLETE`** — partial or failed coverage is not a passing review
+12. **Never claim "ready" from your own fixes** — an independent re-verification
+    with re-collected evidence closes a fix batch; report the readiness level
+    the evidence supports and no higher
+13. **Waive a class of warnings only after opening one instance** — 199
+    library-mismatch warnings waived as "metadata" were footprints that had
+    lost their 3D models and THT/SMD attributes
+14. **Re-verify subagent findings before relaying them** — the numbers and the
+    reasoning; say who verified what and quote verdicts verbatim

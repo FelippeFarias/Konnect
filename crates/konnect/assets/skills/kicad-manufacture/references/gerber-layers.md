@@ -39,6 +39,30 @@ Choose layers from the saved board and the selected fabricator's current order
 contract. Use a fresh output directory and apply the manufacturing skill's
 artifact acceptance gate.
 
+## Regenerating with kicad-cli
+
+When outputs are produced with KiCad 10's command line, these details decided
+whether the package was current:
+
+| Output | Invocation that worked | Pitfall it avoided |
+|---|---|---|
+| Gerbers | `kicad-cli pcb export gerbers --no-protel-ext --subtract-soldermask --layers "F.Cu,B.Cu,F.Paste,B.Paste,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"` | Without `--no-protel-ext` the files came out as `.gtl/.gbl/.gts…` next to an older `.gbr` set, leaving two versions in the folder |
+| Drill | `kicad-cli pcb export drill --format excellon --excellon-units mm --excellon-separate-th --generate-map --map-format gerberx2` | The unit flag is `--excellon-units`; `--units` printed the usage text, and piping through `tail` hid the failure while the old drill files stayed |
+| Placement | `kicad-cli pcb export pos --format csv --units mm --side both` | Boolean flags take no value; KiCad's Y axis is negated relative to the board view; rename headers to the fabricator's template |
+| DRC gate | `kicad-cli pcb drc --format json --severity-all --schematic-parity` | Without `--schematic-parity` the parity list is empty and reads as zero |
+| Board-sized view | `kicad-cli pcb export svg --mode-single --page-size-mode 2 --exclude-drawing-sheet` | A page-sized export cut a 400 mm board to A4 |
+
+- Check each command's exit status and its "created file" lines; never judge
+  success from a truncated tail of the output.
+- Use the same origin choice (absolute or drill/place origin) for plot, drill,
+  and placement files. A mismatch shifts holes relative to copper and still
+  uploads without an error.
+- To prove a delivered package is current, regenerate into a temporary folder
+  and diff line by line against it, ignoring comment, creation-date, and
+  generator-version lines.
+- KiCad's Gerber coordinates are Y-up: a notch at the top edge of the board
+  view appears at negative Y when the Edge.Cuts file is decoded.
+
 ## Verification Checklist
 
 Before uploading Gerbers:
