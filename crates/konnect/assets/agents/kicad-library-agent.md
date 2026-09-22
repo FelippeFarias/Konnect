@@ -110,7 +110,15 @@ creation is not proof it was written.
 
 **Step 6: Disposable placement** — create a scratch project with
 `create_project` at a path **outside the design project's directory** (a
-project nested inside it would join the design's files), place the symbol and
+project nested inside it would join the design's files). Before placing,
+register the Step 4 libraries in the scratch project's own tables, with the
+nickname and path Step 4 used, `scope: "project"` and `project` the scratch
+project's path: `register_symbol_library(nickname, library_path, scope, project)`
+for the symbol library and
+`register_footprint_library(nickname, library_path, scope, project)` for the
+footprint library. Step 4 registered them in the design project's tables,
+which the scratch project cannot see, so a placement there fails "not found"
+without this. Then place the symbol and
 the footprint there, render both, and inspect the pin-1 or key marker,
 numbering direction, side, pad and drill geometry, courtyard, fab and
 silkscreen layers. Read the placed instances back.
