@@ -1261,3 +1261,588 @@ fn symbol_exists(root: &Path, lib: &str, sym: &str) -> bool {
         .map(|s| s.contains(&format!("(symbol \"{sym}\"")))
         .unwrap_or(false)
 }
+
+/// The text with every run of whitespace collapsed to one space, so a marker
+/// matches however the prose around it was re-wrapped.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn missing_markers(label: &str, text: &str, markers: &[&str]) -> Vec<String> {
+    let text = flat(text);
+    markers
+        .iter()
+        .filter(|marker| !text.contains(&flat(marker)))
+        .map(|marker| format!("{label} lost: {marker}"))
+        .collect()
+}
+
+/// Tasks 3.4 and 3.5 of the konnect-orchestrator change: no bundled agent can
+/// fetch a live part page or open a datasheet, so a parts-list row is
+/// confirmed only by the orchestrating session's `flow_log` evidence entry,
+/// and a catalogue-only stock or a `located, not validated` datasheet keeps
+/// the readiness line BLOCKED. The rule is stated where the session reads it
+/// (orchestration.md §9, and the purchase-gate checks in §4), in the record
+/// schema, and in the two texts the architecture agent actually loads (its
+/// preloaded skill's readiness section and its own Step 6 and readiness
+/// section). Each marker is scoped to its section, so the rule quoted
+/// elsewhere in a file cannot satisfy it.
+#[test]
+fn architecture_confirmation_rule_stays_guarded() {
+    let orchestration = include_str!("../assets/skills/konnect/references/orchestration.md");
+    let schema = include_str!(
+        "../assets/skills/kicad-architecture/references/architecture-record-schema.md"
+    );
+    let skill = include_str!("../assets/skills/kicad-architecture/SKILL.md");
+    let agent = include_str!("../assets/agents/kicad-architecture-agent.md");
+    let manufacture = include_str!("../assets/agents/kicad-manufacture-agent.md");
+    let mut lost = Vec::new();
+
+    lost.extend(missing_markers(
+        "orchestration.md §9",
+        section(orchestration, "## 9. Sourcing inside `architecture`", "\n## 10."),
+        &[
+            "The session confirms live stock and datasheets.",
+            "a datasheet marked `located, not validated`",
+            "confirms each parts-list row before the architecture gate",
+            "`flow_log(project_dir, job_id, kind, message)`, `kind` `evidence`, one entry per row",
+            "A row without the session's evidence entry is not confirmed and keeps the readiness line BLOCKED",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "orchestration.md §4",
+        section(orchestration, "## 4. Gates", "\n## 5."),
+        &[
+            "its `## Checks at the purchase gate` section — the session shows it to the user and runs or asks for each listed check before `flow_gate` for `purchase`",
+            "A check that failed is a FIX (§5), not an approval.",
+            "`purchase` always needs the user's words.",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "architecture-record-schema.md \"A confirmed row\"",
+        section(schema, "**A confirmed row.**", "### Open questions"),
+        &[
+            "A row is confirmed only when the orchestrating session's evidence entry for it exists in the job log",
+            "`kind` `evidence`",
+            "A row keeps the readiness line BLOCKED while any of these holds:",
+            "its Datasheet cell reads `located, not validated`;",
+            "its stock is catalogue-only",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "architecture-record-schema.md readiness line",
+        section(schema, "### The readiness line", "\n## 2."),
+        &["every parts-list row is confirmed — the session's evidence entry exists for it"],
+    ));
+    lost.extend(missing_markers(
+        "kicad-architecture/SKILL.md readiness line",
+        section(skill, "### The readiness line", "\n## Rules"),
+        &[
+            "every parts-list row is confirmed (next bullet)",
+            "A parts-list row is confirmed only when the orchestrating session's evidence entry for it exists in the job log",
+            "`kind` `evidence`",
+            "a catalogue-only stock or a Datasheet cell reading `located, not validated` keeps the line `Readiness: BLOCKED — …`",
+            "the agent then returns BLOCKED naming the rows the session must confirm, never advancing.",
+        ],
+    ));
+    let step6 = section(agent, "**Step 6: Parts that can be bought**", "**Step 7:");
+    lost.extend(missing_markers(
+        "kicad-architecture-agent.md Step 6",
+        step6,
+        &[
+            "A row counts as confirmed only when the orchestrating session's evidence entry for it exists in the job log",
+            "`kind` `evidence`",
+            "a catalogue-only stock or a Datasheet cell reading `located, not validated` leaves the row unconfirmed and keeps the readiness line `Readiness: BLOCKED — …`",
+        ],
+    ));
+    // Task 3.5: Step 6 no longer implies catalogue stock is acceptable
+    // until payment.
+    for stale in ["before payment", "catalogue stock is discovery"] {
+        if flat(step6).contains(stale) {
+            lost.push(format!(
+                "kicad-architecture-agent.md Step 6 again says `{stale}`"
+            ));
+        }
+    }
+    lost.extend(missing_markers(
+        "kicad-architecture-agent.md readiness line",
+        section(agent, "### The readiness line", "### Ending the run"),
+        &[
+            "every parts-list row is confirmed by the session's evidence entry (Step 6)",
+            "**An unconfirmed row is a BLOCKED reason.**",
+            "as the rows the session must confirm (live stock and datasheet), then return BLOCKED. Never advance, and never mark a row confirmed yourself.",
+        ],
+    ));
+    // §4 names a section of `manufacturing.md`; the agent that writes that
+    // record must still prescribe it under that exact heading.
+    if !manufacture
+        .lines()
+        .any(|line| line.trim() == "## Checks at the purchase gate")
+    {
+        lost.push(
+            "kicad-manufacture-agent.md no longer prescribes `## Checks at the purchase gate`"
+                .to_string(),
+        );
+    }
+
+    assert!(
+        lost.is_empty(),
+        "the parts-list confirmation rule (tasks 3.4/3.5) lost a guard:\n  {}",
+        lost.join("\n  ")
+    );
+}
+
+/// The hardware-orchestration spec's scenarios are prose the orchestrating
+/// session follows; nothing executes them. Each is pinned here to the
+/// section of the file its scenario names, so an edit that drops the rule
+/// fails a test instead of passing silently.
+#[test]
+fn orchestration_reference_keeps_its_protocol_rules() {
+    let konnect = include_str!("../assets/skills/konnect/SKILL.md");
+    let orchestration = include_str!("../assets/skills/konnect/references/orchestration.md");
+    let brief = include_str!("../assets/skills/konnect/references/brief-template.md");
+    let handoff = include_str!("../assets/skills/konnect/references/handoff-template.md");
+    let mut lost = Vec::new();
+
+    // The router: one hop to each reference, additive to the Decision Tree.
+    let router = section(konnect, "## Orchestrator — `/konnect <request>`", "\n## ");
+    lost.extend(missing_markers(
+        "konnect/SKILL.md Orchestrator",
+        router,
+        &[
+            "| Bounded edit |",
+            "The Decision Tree below; no job",
+            "| Single agent |",
+            "then check its handoff; no job",
+            "A flow job: read `references/orchestration.md`",
+            "[references/orchestration.md](references/orchestration.md)",
+            "[references/brief-template.md](references/brief-template.md)",
+            "[references/handoff-template.md](references/handoff-template.md)",
+            "The Decision Tree and Agent Routing below stay the direct path.",
+        ],
+    ));
+    let orchestrator_at = konnect.find("## Orchestrator").unwrap_or(usize::MAX);
+    let decision_tree_at = konnect.find("## Decision Tree").unwrap_or(0);
+    if orchestrator_at > decision_tree_at {
+        lost.push(
+            "konnect/SKILL.md: the Orchestrator section must precede the Decision Tree".into(),
+        );
+    }
+    lost.extend(missing_markers(
+        "konnect/SKILL.md Available Toolsets",
+        konnect,
+        &["| Orchestration | flow |"],
+    ));
+
+    // §1: the canonical sequence and the two job-less lanes.
+    let lanes = section(
+        orchestration,
+        "## 1. Lanes and the canonical sequence",
+        "\n## 2.",
+    );
+    lost.extend(missing_markers(
+        "orchestration.md §1",
+        lanes,
+        &[
+            "requirements → architecture → gate:architecture → schematic → schematic_review → placement → gate:placement → routing → prefab_review → manufacturing → gate:purchase → learn",
+            "| Bounded edit | A few objects, no architecture change, reversible",
+            "| none | The konnect skill's Decision Tree",
+            "| Single agent | The request is exactly one bundled agent's stated purpose",
+            "| none | One complete brief to that agent; check its handoff (§6) |",
+            "`[prefab_review]`",
+            "`[manufacturing, gate:purchase]`",
+            "A job's `phases` never drops a human gate",
+        ],
+    ));
+
+    // §2: every phase row names the records it supplies.
+    let playbook = section(orchestration, "## 2. Phase playbook", "\n## 3.");
+    for (phase, records) in [
+        ("requirements", &["constraints.md"][..]),
+        (
+            "architecture",
+            &["architecture.md", "worst-case.md", "pin-plan.md"][..],
+        ),
+        ("schematic", &["schematic-evidence.md"][..]),
+        ("schematic_review", &["ledger-schematic.md"][..]),
+        ("placement", &["placement.md"][..]),
+        ("routing", &["routing.md"][..]),
+        ("prefab_review", &["ledger-prefab.md"][..]),
+        ("manufacturing", &["manufacturing.md"][..]),
+    ] {
+        let row_start = format!("| `{phase}` |");
+        match playbook.lines().find(|line| line.starts_with(&row_start)) {
+            None => lost.push(format!("orchestration.md §2 has no `{phase}` row")),
+            Some(row) => {
+                for record in records {
+                    if !row.contains(record) {
+                        lost.push(format!("orchestration.md §2 `{phase}` row omits {record}"));
+                    }
+                }
+            }
+        }
+    }
+    for agent in [
+        "kicad-requirements-agent",
+        "kicad-architecture-agent",
+        "kicad-sourcing-agent",
+        "kicad-schematic-build-agent",
+        "kicad-library-agent",
+        "kicad-design-review-agent",
+        "kicad-pcb-layout-agent",
+        "kicad-manufacture-agent",
+        "kicad-curator-agent",
+    ] {
+        if !orchestration.contains(agent) {
+            lost.push(format!("orchestration.md does not name {agent}"));
+        }
+    }
+
+    // §4: the readiness line gates the architecture approval.
+    lost.extend(missing_markers(
+        "orchestration.md §4",
+        section(orchestration, "## 4. Gates", "\n## 5."),
+        &[
+            "The architecture approval is refused unless `architecture.md` ends with `Readiness: PASS`. A `Readiness: BLOCKED` line names the missing or invented value",
+        ],
+    ));
+
+    // §5: failing layer → rewind target, and the three-round cap.
+    lost.extend(missing_markers(
+        "orchestration.md §5",
+        section(orchestration, "## 5. The FIX loop", "\n## 6."),
+        &[
+            "| `requirement` | `requirements` |",
+            "| `architecture` | `architecture` |",
+            "| `implementation` | The phase that produced the faulty artifact — `routing` for a routing defect found at `prefab_review`",
+            "**Three rounds at most.** `flow_status`'s `fix_rounds` counts the rewinds out of `schematic_review` and `prefab_review`.",
+            "When a review phase's count reaches 3 and its latest ledger still has an open `FIX_BEFORE_FAB`, stop: do not dispatch a fourth round. Report `BLOCKED` to the user",
+        ],
+    ));
+
+    // §6: an unconfirmed citation is a FIX at the implementation layer.
+    lost.extend(missing_markers(
+        "orchestration.md §6",
+        section(
+            orchestration,
+            "## 6. Evidence cross-check before accepting DONE",
+            "\n## 7.",
+        ),
+        &[
+            "Any cited call in `absent` or `not_ok` makes the handoff a `FIX` with `failing_layer: implementation`",
+            "Never re-run the call yourself in the agent's name.",
+            "call `get_recent_calls(limit: 0)` right after the agent returns",
+            "`calls.jsonl`",
+        ],
+    ));
+
+    // §12: a client without bundled agents runs each phase itself.
+    lost.extend(missing_markers(
+        "orchestration.md §12",
+        section(
+            orchestration,
+            "## 12. Codex, or any client without bundled agents",
+            "\n## 13.",
+        ),
+        &[
+            "A Codex installation receives the skills and no bundled agent.",
+            "kicad-architecture for `requirements` and `architecture`",
+            "as the producer, calls `flow_advance` itself",
+        ],
+    ));
+
+    // The templates.
+    lost.extend(missing_markers(
+        "handoff-template.md",
+        handoff,
+        &[
+            "verdict: DONE | FIX | BLOCKED",
+            "failing_layer: requirement | architecture | implementation",
+            "**`failing_layer`** is required on `FIX`",
+        ],
+    ));
+    let fields = section(brief, "## The eight fields", "\n- **Name records");
+    for field in [
+        "Objective",
+        "Context",
+        "Output Format",
+        "Tools Granted",
+        "Tools Blocked",
+        "Budget",
+        "Files Scope",
+        "Success Criteria",
+    ] {
+        if !fields.contains(&format!("| {field} |")) {
+            lost.push(format!("brief-template.md has no `{field}` row"));
+        }
+    }
+    lost.extend(missing_markers(
+        "brief-template.md",
+        fields,
+        &["Files Scope never includes `STATE.md`"],
+    ));
+
+    assert!(
+        lost.is_empty(),
+        "the orchestration protocol lost a rule:\n  {}",
+        lost.join("\n  ")
+    );
+}
+
+/// The frontmatter (a block list of preloaded skills, `mcp__konnect__*` only,
+/// `model: sonnet`, an explicit `maxTurns`) and the job-only duties of the six
+/// agents the konnect-orchestrator change adds (tasks 4.1–4.6), and the flow
+/// steps it adds to three existing agents (tasks 5.1–5.3).
+#[test]
+fn orchestrator_agents_keep_their_contract() {
+    let root = assets_root().join("agents");
+    let mut broken = Vec::new();
+
+    for (filename, skills, max_turns) in [
+        (
+            "kicad-requirements-agent.md",
+            &["konnect", "kicad-architecture", "kicad-schematic"][..],
+            60,
+        ),
+        (
+            "kicad-architecture-agent.md",
+            &["konnect", "kicad-architecture", "kicad-schematic"][..],
+            150,
+        ),
+        (
+            "kicad-sourcing-agent.md",
+            &[
+                "konnect",
+                "kicad-architecture",
+                "kicad-manufacture",
+                "kicad-review",
+            ][..],
+            150,
+        ),
+        (
+            "kicad-library-agent.md",
+            &["konnect", "kicad-library"][..],
+            100,
+        ),
+        (
+            "kicad-manufacture-agent.md",
+            &["konnect", "kicad-manufacture"][..],
+            150,
+        ),
+        (
+            "kicad-curator-agent.md",
+            &["konnect", "kicad-curator"][..],
+            60,
+        ),
+    ] {
+        let text = std::fs::read_to_string(root.join(filename))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let frontmatter = text
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map_or("", |(head, _)| head);
+        if yaml_list(frontmatter, "skills") != skills {
+            broken.push(format!("{filename}: skills block list is not {skills:?}"));
+        }
+        if yaml_list(frontmatter, "tools") != ["mcp__konnect__*"] {
+            broken.push(format!(
+                "{filename}: tools block list is not [mcp__konnect__*]"
+            ));
+        }
+        let lines: Vec<&str> = frontmatter.lines().collect();
+        if !lines.contains(&"model: sonnet") {
+            broken.push(format!("{filename}: model is not sonnet"));
+        }
+        let turns = format!("maxTurns: {max_turns}");
+        if !lines.contains(&turns.as_str()) {
+            broken.push(format!("{filename}: maxTurns is not {max_turns}"));
+        }
+        if !lines
+            .iter()
+            .any(|line| line.starts_with("description: \"") && line.contains("Triggers:"))
+        {
+            broken.push(format!(
+                "{filename}: description does not state its triggers"
+            ));
+        }
+    }
+
+    let read = |filename: &str| std::fs::read_to_string(root.join(filename)).unwrap();
+    let requirements = read("kicad-requirements-agent.md");
+    let architecture = read("kicad-architecture-agent.md");
+    let sourcing = read("kicad-sourcing-agent.md");
+    let library = read("kicad-library-agent.md");
+    let manufacture = read("kicad-manufacture-agent.md");
+    let curator = read("kicad-curator-agent.md");
+    let build = read("kicad-schematic-build-agent.md");
+    let layout = read("kicad-pcb-layout-agent.md");
+    let review = read("kicad-design-review-agent.md");
+    let library_skill = include_str!("../assets/skills/kicad-library/SKILL.md");
+
+    broken.extend(missing_markers(
+        "kicad-requirements-agent.md",
+        &requirements,
+        &[
+            "load_toolset(\"flow\")",
+            "flow_advance",
+            "flow_log",
+            "A run whose brief names no `job_id` calls no `flow_*`",
+        ],
+    ));
+    broken.extend(missing_markers(
+        "kicad-architecture-agent.md",
+        &architecture,
+        &[
+            "load_toolset(\"flow\")",
+            "flow_advance",
+            "Readiness: PASS",
+            "Readiness: BLOCKED — <the missing or invented value, and what would supply it>",
+            "**BLOCKED means return BLOCKED, not advance.**",
+        ],
+    ));
+    broken.extend(missing_markers(
+        "kicad-sourcing-agent.md Hard rules",
+        section(&sourcing, "### Hard rules", "### Output Format"),
+        &[
+            "`search_symbols` and `search_footprints` are read-only lookups. Never place or wire a part",
+            "Never call `flow_advance`; in a job, persist the handoff with `flow_log`.",
+        ],
+    ));
+    if !library_skill.contains("### Physical pin-map acceptance contract") {
+        broken.push("kicad-library/SKILL.md lost its physical pin-map acceptance contract".into());
+    }
+    broken.extend(missing_markers(
+        "kicad-library-agent.md",
+        &library,
+        &[
+            "Physical pin-map acceptance contract",
+            "It never edits a schematic sheet or the board of the design it serves",
+            "flow_log",
+        ],
+    ));
+    broken.extend(missing_markers(
+        "kicad-manufacture-agent.md",
+        &manufacture,
+        &[
+            "load_toolset(\"flow\")",
+            "flow_advance",
+            "gate:purchase",
+            "manufacturing.md",
+            "Never produce a firmware-contract artifact",
+            "INCOMPLETE",
+            "indicative heuristic",
+        ],
+    ));
+    broken.extend(missing_markers(
+        "kicad-curator-agent.md",
+        &curator,
+        &[
+            "load_toolset(\"flow\")",
+            "flow_advance",
+            "Anti-triggers: any phase before `learn`",
+            "**It never writes a `MEMORY.md` itself**",
+            "**Not a brain.** No brain path is ever read or written.",
+        ],
+    ));
+
+    // Task 5.1: Step 9 follows Step 8 and applies only in a job.
+    let step8 = build.find("**Step 8:").unwrap_or(usize::MAX);
+    let step9 = build.find("**Step 9: Record the phase (flow job only)**");
+    if step9.is_none_or(|at| at < step8) {
+        broken.push("kicad-schematic-build-agent.md: Step 9 does not follow Step 8".into());
+    }
+    broken.extend(missing_markers(
+        "kicad-schematic-build-agent.md Step 9",
+        section(
+            &build,
+            "**Step 9: Record the phase (flow job only)**",
+            "\n### ",
+        ),
+        &[
+            "Applies only when the brief names a `job_id`; a job-less run skips this step and calls no `flow_*` tool.",
+            "load_toolset(\"flow\")",
+            "`flow_advance(project_dir, job_id, to_phase, records, evidence_calls)`",
+            "`to_phase` is `schematic_review`; `records` holds `schematic-evidence.md`",
+        ],
+    ));
+    // Task 5.2: placement records `placement.md` and the run stops there.
+    broken.extend(missing_markers(
+        "kicad-pcb-layout-agent.md Phase 3",
+        section(&layout, "### Phase 3: Placement", "\n### Phase 4"),
+        &[
+            "**In a flow job, Phase 3 ends the run.**",
+            "`to_phase` is `gate:placement`; `records` holds `placement.md`",
+            "**Never route in the same run**",
+        ],
+    ));
+    broken.extend(missing_markers(
+        "kicad-pcb-layout-agent.md",
+        &layout,
+        &[
+            "load_toolset(\"flow\")",
+            "`to_phase` `prefab_review`, `records` holding `routing.md`",
+            "never route in the run that recorded `placement.md`",
+        ],
+    ));
+    // Task 5.3: single-reviewer mode advances; a merge leaves it to the
+    // session; the review never mutates the design.
+    broken.extend(missing_markers(
+        "kicad-design-review-agent.md",
+        section(&review, "### Recording the review (flow job only)", "\n### "),
+        &[
+            "Applies only when the brief names a `job_id`. You still never mutate the design",
+            "**Single-reviewer mode**",
+            "`ledger-schematic.md` at `schematic_review` or `ledger-prefab.md` at `prefab_review`",
+            "**Multi-reviewer merge** (the brief says the session merges several reviewers): never call `flow_advance`.",
+        ],
+    ));
+
+    assert!(
+        broken.is_empty(),
+        "an orchestrator agent broke its contract:\n  {}",
+        broken.join("\n  ")
+    );
+}
+
+/// Spec "an agent that records a phase loads the flow toolset", derived from
+/// the agents directory rather than a hand-written list: every bundled agent
+/// that names `flow_advance` or any other `flow_*` tool also prescribes
+/// `load_toolset("flow")`, so a new agent is covered the day it is added.
+#[test]
+fn every_agent_that_names_a_flow_tool_loads_flow() {
+    const FLOW_TOOLS: [&str; 6] = [
+        "flow_status",
+        "flow_start",
+        "flow_advance",
+        "flow_gate",
+        "flow_log",
+        "flow_defer",
+    ];
+    let mut missing = Vec::new();
+    let mut enrolled = 0;
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !FLOW_TOOLS.iter().any(|tool| text.contains(tool)) {
+            continue;
+        }
+        enrolled += 1;
+        let loaded: BTreeSet<String> = text.lines().flat_map(toolset_names_in).collect();
+        if !loaded.contains("flow") {
+            missing.push(display(&path));
+        }
+    }
+    assert!(
+        enrolled >= 9,
+        "expected the nine flow-aware agents, found {enrolled}"
+    );
+    assert!(
+        missing.is_empty(),
+        "agents name a flow tool without loading `flow`: {}",
+        missing.join(", ")
+    );
+}
