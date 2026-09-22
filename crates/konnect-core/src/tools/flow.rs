@@ -249,6 +249,23 @@ pub(crate) enum GateDecision {
     Reject,
 }
 
+impl GateDecision {
+    pub(crate) const ALL: [GateDecision; 2] = [GateDecision::Approve, GateDecision::Reject];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GateDecision::Approve => "approve",
+            GateDecision::Reject => "reject",
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Option<GateDecision> {
+        GateDecision::ALL
+            .into_iter()
+            .find(|decision| decision.as_str() == raw)
+    }
+}
+
 /// Who granted an approval: the user's own words, or the session under
 /// autonomous mode (D3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +273,15 @@ pub(crate) enum GateDecision {
 pub(crate) enum ApprovedBy {
     User,
     Session,
+}
+
+impl ApprovedBy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ApprovedBy::User => "user",
+            ApprovedBy::Session => "session",
+        }
+    }
 }
 
 // ─── STATE.md structs (design D2) ─────────────────────────────────────────────
@@ -1773,21 +1799,24 @@ fn existing_state_path(project: &Path) -> Result<(PathBuf, PathBuf), CallToolRes
     Ok((flow_dir, state_path))
 }
 
-/// Run the transition under the `STATE.md` lock. The closure validates
-/// everything first; a refusal hands the content back unchanged, so nothing
-/// is written.
-fn advance_job(project: &Path, request: &AdvanceRequest) -> CallToolResult {
+/// Run a mutation of an existing job under the `STATE.md` lock (D2): `apply`
+/// receives the flow directory, the state path and the current text, and
+/// returns the new text and the response. A refusal hands the text back
+/// unchanged, so `STATE.md` is not rewritten — and `apply` writes its side
+/// files only after every check passed.
+fn transact_state(
+    project: &Path,
+    apply: impl FnOnce(&Path, &Path, &str) -> Result<(String, Value), CallToolResult>,
+) -> CallToolResult {
     let (flow_dir, state_path) = match existing_state_path(project) {
         Ok(paths) => paths,
         Err(refusal) => return refusal,
     };
     let outcome = konnect_sexp::transact_atomic(&state_path, |current| {
-        Ok(
-            match apply_advance(project, &flow_dir, &state_path, current, request) {
-                Ok((next, response)) => (next, Ok(response)),
-                Err(refusal) => (current.to_string(), Err(refusal)),
-            },
-        )
+        Ok(match apply(&flow_dir, &state_path, current) {
+            Ok((next, response)) => (next, Ok(response)),
+            Err(refusal) => (current.to_string(), Err(refusal)),
+        })
     });
     match outcome {
         Ok(Ok(response)) => CallToolResult::json(&response),
@@ -1799,6 +1828,36 @@ fn advance_job(project: &Path, request: &AdvanceRequest) -> CallToolResult {
     }
 }
 
+/// The job in `current`, refused as a `conflict` when the front matter does
+/// not parse and as a `stale_target` when `job_id` is not the project's job
+/// (active or closed).
+fn load_job(state_path: &Path, current: &str, job_id: &str) -> Result<JobState, CallToolResult> {
+    let state = parse_state(current).map_err(|error| {
+        conflict(
+            state_path,
+            format!("{error}. Fix it by hand; nothing was written."),
+        )
+    })?;
+    if job_id != state.job_id {
+        return Err(stale(
+            &format!("job:{job_id}"),
+            format!(
+                "job_id {job_id:?} is not this project's job ({:?}); read flow_status. Nothing \
+                 was written.",
+                state.job_id
+            ),
+        ));
+    }
+    Ok(state)
+}
+
+/// Run the transition under the `STATE.md` lock.
+fn advance_job(project: &Path, request: &AdvanceRequest) -> CallToolResult {
+    transact_state(project, |flow_dir, state_path, current| {
+        apply_advance(project, flow_dir, state_path, current, request)
+    })
+}
+
 /// Parse, check the job, classify, then dispatch on the transition. Returns
 /// the new `STATE.md` text and the response.
 fn apply_advance(
@@ -1808,22 +1867,7 @@ fn apply_advance(
     current: &str,
     request: &AdvanceRequest,
 ) -> Result<(String, Value), CallToolResult> {
-    let state = parse_state(current).map_err(|error| {
-        conflict(
-            state_path,
-            format!("{error}. Fix it by hand; nothing was written."),
-        )
-    })?;
-    if request.job_id != state.job_id {
-        return Err(stale(
-            &format!("job:{}", request.job_id),
-            format!(
-                "job_id {:?} is not this project's job ({:?}); read flow_status. Nothing was \
-                 written.",
-                request.job_id, state.job_id
-            ),
-        ));
-    }
+    let state = load_job(state_path, current, &request.job_id)?;
     if state.phase == CLOSED {
         return Err(stale(
             &format!("job:{}", request.job_id),
@@ -1945,26 +1989,35 @@ fn check_gate_exit(
         let shown = visit
             .and_then(|visit| state.history.get(visit))
             .map(|entry| &entry.package_files);
-        let changed: Vec<&str> = package
-            .files
-            .iter()
-            .filter(|(name, digest)| shown.and_then(|files| files.get(*name)) != Some(*digest))
-            .map(|(name, _)| name.as_str())
-            .collect();
         return Err(stale(
             gate_token,
             format!(
                 "the package of gate {gate:?} changed after it was approved (changed or \
                  missing: {}); rewind or re-approve. Nothing was written.",
-                if changed.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    changed.join(", ")
-                }
+                changed_package_files(shown, &package.files)
             ),
         ));
     }
     Ok(())
+}
+
+/// The package records whose digest now differs from what the gate entry
+/// recorded (`shown`) — changed, deleted or newly present — for a refusal to
+/// name; `unknown` when the entry kept no per-record digests.
+fn changed_package_files(
+    shown: Option<&BTreeMap<String, Option<String>>>,
+    now: &BTreeMap<String, Option<String>>,
+) -> String {
+    let changed: Vec<&str> = now
+        .iter()
+        .filter(|(name, digest)| shown.and_then(|files| files.get(*name)) != Some(*digest))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if changed.is_empty() {
+        "unknown".to_string()
+    } else {
+        changed.join(", ")
+    }
 }
 
 /// A forward move (or the close from the last entry): validate, hash, write
@@ -2180,6 +2233,358 @@ fn commit_transition(
     Ok((render_state(&state), response))
 }
 
+// ─── flow_gate (design D1, D3, D5, D11) ───────────────────────────────────────
+
+/// A validated `flow_gate` call, before it meets the state file.
+struct GateRequest {
+    job_id: String,
+    /// A [`GATE_NAMES`] entry; the phase token is `gate:<gate>`.
+    gate: String,
+    decision: GateDecision,
+    summary: String,
+    user_words: String,
+}
+
+async fn handle_flow_gate(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let job_id = match require_str(args, "job_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let gate = match require_str(args, "gate_name") {
+        Ok(value) if GATE_NAMES.contains(&value) => value.to_string(),
+        Ok(value) => {
+            return Ok(invalid_arg(
+                "gate_name",
+                &format!(
+                    "{value:?} is not a gate; expected one of: {}. Nothing was written.",
+                    GATE_NAMES.join(", ")
+                ),
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let decision = match require_str(args, "decision").map(GateDecision::parse) {
+        Ok(Some(decision)) => decision,
+        Ok(None) => {
+            return Ok(invalid_arg(
+                "decision",
+                "must be approve or reject. Nothing was written.",
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let summary = match require_str(args, "summary") {
+        Ok(value) if !value.trim().is_empty() => value.to_string(),
+        Ok(_) => {
+            return Ok(invalid_arg(
+                "summary",
+                "must say what was shown and decided. Nothing was written.",
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let user_words = match require_str(args, "user_words") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    let request = GateRequest {
+        job_id,
+        gate,
+        decision,
+        summary,
+        user_words,
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        transact_state(&project, |flow_dir, state_path, current| {
+            apply_gate(&project, flow_dir, state_path, current, &request)
+        })
+    })
+    .await?)
+}
+
+/// Record the decision: every check first, then the gate file and the log,
+/// then the new `STATE.md`. The phase never moves — leaving the gate is
+/// `flow_advance`'s.
+fn apply_gate(
+    project: &Path,
+    flow_dir: &Path,
+    state_path: &Path,
+    current: &str,
+    request: &GateRequest,
+) -> Result<(String, Value), CallToolResult> {
+    let mut state = load_job(state_path, current, &request.job_id)?;
+    let gate_token = format!("gate:{}", request.gate);
+    if state.phase != gate_token {
+        return Err(invalid_arg(
+            "gate_name",
+            &format!(
+                "the job is at {:?}, not at {gate_token:?}; a gate decision is recorded only \
+                 while the job stands at that gate. Nothing was written.",
+                state.phase
+            ),
+        ));
+    }
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let (approval, removed) = match request.decision {
+        GateDecision::Approve => {
+            let approval = check_approval(project, flow_dir, &state, request, &gate_token, &at)?;
+            (Some(approval), false)
+        }
+        GateDecision::Reject => (None, state.gate_approvals.contains_key(&request.gate)),
+    };
+
+    // Every check passed: side files first, STATE.md last (D2).
+    let gates_dir =
+        ensure_flow_subdir(flow_dir, &[RECORDS_DIR, GATES_DIR]).map_err(CallToolResult::error)?;
+    let gate_path = gates_dir.join(format!("{}.md", request.gate));
+    let history_package = current_visit(&state)
+        .and_then(|visit| state.history.get(visit))
+        .map(|entry| &entry.package_files);
+    let file = gate_file_text(&state, request, &at, approval.as_ref(), history_package);
+    konnect_sexp::write_atomic(&gate_path, &file).map_err(|error| {
+        CallToolResult::error(format!("Could not write {} ({error})", gate_path.display()))
+    })?;
+
+    let mut lines = Vec::new();
+    if let Some(approval) = &approval {
+        lines.push(format!(
+            "approved by {} · visit {}",
+            approval.approved_by.as_str(),
+            approval.visit
+        ));
+        lines.push(format!(
+            "design_hash: `{}`",
+            approval.design_hash_at_approval
+        ));
+        lines.push(format!(
+            "package_hash: `{}`",
+            approval.package_hash_at_approval
+        ));
+    } else {
+        lines.push(format!("removed approval: {removed}"));
+    }
+    lines.push(format!("summary: {}", one_line(&request.summary)));
+    lines.push(format!("user_words: {}", one_line(&request.user_words)));
+    let log = log_entry(
+        &at,
+        &format!("gate {} {}", request.gate, request.decision.as_str()),
+        &lines,
+    );
+    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
+
+    let response = json!({
+        "job_id": state.job_id,
+        "gate": request.gate,
+        "decision": request.decision,
+        "phase": state.phase,
+        "approved_by": approval.as_ref().map(|approval| approval.approved_by),
+        "approved_at": approval.as_ref().map(|approval| approval.approved_at.clone()),
+        "visit": approval.as_ref().map(|approval| approval.visit),
+        "design_hash_at_approval": approval
+            .as_ref()
+            .map(|approval| approval.design_hash_at_approval.clone()),
+        "package_hash_at_approval": approval
+            .as_ref()
+            .map(|approval| approval.package_hash_at_approval.clone()),
+        "removed_approval": removed,
+        "gate_file": gate_path.display().to_string(),
+    });
+    match approval {
+        Some(approval) => {
+            state.gate_approvals.insert(request.gate.clone(), approval);
+        }
+        None => {
+            state.gate_approvals.remove(&request.gate);
+        }
+    }
+    Ok((render_state(&state), response))
+}
+
+/// The approval rules, in order (D1, D3, D5, D11): the user's own words
+/// unless an autonomous session approves `architecture` or `placement`;
+/// `architecture.md`'s readiness line for `architecture`; and both keys equal
+/// to those recorded by the history entry that ENTERED this gate phase — the
+/// human approves what was produced and shown, never whatever the files
+/// became meanwhile.
+fn check_approval(
+    project: &Path,
+    flow_dir: &Path,
+    state: &JobState,
+    request: &GateRequest,
+    gate_token: &str,
+    at: &str,
+) -> Result<GateApproval, CallToolResult> {
+    let session_approval = request.user_words.trim().is_empty();
+    if session_approval && (state.mode == Mode::Guided || request.gate == "purchase") {
+        return Err(invalid_arg(
+            "user_words",
+            &format!(
+                "approving {:?} needs the user's own words, quoted verbatim — {}. Nothing was \
+                 written.",
+                request.gate,
+                if request.gate == "purchase" {
+                    "purchase always does, in every mode"
+                } else {
+                    "this job is guided"
+                }
+            ),
+        ));
+    }
+    if request.gate == "architecture" {
+        let path = flow_dir.join(RECORDS_DIR).join(ARCHITECTURE_RECORD);
+        let content = match std::fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(CallToolResult::error(format!(
+                    "Could not read {} ({error}). Nothing was written.",
+                    path.display()
+                )))
+            }
+        };
+        let problem = match parse_readiness(&content) {
+            Readiness::Pass => None,
+            Readiness::Blocked(reason) => Some(format!("its readiness line is BLOCKED — {reason}")),
+            Readiness::Malformed => {
+                Some("its last non-empty line is not a readiness line".to_string())
+            }
+        };
+        if let Some(problem) = problem {
+            return Err(invalid_arg(
+                "decision",
+                &format!(
+                    "records/{ARCHITECTURE_RECORD} must end with `Readiness: PASS` to approve \
+                     architecture; {problem}. Nothing was written."
+                ),
+            ));
+        }
+    }
+
+    let Some(visit) = current_visit(state) else {
+        return Err(stale(
+            gate_token,
+            format!(
+                "no history entry entered {gate_token}, so there are no keys to approve \
+                 against; rewind and re-enter it. Nothing was written."
+            ),
+        ));
+    };
+    let entered = &state.history[visit];
+    let design_hash = hash_design(project)?;
+    if design_hash != entered.design_hash {
+        return Err(stale(
+            gate_token,
+            format!(
+                "the design changed after the job entered {gate_token} (design_hash {} then, \
+                 {} now), so the user was not shown this state; rewind to the phase that \
+                 produced it and re-enter the gate. Nothing was written.",
+                short_hash(&entered.design_hash),
+                short_hash(&design_hash)
+            ),
+        ));
+    }
+    let package = current_package(flow_dir, &state.phases, gate_token).map_err(|error| {
+        CallToolResult::error(format!(
+            "Could not hash the package of {gate_token}: {error}. Nothing was written."
+        ))
+    })?;
+    if entered.package_hash.as_deref() != Some(package.hash.as_str()) {
+        return Err(stale(
+            gate_token,
+            format!(
+                "the package of {gate_token} changed after the job entered it (changed or \
+                 missing: {}), so the user was not shown this state; rewind to the phase that \
+                 produced it and re-enter the gate. Nothing was written.",
+                changed_package_files(Some(&entered.package_files), &package.files)
+            ),
+        ));
+    }
+    Ok(GateApproval {
+        decision: GateDecision::Approve,
+        approved_by: if session_approval {
+            ApprovedBy::Session
+        } else {
+            ApprovedBy::User
+        },
+        approved_at: at.to_string(),
+        design_hash_at_approval: design_hash,
+        package_hash_at_approval: package.hash,
+        visit,
+        summary: request.summary.clone(),
+        user_words: request.user_words.clone(),
+    })
+}
+
+/// `records/gates/<gate>.md`: the latest decision on the gate, with the
+/// user's words verbatim (blockquoted, so no line can forge a heading). Each
+/// earlier decision stays in the job log.
+fn gate_file_text(
+    state: &JobState,
+    request: &GateRequest,
+    at: &str,
+    approval: Option<&GateApproval>,
+    package_files: Option<&BTreeMap<String, Option<String>>>,
+) -> String {
+    let mut text = format!(
+        "# Gate `{}` — {}\n\n- Job: `{}`\n- At: {at}\n",
+        request.gate,
+        request.decision.as_str(),
+        state.job_id
+    );
+    if let Some(approval) = approval {
+        text.push_str(&format!(
+            "- Approved by: {}\n- Visit: {} (the history entry that entered gate:{})\n\
+             - design_hash: `{}`\n- package_hash: `{}`\n",
+            approval.approved_by.as_str(),
+            approval.visit,
+            request.gate,
+            approval.design_hash_at_approval,
+            approval.package_hash_at_approval
+        ));
+        for (name, digest) in package_files.into_iter().flatten() {
+            text.push_str(&format!(
+                "  - {name}: {}\n",
+                digest
+                    .as_deref()
+                    .map_or("absent".to_string(), |digest| format!("`{digest}`"))
+            ));
+        }
+    }
+    text.push_str(&format!(
+        "\n## Summary\n\n{}\n\n## User's words\n\n{}\n",
+        blockquote(&request.summary),
+        match (request.user_words.trim().is_empty(), approval) {
+            (true, Some(_)) => "(none — approved by the session under autonomous mode)".to_string(),
+            (true, None) => "(none)".to_string(),
+            (false, _) => blockquote(&request.user_words),
+        }
+    ));
+    text
+}
+
+/// Every line prefixed with `> `: free text kept readable and verbatim, yet
+/// unable to open a heading or a list of its own.
+fn blockquote(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ─── Tool definitions (design D1) ─────────────────────────────────────────────
 
 /// The `flow` tools in D1 order. The router registers them (task 1.8).
@@ -2301,6 +2706,51 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["project_dir", "job_id", "to_phase"]
             }),
             |args, ctx| async move { handle_flow_advance(args, ctx).await }
+        ),
+        tool!(
+            "flow_gate",
+            "Record the user's decision on the gate the job stands at (gate:<gate_name>). \
+             approve binds to what was shown: the design_state_hash and the package hash \
+             recorded when the job entered the gate must still match (a design or record \
+             changed since is stale_target, naming the changed records); architecture also \
+             needs architecture.md to end with `Readiness: PASS`; user_words must quote the \
+             user verbatim, except that an autonomous job may approve architecture or \
+             placement with empty user_words (recorded as approved_by: session) — purchase \
+             always needs them. reject removes any approval. Writes \
+             records/gates/<gate_name>.md and logs it; never moves the phase.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id flow_start returned (flow_status reports it)."
+                    },
+                    "gate_name": {
+                        "type": "string",
+                        "enum": GATE_NAMES,
+                        "description": "The gate the job stands at: its phase is gate:<gate_name>."
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": GateDecision::ALL.map(GateDecision::as_str),
+                        "description": "approve records a hash-bound approval; reject removes any approval of this gate."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "What was shown to the user and what was decided (under autonomous mode, the session's reasoning). Must not be empty."
+                    },
+                    "user_words": {
+                        "type": "string",
+                        "description": "The user's own words, verbatim. Empty only when an autonomous job approves architecture or placement."
+                    }
+                },
+                "required": ["project_dir", "job_id", "gate_name", "decision", "summary", "user_words"]
+            }),
+            |args, ctx| async move { handle_flow_gate(args, ctx).await }
         ),
     ]
 }
@@ -2698,6 +3148,16 @@ mod foundation_tests {
         }
         for mode in Mode::ALL {
             assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
+        for decision in GateDecision::ALL {
+            assert_eq!(serde_json::to_value(decision).unwrap(), decision.as_str());
+            assert_eq!(GateDecision::parse(decision.as_str()), Some(decision));
+        }
+        for approved_by in [ApprovedBy::User, ApprovedBy::Session] {
+            assert_eq!(
+                serde_json::to_value(approved_by).unwrap(),
+                approved_by.as_str()
+            );
         }
         let flattened: Vec<&str> = PHASE_RECORDS
             .iter()
@@ -3152,6 +3612,29 @@ mod schema_tests {
             "to_phase": "architecture",
             "records": [{ "filename": "constraints.md", "content": "x", "extra": 1 }]
         })));
+
+        let gate = tool("flow_gate");
+        let approve = json!({
+            "project_dir": "p",
+            "job_id": "j",
+            "gate_name": "placement",
+            "decision": "approve",
+            "summary": "s",
+            "user_words": ""
+        });
+        assert!(gate.input_validator.is_valid(&approve));
+        for (key, bad) in [
+            ("gate_name", json!("layout")),
+            ("decision", json!("maybe")),
+            ("extra", json!(1)),
+        ] {
+            let mut call = approve.clone();
+            call[key] = bad;
+            assert!(!gate.input_validator.is_valid(&call), "{key}");
+        }
+        let mut without_words = approve.clone();
+        without_words.as_object_mut().unwrap().remove("user_words");
+        assert!(!gate.input_validator.is_valid(&without_words));
     }
 }
 
@@ -4069,5 +4552,370 @@ mod rewind_tests {
             "present only as an error"
         );
         assert!(check.confirmed.is_empty() && check.absent.is_empty());
+    }
+}
+
+// ─── Tests: flow_gate (task 1.6) ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod gate_tests {
+    use super::advance_tests::*;
+    use super::rewind_tests::PHOTO_PHASES;
+    use super::test_support::*;
+    use super::*;
+    use crate::mcp::protocol::CallToolResult;
+    use serde_json::json;
+
+    pub(super) async fn gate(
+        dir: &tempfile::TempDir,
+        job_id: &str,
+        gate_name: &str,
+        decision: &str,
+        user_words: &str,
+    ) -> CallToolResult {
+        handle_flow_gate(
+            &json!({
+                "project_dir": arg(dir),
+                "job_id": job_id,
+                "gate_name": gate_name,
+                "decision": decision,
+                "summary": "Showed the package and the renders.",
+                "user_words": user_words,
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn gate_file(dir: &tempfile::TempDir, gate_name: &str) -> std::path::PathBuf {
+        flow_path(dir)
+            .join("records")
+            .join("gates")
+            .join(format!("{gate_name}.md"))
+    }
+
+    async fn open_in(dir: &tempfile::TempDir, lane: &str, phases: &[&str], mode: &str) -> String {
+        let result = handle_flow_start(
+            &json!({
+                "project_dir": arg(dir),
+                "objective": "Demo board",
+                "lane": lane,
+                "phases": phases,
+                "mode": mode,
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        body(&result)["job_id"].as_str().unwrap().to_string()
+    }
+
+    /// A photo-lane job standing at `gate:placement`, entered by the real tool.
+    pub(super) async fn at_placement_gate(dir: &tempfile::TempDir, mode: &str) -> String {
+        let job_id = open_in(dir, "photo_to_kicad", &PHOTO_PHASES, mode).await;
+        for (to_phase, record) in [
+            ("schematic_review", "schematic-evidence.md"),
+            ("placement", "ledger-schematic.md"),
+            ("gate:placement", "placement.md"),
+        ] {
+            let moved = advance(dir, &job_id, to_phase, &[(record, "# Record\n")]).await;
+            assert!(!moved.is_error, "{to_phase}: {}", text(&moved));
+        }
+        job_id
+    }
+
+    /// Acceptance 1.6: D5 is re-checked at approval. The gate-entry keys are
+    /// re-planted over the BLOCKED file, so the readiness rule is the ONLY one
+    /// that can refuse — the stale-package rule would otherwise mask it.
+    #[tokio::test]
+    async fn approving_architecture_against_a_blocked_readiness_writes_no_gate_file() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        std::fs::write(
+            record_path(&dir, "architecture.md"),
+            "# A\n\nReadiness: BLOCKED — no input voltage range\n",
+        )
+        .unwrap();
+        let mut state = state_on_disk(&dir);
+        let package =
+            current_package(&flow_path(&dir), &state.phases, "gate:architecture").unwrap();
+        let entered = state.history.last_mut().unwrap();
+        entered.package_hash = Some(package.hash);
+        entered.package_files = package.files;
+        plant_state(&dir, &state);
+        let before = state_bytes(&dir);
+
+        let refused = gate(&dir, &job_id, "architecture", "approve", "aprovado").await;
+        assert_eq!(error_kind(&refused), "invalid_argument");
+        assert!(
+            text(&refused).contains("BLOCKED") && text(&refused).contains("no input voltage range"),
+            "{}",
+            text(&refused)
+        );
+        assert!(!gate_file(&dir, "architecture").exists());
+        assert_eq!(state_bytes(&dir), before);
+    }
+
+    /// Acceptance 1.6: empty `user_words` is refused in a guided job, and for
+    /// `purchase` even in an autonomous one.
+    #[tokio::test]
+    async fn an_approval_without_the_users_words_is_refused_in_guided_mode_and_at_purchase() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        let before = state_bytes(&dir);
+        for words in ["", "   "] {
+            let refused = gate(&dir, &job_id, "architecture", "approve", words).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{words:?}");
+            assert_eq!(body(&refused)["error"]["field"], "user_words", "{words:?}");
+            assert!(!gate_file(&dir, "architecture").exists());
+            assert_eq!(state_bytes(&dir), before);
+        }
+
+        let fab = project();
+        let fab_job = open_in(
+            &fab,
+            "fab_only",
+            &["manufacturing", "gate:purchase"],
+            "autonomous",
+        )
+        .await;
+        let entered = advance(
+            &fab,
+            &fab_job,
+            "gate:purchase",
+            &[("manufacturing.md", "# Package\n")],
+        )
+        .await;
+        assert!(!entered.is_error, "{}", text(&entered));
+        let before = state_bytes(&fab);
+        let refused = gate(&fab, &fab_job, "purchase", "approve", "").await;
+        assert_eq!(error_kind(&refused), "invalid_argument");
+        assert_eq!(body(&refused)["error"]["field"], "user_words");
+        assert!(text(&refused).contains("purchase"), "{}", text(&refused));
+        assert!(!gate_file(&fab, "purchase").exists());
+        assert_eq!(state_bytes(&fab), before);
+    }
+
+    /// Acceptance 1.6: an autonomous session may approve `placement` itself.
+    #[tokio::test]
+    async fn autonomous_mode_lets_the_session_approve_placement() {
+        let dir = project();
+        let job_id = at_placement_gate(&dir, "autonomous").await;
+        let approved = gate(&dir, &job_id, "placement", "approve", "").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+        assert_eq!(body(&approved)["approved_by"], "session");
+
+        let state = state_on_disk(&dir);
+        let approval = &state.gate_approvals["placement"];
+        assert_eq!(approval.approved_by, ApprovedBy::Session);
+        assert_eq!(approval.user_words, "");
+        assert_eq!(Some(approval.visit), current_visit(&state));
+        let (design_hash, _) =
+            crate::design_hash::design_state_hash(&dir.path().canonicalize().unwrap()).unwrap();
+        assert_eq!(approval.design_hash_at_approval, design_hash);
+        let file = std::fs::read_to_string(gate_file(&dir, "placement")).unwrap();
+        assert!(
+            file.contains("approve") && file.contains("session"),
+            "{file}"
+        );
+
+        let left = advance(&dir, &job_id, "routing", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
+    }
+
+    /// Acceptance 1.6 / architect's mistake #2: approval compares against the
+    /// keys of the entry that ENTERED the gate — a `.kicad_pcb` byte changed
+    /// since then is refused, although now-vs-now would match.
+    #[tokio::test]
+    async fn a_board_changed_since_the_gate_was_entered_is_a_stale_target() {
+        let dir = project();
+        std::fs::write(dir.path().join("demo.kicad_pcb"), "(kicad_pcb)\n").unwrap();
+        let job_id = at_placement_gate(&dir, "guided").await;
+        let before = state_bytes(&dir);
+
+        std::fs::write(dir.path().join("demo.kicad_pcb"), "(kicad_pcb )\n").unwrap();
+        let refused = gate(&dir, &job_id, "placement", "approve", "pode fabricar").await;
+        assert_eq!(error_kind(&refused), "stale_target");
+        assert_eq!(body(&refused)["error"]["target"], "gate:placement");
+        assert!(!gate_file(&dir, "placement").exists());
+        assert_eq!(state_bytes(&dir), before);
+        std::fs::write(dir.path().join("demo.kicad_pcb"), "(kicad_pcb)\n").unwrap();
+
+        std::fs::write(record_path(&dir, "placement.md"), "# Record, edited\n").unwrap();
+        let package_changed = gate(&dir, &job_id, "placement", "approve", "pode fabricar").await;
+        assert_eq!(error_kind(&package_changed), "stale_target");
+        assert!(
+            text(&package_changed).contains("placement.md"),
+            "{}",
+            text(&package_changed)
+        );
+        assert_eq!(state_bytes(&dir), before);
+        std::fs::write(record_path(&dir, "placement.md"), "# Record\n").unwrap();
+
+        let approved = gate(&dir, &job_id, "placement", "approve", "pode fabricar").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+    }
+
+    /// A guided approval records the D11 keys of the gate entry and its
+    /// visit, writes the gate file with the user's words verbatim, logs it,
+    /// and is what lets the job leave the gate.
+    #[tokio::test]
+    async fn a_guided_approval_binds_to_the_gate_entry_and_lets_the_job_leave() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        let words = "Pode seguir: \"USB-C\" ok\nsem o LDO extra";
+        let approved = gate(&dir, &job_id, "architecture", "approve", words).await;
+        assert!(!approved.is_error, "{}", text(&approved));
+
+        let state = state_on_disk(&dir);
+        let visit = state.history.len() - 1;
+        let entered = &state.history[visit];
+        let approval = &state.gate_approvals["architecture"];
+        assert_eq!(approval.decision, GateDecision::Approve);
+        assert_eq!(approval.approved_by, ApprovedBy::User);
+        assert_eq!(approval.visit, visit);
+        assert_eq!(approval.design_hash_at_approval, entered.design_hash);
+        assert_eq!(
+            Some(approval.package_hash_at_approval.as_str()),
+            entered.package_hash.as_deref()
+        );
+        assert_eq!(approval.user_words, words);
+        assert_eq!(approval.summary, "Showed the package and the renders.");
+        assert_eq!(
+            state.phase, "gate:architecture",
+            "a decision moves no phase"
+        );
+
+        let file = std::fs::read_to_string(gate_file(&dir, "architecture")).unwrap();
+        assert!(
+            file.contains("> Pode seguir: \"USB-C\" ok\n> sem o LDO extra"),
+            "{file}"
+        );
+        assert!(file.contains(&approval.package_hash_at_approval), "{file}");
+        let log = std::fs::read_to_string(
+            flow_path(&dir)
+                .join("log")
+                .join(format!("{}-{job_id}.md", &state.started_at[..10])),
+        )
+        .unwrap();
+        assert!(log.contains("gate architecture approve"), "{log}");
+
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
+    }
+
+    #[tokio::test]
+    async fn a_decision_needs_the_job_at_that_gate_and_a_summary() {
+        let dir = project();
+        let orphan = gate(
+            &dir,
+            "demo-20260921-140000",
+            "architecture",
+            "approve",
+            "ok",
+        )
+        .await;
+        assert_eq!(error_kind(&orphan), "stale_target");
+        assert!(!dir.path().join(".konnect").exists(), "creates nothing");
+
+        let working = open(&dir, "new_board", None).await;
+        let not_at_gate = gate(&dir, &working, "architecture", "approve", "ok").await;
+        assert_eq!(error_kind(&not_at_gate), "invalid_argument");
+        assert_eq!(body(&not_at_gate)["error"]["field"], "gate_name");
+
+        let at_gate = project();
+        let job_id = at_architecture_gate(&at_gate).await;
+        let before = state_bytes(&at_gate);
+        let other_gate = gate(&at_gate, &job_id, "placement", "approve", "ok").await;
+        assert_eq!(error_kind(&other_gate), "invalid_argument");
+        assert_eq!(body(&other_gate)["error"]["field"], "gate_name");
+        let foreign = gate(
+            &at_gate,
+            "another-20260101-000000",
+            "architecture",
+            "approve",
+            "ok",
+        )
+        .await;
+        assert_eq!(error_kind(&foreign), "stale_target");
+        let no_summary = handle_flow_gate(
+            &json!({
+                "project_dir": arg(&at_gate),
+                "job_id": job_id,
+                "gate_name": "architecture",
+                "decision": "approve",
+                "summary": " ",
+                "user_words": "ok",
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(error_kind(&no_summary), "invalid_argument");
+        assert_eq!(body(&no_summary)["error"]["field"], "summary");
+        assert!(!gate_file(&at_gate, "architecture").exists());
+        assert_eq!(state_bytes(&at_gate), before);
+    }
+
+    /// `reject` removes the approval, records the rejection in the gate file
+    /// and the log, and leaves the phase where it is.
+    #[tokio::test]
+    async fn a_rejection_removes_the_approval_and_keeps_the_phase() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        assert!(
+            !gate(&dir, &job_id, "architecture", "approve", "sim")
+                .await
+                .is_error
+        );
+        let rejected = gate(&dir, &job_id, "architecture", "reject", "").await;
+        assert!(!rejected.is_error, "{}", text(&rejected));
+        assert_eq!(body(&rejected)["removed_approval"], true);
+
+        let state = state_on_disk(&dir);
+        assert!(state.gate_approvals.is_empty());
+        assert_eq!(state.phase, "gate:architecture");
+        let file = std::fs::read_to_string(gate_file(&dir, "architecture")).unwrap();
+        assert!(file.contains("reject"), "{file}");
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(error_kind(&left), "stale_target");
+    }
+
+    /// After a rewind into the gate, the approval binds to the REWIND entry's
+    /// keys (the package as fixed), and leaving works again.
+    #[tokio::test]
+    async fn an_approval_after_a_rewind_into_the_gate_binds_to_the_rewind_entry() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        assert!(
+            !gate(&dir, &job_id, "architecture", "approve", "sim")
+                .await
+                .is_error
+        );
+        assert!(!advance(&dir, &job_id, "schematic", &[]).await.is_error);
+        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins, fixed\n").unwrap();
+        let rewound = advance_with(
+            &dir,
+            &ctx(),
+            &job_id,
+            "gate:architecture",
+            json!({ "reason": "pin conflict" }),
+        )
+        .await;
+        assert!(!rewound.is_error, "{}", text(&rewound));
+
+        let approved = gate(&dir, &job_id, "architecture", "approve", "agora sim").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+        let state = state_on_disk(&dir);
+        let approval = &state.gate_approvals["architecture"];
+        assert_eq!(approval.visit, state.history.len() - 1);
+        assert_eq!(
+            Some(approval.package_hash_at_approval.as_str()),
+            state.history.last().unwrap().package_hash.as_deref()
+        );
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
     }
 }
