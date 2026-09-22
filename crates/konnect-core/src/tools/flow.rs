@@ -59,7 +59,9 @@ pub(crate) const CANONICAL_PHASES: [&str; 12] = [
 pub(crate) const CLOSED: &str = "closed";
 
 /// A gated phase and the gate it brings (D3): a lane subset that includes the
-/// phase without its gate would silently drop a human approval.
+/// phase without its gate would silently drop a human approval, and one that
+/// includes the gate without its phase would bind the approval to a record
+/// no phase of this job produced.
 const GATED_PHASES: [(&str, &str); 3] = [
     ("architecture", "gate:architecture"),
     ("placement", "gate:placement"),
@@ -412,7 +414,8 @@ pub(crate) struct DeferredItem {
 
 /// D3, generic over lanes (no per-lane arm): non-empty; every token known;
 /// strictly increasing in canonical order; a gate is never first; a gated
-/// phase brings its gate. Every error quotes the offending entry.
+/// phase brings its gate, and a gate brings its phase (Fix round 1, DECISION
+/// A). Every error quotes the offending entry.
 pub(crate) fn validate_phases(phases: &[String]) -> Result<(), String> {
     if phases.is_empty() {
         return Err("phases must name at least one phase".to_string());
@@ -452,6 +455,14 @@ pub(crate) fn validate_phases(phases: &[String]) -> Result<(), String> {
             return Err(format!(
                 "phases includes {phase:?} without its gate {gate:?}; a lane subset cannot drop \
                  a human gate"
+            ));
+        }
+    }
+    for (phase, gate) in GATED_PHASES {
+        if phases.iter().any(|entry| entry == gate) && !phases.iter().any(|entry| entry == phase) {
+            return Err(format!(
+                "phases includes {gate:?} without its phase {phase:?}; a gate's package must \
+                 come from this job, not from a record an earlier job left on disk"
             ));
         }
     }
@@ -3425,12 +3436,24 @@ mod foundation_tests {
 
     #[test]
     fn the_validator_names_the_entry_it_rejects() {
-        let cases: [(&[&str], &str, &str); 5] = [
+        let cases: [(&[&str], &str, &str); 7] = [
             (&["schematic", "requirements"], "\"requirements\"", "order"),
             (&["schematic", "schematic"], "\"schematic\"", "repeat"),
             (&["schematic", "layout"], "\"layout\"", "not a phase"),
             (&["gate:placement", "routing"], "\"gate:placement\"", "gate"),
             (&["placement", "routing"], "\"placement\"", "gate:placement"),
+            // Reviewer 11's two shapes: a gate whose producing phase is not in
+            // the job would bind its approval to a leftover record.
+            (
+                &["routing", "prefab_review", "gate:purchase"],
+                "\"gate:purchase\"",
+                "manufacturing",
+            ),
+            (
+                &["requirements", "gate:architecture", "schematic"],
+                "\"gate:architecture\"",
+                "architecture",
+            ),
         ];
         for (phases, entry, rule) in cases {
             let error = validate_phases(&owned(phases)).expect_err("rejected");

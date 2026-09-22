@@ -308,6 +308,46 @@ async fn the_loaded_schemas_refuse_what_the_server_would_refuse() {
     );
 }
 
+/// Reviewer 11's Scenario A through the published `flow_start` schema: a job
+/// that holds `gate:purchase` without `manufacturing` would bind the purchase
+/// approval to whatever `manufacturing.md` an earlier job left on disk, so it
+/// is refused before anything is created.
+#[tokio::test]
+async fn a_gate_without_its_phase_is_refused_through_flow_start() {
+    let (ctx, defs) = loaded_toolset().await;
+    let (_dir, project_dir, project_arg) = project();
+
+    let result = call(
+        &ctx,
+        &defs,
+        "flow_start",
+        json!({
+            "project_dir": project_arg,
+            "objective": "Re-route after the board changed",
+            "lane": "board_revision",
+            "phases": ["routing", "prefab_review", "gate:purchase"],
+        }),
+    )
+    .await;
+    assert!(
+        result.is_error,
+        "a purchase gate without manufacturing must be refused: {}",
+        text(&result)
+    );
+    let body = payload(&result);
+    assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["field"], "phases", "{body}");
+    let message = body["message"].as_str().expect("refusal message");
+    assert!(
+        message.contains("\"gate:purchase\"") && message.contains("manufacturing"),
+        "the refusal names the gate and its missing phase: {message}"
+    );
+    assert!(
+        !project_dir.join(".konnect").join("flow").exists(),
+        "a refused start creates no flow directory"
+    );
+}
+
 /// start → requirements → architecture (`PASS`) → approve → a `.kicad_pro`
 /// byte changes → leaving is refused → rewind to `architecture`, re-advance,
 /// re-approve → leaving succeeds.
