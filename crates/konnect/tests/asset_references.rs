@@ -2203,3 +2203,107 @@ fn manufacture_verdict_permits_exit_with_adjudicated_drc_warnings() {
     }
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
+
+/// Task 9.2 (DECISIONS J + K; reviewer 16 minors 2 and 3): after the
+/// purchase gate, `READY` has an owner — the orchestrating session records it
+/// with `flow_log`, naming the approval, and no agent ever uploads — and §4
+/// no longer says `valid` is recomputed for every approval, which contradicted
+/// §7. The `READY` bullet must sit between "Only then does it ask for the
+/// `purchase` decision" and "A rejection records the decision", inside §4.
+#[test]
+fn orchestration_reference_gives_ready_an_owner_after_the_purchase_gate() {
+    let orchestration = include_str!("../assets/skills/konnect/references/orchestration.md");
+    let gates = section(orchestration, "## 4. Gates", "\n## 5.");
+    let mut lost = missing_markers(
+        "orchestration.md §4",
+        gates,
+        &[
+            "Once `flow_gate` records the `purchase` approval",
+            "records the package as `READY` in the skill's sense",
+            "`kind` `evidence`, naming that approval",
+            "Placing or uploading the order is the user's own action; no agent, including \
+             `kicad-manufacture-agent`, ever uploads it.",
+            "`flow_status`'s `gate_approvals` reports `valid` only for the gate the job \
+             stands at now (§7); a passed gate reports `status: passed` with no `valid` field.",
+        ],
+    );
+    let flat_gates = flat(gates);
+    let stale = "reports every approval's validity";
+    if flat(orchestration).contains(stale) {
+        lost.push(format!("orchestration.md again says `{stale}`"));
+    }
+    let asks = flat_gates.find("Only then does it ask for the `purchase` decision");
+    let owner = flat_gates.find("records the package as `READY` in the skill's sense");
+    let rejection = flat_gates.find("A rejection records the decision");
+    match (asks, owner, rejection) {
+        (Some(asks), Some(owner), Some(rejection)) if asks < owner && owner < rejection => {}
+        _ => lost.push(format!(
+            "orchestration.md §4: the READY owner bullet must follow the purchase checks and \
+             precede the rejection bullet (positions {asks:?}, {owner:?}, {rejection:?})"
+        )),
+    }
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
+
+/// Task 9.6 (DECISION M): the three texts that still described the behaviour
+/// before fix round 2, each pinned in its own place so a later reword fails
+/// here instead of passing silently. (a) `tool-directory.md`'s `flow_status`
+/// row: `valid` only for the gate the job stands at now, never "a recomputed
+/// `valid`". (b) The manufacture agent's frontmatter `description`: the agent
+/// ends in `NOT READY` or `INCOMPLETE`, and `READY` belongs to the
+/// orchestrating session after the purchase approval. (c) Its "Ending the
+/// run" non-exit sentence counts an *artifact* warning as an open item, as the
+/// Verdict bullet does — never a bare "a warning".
+#[test]
+fn decision_m_texts_match_the_fixed_behaviour() {
+    let directory = include_str!("../../../tool-directory.md");
+    let agent = include_str!("../assets/agents/kicad-manufacture-agent.md");
+    let mut lost = Vec::new();
+
+    // (a)
+    lost.extend(missing_markers(
+        "tool-directory.md flow_status row",
+        section(directory, "| `flow_status` |", "\n"),
+        &[
+            "gate approvals (`valid` computed only for the gate the job stands at now; a \
+           passed gate reports `status: passed`)",
+        ],
+    ));
+    if directory.contains("recomputed `valid`") {
+        lost.push("tool-directory.md again says `recomputed `valid``".to_string());
+    }
+
+    // (b)
+    let frontmatter = section(agent, "---", "\n---");
+    let description = section(frontmatter, "description:", "\nmodel:");
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md frontmatter description",
+        description,
+        &[
+            "ending in NOT READY or INCOMPLETE; READY is declared by the orchestrating session \
+           after the purchase approval.",
+        ],
+    ));
+    if frontmatter.contains("ending in READY") {
+        lost.push("kicad-manufacture-agent.md frontmatter again says `ending in READY`".into());
+    }
+
+    // (c)
+    let ending = section(agent, "### Ending the run", "### Hard rules");
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md Ending the run",
+        ending,
+        &[
+            "an `INCOMPLETE` one with any other open item (an artifact warning, a check that \
+           did not run or failed, a missing artifact), is not an exit",
+        ],
+    ));
+    if flat(ending).contains("any other open item (a warning,") {
+        lost.push(
+            "kicad-manufacture-agent.md Ending the run again counts a bare `a warning` as \
+             an open item"
+                .into(),
+        );
+    }
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
