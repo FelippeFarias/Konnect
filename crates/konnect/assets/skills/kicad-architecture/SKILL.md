@@ -172,7 +172,18 @@ Readiness: BLOCKED — <the missing or invented value, and what would supply it>
 
 - `Readiness: PASS` only when every value a block depends on traces to a
   datasheet, a measurement, a configuration key, or an assumption the user
-  confirmed, and every part in the parts list has a confirmed source.
+  confirmed, and every parts-list row is confirmed (next bullet).
+- A parts-list row is confirmed only when the orchestrating session's
+  evidence entry for it exists in the job log: the session checked the live
+  stock on the fabricator's current part page and opened the manufacturer's
+  datasheet for that exact part, and recorded both with
+  `flow_log(project_dir, job_id, kind, message)`, `kind` `evidence` (the
+  konnect skill's `references/orchestration.md` §9). Read the log with
+  `flow_status(project_dir, read)` naming `log`. A bundled agent can open
+  neither source, so a catalogue-only stock or a Datasheet cell reading
+  `located, not validated` keeps the line `Readiness: BLOCKED — …`; the agent
+  then returns BLOCKED naming the rows the session must confirm, never
+  advancing.
 - Otherwise `Readiness: BLOCKED`, followed by a reason naming the value:
   `Readiness: BLOCKED — maximum ambient inside the enclosure: not in constraints.md`.
   A BLOCKED line without a reason is malformed.

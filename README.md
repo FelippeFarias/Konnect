@@ -342,7 +342,7 @@ the architecture it proved, rebuilt for production:
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
 | Context cost | Router pattern | Load/unload toolsets + observability |
-| Skills / agents | — | 10 skills + 5 agents bundled |
+| Skills / agents | — | 12 skills + 11 agents bundled |
 | License | MIT | AGPL-3.0 + commercial |
 
 ## Troubleshooting

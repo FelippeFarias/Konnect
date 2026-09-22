@@ -119,9 +119,16 @@ copy them rather than re-deriving them):
   AVL `on AVL`, `not on AVL` or `not enforced` (an empty AVL is never a pass);
   derating against the matching worst-case record; Library `found` with the
   IDs a search returned, or `needs library`.
-- A stock figure from the local JLCPCB catalogue is discovery with its date:
-  it shows the part is listed, and the live figure is re-checked before
-  payment (the kicad-manufacture skill's `references/jlcpcb-rules.md` §2).
+- A row counts as confirmed only when the orchestrating session's evidence
+  entry for it exists in the job log: the session checked the live stock on
+  the fabricator's current part page and opened the manufacturer's datasheet
+  for that exact part, and recorded both with
+  `flow_log(project_dir, job_id, kind, message)`, `kind` `evidence`. Read the
+  log with `flow_status(project_dir, read)` naming `log` when the brief names
+  those entries. You can open neither source: a stock figure from the local
+  JLCPCB catalogue only shows the part is listed, so a catalogue-only stock
+  or a Datasheet cell reading `located, not validated` leaves the row
+  unconfirmed and keeps the readiness line `Readiness: BLOCKED — …`.
 - Confirm a stocked part meets a requirement before writing the requirement
   down. For a large BOM the session runs `kicad-sourcing-agent` on disjoint
   part groups; name in your handoff any part you want sourced.
@@ -139,7 +146,8 @@ Readiness: BLOCKED — <the missing or invented value, and what would supply it>
 
 - `Readiness: PASS` only when every value a block depends on traces to a
   datasheet, a measurement, a configuration key or an assumption the user
-  confirmed, and every parts-list row has a confirmed source.
+  confirmed, and every parts-list row is confirmed by the session's evidence
+  entry (Step 6).
 - Otherwise `Readiness: BLOCKED`, followed by a reason naming the value. A
   bare `Readiness: BLOCKED` is malformed, and so is any text after the line.
 - **BLOCKED means return BLOCKED, not advance.** Put the missing value in the
@@ -147,6 +155,11 @@ Readiness: BLOCKED — <the missing or invented value, and what would supply it>
   handoff and return. The session collects the value — usually by rewinding
   the job to `requirements`. The tool refuses to leave `architecture` on
   anything but `Readiness: PASS`; do not try.
+- **An unconfirmed row is a BLOCKED reason.** Name every such row —
+  reference and manufacturer part number — in the readiness reason and in the
+  handoff's Questions as the rows the session must confirm (live stock and
+  datasheet), then return BLOCKED. Never advance, and never mark a row
+  confirmed yourself.
 
 ### Ending the run
 
