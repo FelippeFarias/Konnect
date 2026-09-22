@@ -3,6 +3,10 @@
 # Local-build installer for developers and testers (Windows). The end-user
 # path stays the KiCAD PCM zip built by packaging/build-pcm.ps1. Steps:
 #
+#   0. bootstrap -Bootstrap only: install cargo, protoc and cmake with winget
+#                (or choco) when they are missing, and register the konnect MCP
+#                server for each selected client. -WithRetrace also creates
+#                <repo>\.venv-retrace and pip installs retrace into it
 #   1. build     cargo build --release -p konnect, when target/release/konnect.exe
 #                ($env:CARGO_TARGET_DIR\release when set) is missing, older than
 #                the newest git-tracked build input (crates/, Cargo.lock,
@@ -20,13 +24,14 @@
 #   5. retrace   point the user-level RETRACE_PYTHON at a Python that can
 #                `import retrace` (default: <repo>/.venv-retrace)
 #
-# It never registers or edits an MCP server entry, never touches KiCAD
-# projects and never deletes a binary.
+# Without -Bootstrap it never registers or edits an MCP server entry. It never
+# touches KiCAD projects and never deletes a binary.
 #
 # Usage:
 #   ./scripts/install.ps1 [-Client claude,codex,omp|both|all] [-Target PATH] `
 #       [-ClaudeConfig PATH] [-SkipBuild | -Rebuild] [-SkipInit] `
-#       [-RetracePython PATH | -NoRetrace] [-DryRun] [-Help]
+#       [-RetracePython PATH | -NoRetrace] [-Bootstrap] [-WithRetrace] `
+#       [-DryRun] [-Help]
 #
 # -DryRun prints every action and changes nothing. Runs on Windows PowerShell
 # 5.1 and later; use scripts/install.sh on macOS/Linux or from Git Bash.
@@ -42,6 +47,8 @@ param(
     [switch]$SkipInit,
     [string]$RetracePython = "",
     [switch]$NoRetrace,
+    [switch]$Bootstrap,
+    [switch]$WithRetrace,
     [switch]$DryRun,
     [switch]$Help
 )
@@ -54,7 +61,8 @@ function Show-Usage {
     Write-Host @"
 Usage: scripts/install.ps1 [-Client claude,codex,omp|both|all] [-Target PATH]
                            [-ClaudeConfig PATH] [-SkipBuild | -Rebuild] [-SkipInit]
-                           [-RetracePython PATH | -NoRetrace] [-DryRun] [-Help]
+                           [-RetracePython PATH | -NoRetrace] [-Bootstrap]
+                           [-WithRetrace] [-DryRun] [-Help]
 
 Builds Konnect from this checkout, installs it where Claude Code runs it,
 installs the bundled guidance (konnect init) and points RETRACE_PYTHON at the
@@ -72,6 +80,11 @@ photo-intake Python.
   -SkipInit       do not run konnect init / status
   -RetracePython  Python to use for RETRACE_PYTHON (default <repo>/.venv-retrace)
   -NoRetrace      leave RETRACE_PYTHON alone
+  -Bootstrap      fresh machine: install cargo, protoc and cmake when they are
+                  missing, then register the konnect MCP server for each
+                  selected client
+  -WithRetrace    create <repo>\.venv-retrace and pip install the optional
+                  retrace package into it
   -DryRun         print every action, change nothing
 
 Run it from an open PowerShell window, for example:
@@ -90,6 +103,11 @@ $parkedPath = $null      # where the rollback moves the new binary aside
 $freshInstall = $false   # a new binary was (or would be) placed where none existed
 $retraceChanged = $false
 $retracePrevious = $null
+$protocChanged = $false
+$protocPrevious = $null
+$mcpAdded = New-Object System.Collections.ArrayList   # clients whose MCP entry this run created
+$mcpOmpFile = $null      # the OMP mcp.json that was written, when one was
+$mcpOmpBackup = $null    # its pre-run copy, when the file already existed
 $recoveryShown = $false
 
 # A PowerShell single-quoted literal. PowerShell reads each of these five
@@ -132,6 +150,18 @@ function Get-RollbackLines {
     if ($retraceChanged) {
         if ($retracePrevious) { $lines += "[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', $(Format-PsLiteral $retracePrevious), 'User')" }
         else { $lines += "[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', `$null, 'User')" }
+    }
+    if ($protocChanged) {
+        if ($protocPrevious) { $lines += "[Environment]::SetEnvironmentVariable('PROTOC', $(Format-PsLiteral $protocPrevious), 'User')" }
+        else { $lines += "[Environment]::SetEnvironmentVariable('PROTOC', `$null, 'User')" }
+    }
+    foreach ($c in $mcpAdded) {
+        if ($c -eq "claude") { $lines += "claude mcp remove konnect -s user" }
+        elseif ($c -eq "codex") { $lines += "codex mcp remove konnect" }
+        elseif ($c -eq "omp") {
+            if ($mcpOmpBackup) { $lines += "Move-Item -Force -LiteralPath $(Format-PsLiteral $mcpOmpBackup) -Destination $(Format-PsLiteral $mcpOmpFile)" }
+            else { $lines += "Remove-Item -LiteralPath $(Format-PsLiteral $mcpOmpFile)" }
+        }
     }
     return $lines
 }
@@ -330,6 +360,163 @@ if (Test-Path -LiteralPath $manifestPath) {
     $expectedAgents = @(Select-String -LiteralPath $manifestPath -Pattern '^\s+AgentManifest \{' -CaseSensitive).Count
 }
 
+# ---- bootstrap helpers -----------------------------------------------------
+function Test-Cmd([string]$name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+
+# Echo then run, or only echo under -DryRun. True means the command succeeded.
+function Invoke-Run([string]$exe, [string[]]$argList) {
+    if ($DryRun) { Say "would run: $exe $($argList -join ' ')"; return $true }
+    Say "running: $exe $($argList -join ' ')"
+    & $exe @argList
+    return ($LASTEXITCODE -eq 0)
+}
+
+# A package manager can put a tool where this already-running window will not
+# look: rustup writes ~\.cargo\bin, winget shims live under WinGet\Links, and
+# CMake and protoc install outside both. Re-probe those places so the build in
+# this same run can still find what was just installed.
+function Update-ToolPath {
+    $candidates = New-Object System.Collections.ArrayList
+    [void]$candidates.Add((Join-Path $userHome ".cargo\bin"))
+    [void]$candidates.Add((Join-Path $env:ProgramFiles "CMake\bin"))
+    if ($env:LOCALAPPDATA) {
+        [void]$candidates.Add((Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"))
+        $packages = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+        if (Test-Path -LiteralPath $packages) {
+            Get-ChildItem -LiteralPath $packages -Directory -Filter "Google.Protobuf*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Directory -Recurse -Depth 1 -Filter "bin" -ErrorAction SilentlyContinue } |
+                ForEach-Object { [void]$candidates.Add($_.FullName) }
+        }
+    }
+    foreach ($dir in $candidates) {
+        if ($dir -and (Test-Path -LiteralPath $dir) -and (";$env:PATH;" -notlike "*;$dir;*")) { $env:PATH = "$env:PATH;$dir" }
+    }
+}
+
+function Install-Dep([string]$dep) {
+    $wingetIds = @{ cargo = "Rustlang.Rustup"; protoc = "Google.Protobuf"; cmake = "Kitware.CMake" }
+    $chocoIds = @{ cargo = "rustup.install"; protoc = "protoc"; cmake = "cmake" }
+    if ($script:pkg -eq "winget") {
+        return (Invoke-Run "winget" @("install", "--id", $wingetIds[$dep], "-e",
+            "--accept-source-agreements", "--accept-package-agreements", "--silent"))
+    }
+    return (Invoke-Run "choco" @("install", "-y", $chocoIds[$dep]))
+}
+
+# The C++ workload ships a cmake.exe that never lands on PATH. The build step
+# prepends it for its own run, and the bootstrap step treats it as cmake being
+# present, so a machine with Build Tools installs nothing.
+function Find-VsCmakeDir {
+    $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ }
+    foreach ($root in $roots) {
+        $pattern = Join-Path $root "Microsoft Visual Studio\*\*\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+        $hit = @(Get-Item -Path $pattern -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "cmake.exe") } |
+            Sort-Object FullName -Descending) | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# OMP has no `mcp add` subcommand, so its user-level mcp.json is edited in
+# place: the file is copied aside first, which is what the rollback restores.
+function Register-OmpMcp {
+    $file = Join-Path $userHome ".omp\agent\mcp.json"
+    $json = $null
+    $current = $null
+    if (Test-Path -LiteralPath $file) {
+        $raw = Get-Content -LiteralPath $file -Raw
+        if ($raw -and $raw.Trim()) {
+            try { $json = $raw | ConvertFrom-Json } catch { Fail "$file is not valid JSON; fix or move it, then re-run." }
+        }
+        if ($json -and ($json.PSObject.Properties.Name -contains "mcpServers") -and $json.mcpServers -and
+            ($json.mcpServers.PSObject.Properties.Name -contains "konnect")) {
+            $current = $json.mcpServers.konnect.command
+        }
+    }
+    if ($current -and ($current.ToLowerInvariant() -eq $targetPath.ToLowerInvariant())) {
+        Say "omp: konnect already points at $targetPath"
+        return
+    }
+    if ($DryRun) { Say "would set mcpServers.konnect.command = $targetPath in $file"; return }
+    $dir = Split-Path -Parent $file
+    if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Force -Path $dir) }
+    if (Test-Path -LiteralPath $file) {
+        $script:mcpOmpBackup = "$file.$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+        Copy-Item -LiteralPath $file -Destination $script:mcpOmpBackup
+    }
+    $script:mcpOmpFile = $file
+    if (-not $json) { $json = [pscustomobject]@{} }
+    if (-not ($json.PSObject.Properties.Name -contains "mcpServers") -or -not $json.mcpServers) {
+        $json | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $json.mcpServers | Add-Member -NotePropertyName konnect `
+        -NotePropertyValue ([pscustomobject]@{ type = "stdio"; command = $targetPath }) -Force
+    # No BOM: a byte-order mark in front of '{' breaks strict JSON readers.
+    [System.IO.File]::WriteAllText($file, ($json | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+    [void]$script:mcpAdded.Add("omp")
+    [void]$script:changes.Add("registered the konnect MCP server for OMP in $file")
+    Say "omp: mcpServers.konnect -> $targetPath"
+}
+
+# ---- 0. bootstrap ----------------------------------------------------------
+# Opt-in. Without it the build step keeps its old behaviour: it reports what is
+# missing and stops, which is what a developer with an environment wants.
+Step "Bootstrap"
+$pkg = $null
+if ($WithRetrace -and $NoRetrace) { Fail "-WithRetrace and -NoRetrace contradict each other; pass one." }
+if (-not $Bootstrap) {
+    Say "skipped (pass -Bootstrap on a machine that has no Rust/protoc/cmake yet)"
+} else {
+    Update-ToolPath
+    $missing = @()
+    foreach ($dep in @("cargo", "protoc", "cmake")) {
+        if (Test-Cmd $dep) { Say "${dep}: already on PATH"; continue }
+        if ($dep -eq "protoc" -and $env:PROTOC) { Say "protoc: PROTOC is set, nothing to install"; continue }
+        if ($dep -eq "cmake" -and (Find-VsCmakeDir)) { Say "cmake: the Visual Studio copy will be used"; continue }
+        Say "${dep}: missing"
+        $missing += $dep
+    }
+    if ($missing.Count -eq 0) {
+        Say "nothing to install"
+    } else {
+        if (Test-Cmd "winget") { $pkg = "winget" } elseif (Test-Cmd "choco") { $pkg = "choco" }
+        if (-not $pkg) { Fail "-Bootstrap needs winget or choco to install $($missing -join ', '). Install them yourself, then re-run without -Bootstrap." }
+        Say "package manager: $pkg"
+        foreach ($dep in $missing) {
+            if (Install-Dep $dep) { [void]$changes.Add("installed $dep with $pkg") }
+            else { Warn "could not install $dep with $pkg." }
+            Update-ToolPath
+            if (-not $DryRun -and -not (Test-Cmd $dep)) {
+                Warn "$dep is installed but not visible in this window; open a new PowerShell and re-run if the build fails."
+            }
+        }
+    }
+    # winget's protobuf package is not shimmed into PATH, so a build from a
+    # fresh window would not find protoc even though it is installed. A
+    # user-level PROTOC is what prost-build reads, and it survives the window.
+    $protocPath = (Get-Command protoc -ErrorAction SilentlyContinue).Source
+    if (-not $protocPath -and $env:PROTOC) { $protocPath = $env:PROTOC }
+    if ($protocPath) {
+        $currentProtoc = [Environment]::GetEnvironmentVariable("PROTOC", "User")
+        if ($currentProtoc -ne $protocPath) {
+            $shownProtoc = "(unset)"
+            if ($currentProtoc) { $shownProtoc = $currentProtoc }
+            if ($DryRun) {
+                Say "would set PROTOC (user): $shownProtoc -> $protocPath"
+            } else {
+                [Environment]::SetEnvironmentVariable("PROTOC", $protocPath, "User")
+                $protocChanged = $true
+                $protocPrevious = $currentProtoc
+                [void]$changes.Add("set PROTOC (user): $shownProtoc -> $protocPath")
+                Say "set PROTOC (user): $shownProtoc -> $protocPath"
+            }
+        } else {
+            Say "PROTOC (user) already $protocPath - unchanged"
+        }
+    }
+}
+
 # ---- 1. build --------------------------------------------------------------
 Step "Build"
 # cargo puts the build under CARGO_TARGET_DIR when it is set (relative to the
@@ -395,14 +582,7 @@ if ($SkipBuild) {
 
     $cmakeDir = $null
     if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-        $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ }
-        foreach ($root in $roots) {
-            $pattern = Join-Path $root "Microsoft Visual Studio\*\*\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
-            $hit = @(Get-Item -Path $pattern -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "cmake.exe") } |
-                Sort-Object FullName -Descending) | Select-Object -First 1
-            if ($hit) { $cmakeDir = $hit.FullName; break }
-        }
+        $cmakeDir = Find-VsCmakeDir
         if (-not $cmakeDir) { [void]$problems.Add("cmake not found on PATH nor in a Visual Studio install; install CMake (https://cmake.org/download/) or the VS Build Tools C++ workload") }
     }
 
@@ -503,8 +683,14 @@ if ($Target) {
     } else {
         $targetPath = Join-Path $userHome ".konnect\bin\konnect.exe"
         Say "no konnect MCP server registered in the Claude config; using the default $targetPath"
-        $targetNote = "Konnect is not registered with Claude Code. To register it (this installer never does), run:`n    claude mcp add --scope user konnect -- `"$targetPath`""
-        Say "NOTE: $targetNote"
+        # -Bootstrap registers the server itself further down, so the manual
+        # command is only worth printing when this run will not do it.
+        if ($Bootstrap) {
+            Say "the MCP registration step below will register this path with Claude"
+        } else {
+            $targetNote = "Konnect is not registered with Claude Code. To register it (or re-run with -Bootstrap), run:`n    claude mcp add --scope user konnect -- `"$targetPath`""
+            Say "NOTE: $targetNote"
+        }
     }
 }
 if (Test-Path -LiteralPath $targetPath -PathType Container) {
@@ -646,6 +832,34 @@ $retraceNote = $null
 if ($NoRetrace) {
     Say "skipped (-NoRetrace)"
 } else {
+    if ($WithRetrace -and -not $RetracePython) {
+        $venv = Join-Path $repoRoot ".venv-retrace"
+        $venvPython = Join-Path $venv "Scripts\python.exe"
+        if (Test-Path -LiteralPath $venvPython) {
+            Say "venv: $venv already exists"
+        } else {
+            $basePython = $null
+            foreach ($cand in @("python", "python3", "py")) { if (Test-Cmd $cand) { $basePython = $cand; break } }
+            if (-not $basePython) { Fail "-WithRetrace needs Python 3.10+ on PATH." }
+            if (-not (Invoke-Run $basePython @("-m", "venv", $venv))) { Fail "$basePython -m venv $venv failed." }
+            if (-not $DryRun) { [void]$changes.Add("created $venv") }
+        }
+        if ($DryRun) {
+            Say "would run: $venvPython -m pip install git+https://github.com/ericrihm/retrace.git"
+        } else {
+            $installed = Invoke-Probe $venvPython "-c `"import retrace`""
+            if ($installed -and $installed.Code -eq 0) {
+                Say "retrace is already importable from the venv"
+            } else {
+                [void](Invoke-Run $venvPython @("-m", "pip", "install", "--quiet", "--upgrade", "pip"))
+                if (Invoke-Run $venvPython @("-m", "pip", "install", "--quiet", "git+https://github.com/ericrihm/retrace.git")) {
+                    [void]$changes.Add("installed retrace into $venv")
+                } else {
+                    Warn "pip install retrace failed; see docs/PHOTO_TO_BOARD_WORKFLOW.md. Photo intake stays unconfigured."
+                }
+            }
+        }
+    }
     $py = $RetracePython
     if (-not $py) {
         $venvPy = Join-Path $repoRoot ".venv-retrace\Scripts\python.exe"
@@ -683,6 +897,37 @@ if ($NoRetrace) {
             [void]$changes.Add("$verb RETRACE_PYTHON (user): $shown -> $py")
         }
     }
+}
+
+# ---- 6. MCP registration ---------------------------------------------------
+# What makes a fresh clone actually usable: a client that does not know about
+# the binary never starts it. Only -Bootstrap writes here; the default run
+# still touches no client config.
+Step "MCP server registration"
+if (-not $Bootstrap) {
+    Say "skipped (pass -Bootstrap to register konnect with the selected clients)"
+} else {
+    foreach ($c in $clients) {
+        if ($c -eq "omp") { Register-OmpMcp; continue }
+        if (-not (Test-Cmd $c)) {
+            Warn "$c is not on PATH; register by hand: $c mcp add konnect -- `"$targetPath`""
+            continue
+        }
+        # The name is listed by both CLIs; matching a whole word keeps
+        # 'konnect-dev' from counting as an existing 'konnect'.
+        $listed = Invoke-Probe $c "mcp list"
+        if ($listed -and $listed.Code -eq 0 -and $listed.Out -match '(^|[^A-Za-z0-9_-])konnect([^A-Za-z0-9_-]|$)') {
+            Say "${c}: konnect is already registered"
+            continue
+        }
+        if ($c -eq "claude") { $added = Invoke-Run "claude" @("mcp", "add", "konnect", "-s", "user", "--", $targetPath) }
+        else { $added = Invoke-Run "codex" @("mcp", "add", "konnect", "--", $targetPath, "--client", "codex") }
+        if (-not $added) { Warn "$c mcp add konnect failed."; continue }
+        if ($DryRun) { continue }
+        [void]$mcpAdded.Add($c)
+        [void]$changes.Add("registered the konnect MCP server with $c")
+    }
+    Say "restart the client so it picks the server up."
 }
 
 # ---- summary ---------------------------------------------------------------

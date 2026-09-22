@@ -5,6 +5,11 @@
 # Local-build installer for developers and testers. The end-user path stays
 # the KiCAD PCM zip built by packaging/build-pcm.sh. Steps:
 #
+#   0. bootstrap --bootstrap only: install cargo, protoc and cmake when they are
+#                missing (winget/choco on Windows, brew on macOS,
+#                apt-get/dnf/pacman/zypper on Linux), and register the konnect
+#                MCP server for each selected client. --with-retrace also
+#                creates <repo>/.venv-retrace and pip installs retrace into it
 #   1. build     cargo build --release -p konnect, when target/release/konnect[.exe]
 #                ($CARGO_TARGET_DIR/release when set) is missing, older than the
 #                newest git-tracked build input (crates/, Cargo.lock, Cargo.toml,
@@ -23,14 +28,14 @@
 #                (default: <repo>/.venv-retrace): setx on Windows shells; on
 #                macOS/Linux the export line is printed, rc files are not edited
 #
-# It never registers or edits an MCP server entry, never touches KiCAD
-# projects and never deletes a binary.
+# Without --bootstrap it never registers or edits an MCP server entry. It never
+# touches KiCAD projects and never deletes a binary.
 #
 # Usage:
 #   scripts/install.sh [--client claude|codex|omp|both|all] [--target PATH]
 #                      [--claude-config PATH] [--skip-build | --rebuild]
 #                      [--skip-init] [--retrace-python PATH | --no-retrace]
-#                      [--dry-run] [--help]
+#                      [--bootstrap] [--with-retrace] [--dry-run] [--help]
 #
 # --dry-run prints every action and changes nothing.
 set -euo pipefail
@@ -46,13 +51,15 @@ skip_init=0
 retrace_python=""
 no_retrace=0
 dry_run=0
+bootstrap=0
+with_retrace=0
 
 usage() {
     cat <<'EOF'
 Usage: scripts/install.sh [--client claude|codex|omp|both|all] [--target PATH]
                           [--claude-config PATH] [--skip-build | --rebuild]
                           [--skip-init] [--retrace-python PATH | --no-retrace]
-                          [--dry-run] [--help]
+                          [--bootstrap] [--with-retrace] [--dry-run] [--help]
 
 Builds Konnect from this checkout, installs it where Claude Code runs it,
 installs the bundled guidance (konnect init) and points RETRACE_PYTHON at the
@@ -70,6 +77,11 @@ photo-intake Python.
   --skip-init       do not run konnect init / status
   --retrace-python  Python to use for RETRACE_PYTHON (default <repo>/.venv-retrace)
   --no-retrace      leave RETRACE_PYTHON alone
+  --bootstrap       fresh machine: install cargo, protoc and cmake when they are
+                    missing, then register the konnect MCP server for each
+                    selected client
+  --with-retrace    create <repo>/.venv-retrace and pip install the optional
+                    retrace package into it
   --dry-run         print every action, change nothing
 EOF
 }
@@ -83,6 +95,12 @@ fresh_install=0    # a new binary was (or would be) placed where none existed
 init_clients=""    # clients whose init ran (or would run)
 retrace_changed=0
 retrace_previous=""
+protoc_changed=0
+protoc_previous=""
+mcp_added=""       # clients whose MCP entry this run created
+mcp_omp_file=""    # the OMP mcp.json that was written, when one was
+mcp_omp_backup=""  # its pre-run copy, when the file already existed
+bootstrap_installed=""
 recovery_shown=0
 failing=0
 
@@ -102,6 +120,8 @@ while [ $# -gt 0 ]; do
         --retrace-python) retrace_python="${2:?--retrace-python needs a value}"; shift 2;;
         --no-retrace)     no_retrace=1; shift;;
         --dry-run)        dry_run=1; shift;;
+        --bootstrap)      bootstrap=1; shift;;
+        --with-retrace)   with_retrace=1; shift;;
         -h|--help)        usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2;;
     esac
@@ -133,6 +153,7 @@ normalize_clients "$client"
 [ -n "$clients" ] || fail "--client needs at least one of claude, codex, omp, both or all (got '$client')."
 [ "$skip_build" = 1 ] && [ "$rebuild" = 1 ] && fail "--skip-build and --rebuild contradict each other; pass one."
 [ "$no_retrace" = 1 ] && [ -n "$retrace_python" ] && fail "--retrace-python and --no-retrace contradict each other; pass one."
+[ "$with_retrace" = 1 ] && [ "$no_retrace" = 1 ] && fail "--with-retrace and --no-retrace contradict each other; pass one."
 
 windows=0
 exe=""
@@ -227,6 +248,23 @@ rollback_lines() {
         else printf '%s\n' "powershell -NoProfile -Command '[Environment]::SetEnvironmentVariable(\"RETRACE_PYTHON\", \$null, \"User\")'"
         fi
     fi
+    if [ "$protoc_changed" = 1 ]; then
+        if [ -n "$protoc_previous" ]; then printf '%s\n' "setx PROTOC $(sh_quote "$protoc_previous")"
+        else printf '%s\n' "powershell -NoProfile -Command '[Environment]::SetEnvironmentVariable(\"PROTOC\", \$null, \"User\")'"
+        fi
+    fi
+    for c in $mcp_added; do
+        case "$c" in
+            claude) printf '%s\n' "claude mcp remove konnect -s user";;
+            codex)  printf '%s\n' "codex mcp remove konnect";;
+            omp)
+                if [ -n "$mcp_omp_backup" ]; then
+                    printf '%s\n' "mv -f -- $(sh_quote "$mcp_omp_backup") $(sh_quote "$mcp_omp_file")"
+                else
+                    printf '%s\n' "rm -f -- $(sh_quote "$mcp_omp_file")"
+                fi;;
+        esac
+    done
 }
 
 # On any non-zero exit after a change (fail, or an unexpected error under
@@ -312,6 +350,101 @@ sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8"))
 
 add_change() { changes="${changes}$1"$'\n'; }
 
+# ---- bootstrap helpers -----------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Echo then run, or only echo under --dry-run. The caller decides what a
+# non-zero exit means, so this never calls fail() itself.
+run_cmd() {
+    if [ "$dry_run" = 1 ]; then say "would run: $*"; return 0; fi
+    say "running: $*"
+    "$@"
+}
+
+add_to_path() {
+    [ -d "$1" ] || return 0
+    case ":$PATH:" in
+        *":$1:"*) ;;
+        *) PATH="$PATH:$1"; export PATH;;
+    esac
+}
+
+# A package manager can put a tool where this already-running shell will not
+# look: rustup writes ~/.cargo/bin, winget shims live under WinGet/Links, and
+# the CMake and protobuf packages install outside both. Re-probe those places
+# so the build in this same run can still find what was just installed.
+refresh_tool_path() {
+    local la d
+    add_to_path "$HOME/.cargo/bin"
+    [ "$windows" = 1 ] || { hash -r 2>/dev/null || true; return 0; }
+    la="$(printenv LOCALAPPDATA 2>/dev/null || true)"
+    if [ -n "$la" ]; then
+        la="$(cygpath -u -- "$la")"
+        add_to_path "$la/Microsoft/WinGet/Links"
+        for d in "$la"/Microsoft/WinGet/Packages/Google.Protobuf*/bin \
+                 "$la"/Microsoft/WinGet/Packages/Google.Protobuf*/*/bin; do
+            add_to_path "$d"
+        done
+    fi
+    add_to_path "/c/Program Files/CMake/bin"
+    hash -r 2>/dev/null || true
+}
+
+detect_pkg() {
+    pkg=""
+    if [ "$windows" = 1 ]; then
+        if have winget; then pkg=winget; elif have choco; then pkg=choco; fi
+        return 0
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+        have brew && pkg=brew
+        return 0
+    fi
+    local m
+    for m in apt-get dnf pacman zypper; do
+        if have "$m"; then pkg="$m"; return 0; fi
+    done
+    return 0
+}
+
+# rustup is the supported way in on every platform the package managers do not
+# carry a current toolchain; it also owns rust-toolchain.toml's pinned version.
+install_rustup() {
+    have curl || { warn "curl is needed to install Rust; see https://rustup.rs"; return 1; }
+    if [ "$dry_run" = 1 ]; then
+        say "would run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+        return 0
+    fi
+    say "running: the rustup installer from https://sh.rustup.rs"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+}
+
+# $1 = cargo | protoc | cmake. Non-zero means nothing was installed.
+install_dep() {
+    local dep="$1"
+    case "$pkg:$dep" in
+        winget:cargo)   run_cmd winget install --id Rustlang.Rustup -e --accept-source-agreements --accept-package-agreements --silent;;
+        winget:protoc)  run_cmd winget install --id Google.Protobuf -e --accept-source-agreements --accept-package-agreements --silent;;
+        winget:cmake)   run_cmd winget install --id Kitware.CMake -e --accept-source-agreements --accept-package-agreements --silent;;
+        choco:cargo)    run_cmd choco install -y rustup.install;;
+        choco:protoc)   run_cmd choco install -y protoc;;
+        choco:cmake)    run_cmd choco install -y cmake;;
+        brew:cargo)     install_rustup;;
+        brew:protoc)    run_cmd brew install protobuf;;
+        brew:cmake)     run_cmd brew install cmake;;
+        apt-get:cargo|dnf:cargo|pacman:cargo|zypper:cargo) install_rustup;;
+        apt-get:protoc) run_cmd $sudo apt-get install -y protobuf-compiler;;
+        apt-get:cmake)  run_cmd $sudo apt-get install -y cmake;;
+        dnf:protoc)     run_cmd $sudo dnf install -y protobuf-compiler;;
+        dnf:cmake)      run_cmd $sudo dnf install -y cmake;;
+        pacman:protoc)  run_cmd $sudo pacman -S --needed --noconfirm protobuf;;
+        pacman:cmake)   run_cmd $sudo pacman -S --needed --noconfirm cmake;;
+        zypper:protoc)  run_cmd $sudo zypper --non-interactive install protobuf-devel;;
+        zypper:cmake)   run_cmd $sudo zypper --non-interactive install cmake;;
+        *) warn "no $pkg recipe for $dep; install it yourself."; return 1;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 echo "Konnect local installer ($repo_root)"
 [ "$dry_run" = 1 ] && echo "DRY RUN - nothing will be changed."
@@ -325,6 +458,93 @@ expected_agents=""
 if [ -f "$manifest" ]; then
     expected_skills="$(grep -cE '^[[:space:]]+SkillManifest \{' "$manifest" || true)"
     expected_agents="$(grep -cE '^[[:space:]]+AgentManifest \{' "$manifest" || true)"
+fi
+
+# The Visual Studio C++ workload ships a cmake.exe that never lands on PATH.
+# The build step prepends it for its own run, and the bootstrap step treats it
+# as cmake being present, so a machine with Build Tools installs nothing.
+vs_cmake_dir() {
+    [ "$windows" = 1 ] || return 0
+    local root_var root d found=""
+    for root_var in 'ProgramFiles(x86)' 'ProgramFiles'; do
+        root="$(printenv "$root_var" 2>/dev/null || true)"
+        [ -n "$root" ] || continue
+        root="$(cygpath -u -- "$root")"
+        for d in "$root"/"Microsoft Visual Studio"/*/*/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin; do
+            if [ -f "$d/cmake.exe" ]; then found="$d"; fi
+        done
+        [ -z "$found" ] || break
+    done
+    [ -z "$found" ] || printf '%s\n' "$found"
+}
+
+# ---- 0. bootstrap ----------------------------------------------------------
+# Opt-in. Without it the build step keeps its old behaviour: it reports what is
+# missing and stops, which is what a developer with an environment wants.
+step "Bootstrap"
+pkg=""
+sudo=""
+if [ "$bootstrap" = 0 ]; then
+    say "skipped (pass --bootstrap on a machine that has no Rust/protoc/cmake yet)"
+else
+    refresh_tool_path
+    missing=""
+    for dep in cargo protoc cmake; do
+        if have "$dep"; then say "$dep: already on PATH"; continue; fi
+        if [ "$dep" = protoc ] && [ -n "${PROTOC:-}" ]; then say "protoc: PROTOC is set, nothing to install"; continue; fi
+        if [ "$dep" = cmake ] && [ -n "$(vs_cmake_dir)" ]; then say "cmake: the Visual Studio copy will be used"; continue; fi
+        say "$dep: missing"
+        missing="$missing $dep"
+    done
+    if [ -z "$missing" ]; then
+        say "nothing to install"
+    else
+        detect_pkg
+        [ -n "$pkg" ] || fail "--bootstrap needs a package manager for$missing (winget or choco on Windows, brew on macOS, apt-get/dnf/pacman/zypper on Linux). Install them yourself, then re-run without --bootstrap."
+        say "package manager: $pkg"
+        if [ "$windows" = 0 ] && [ "$(id -u 2>/dev/null || echo 1)" != 0 ] && have sudo; then sudo="sudo"; fi
+        apt_updated=0
+        for dep in $missing; do
+            if [ "$pkg" = apt-get ] && [ "$apt_updated" = 0 ]; then
+                run_cmd $sudo apt-get update || warn "apt-get update failed; continuing."
+                apt_updated=1
+            fi
+            if install_dep "$dep"; then
+                bootstrap_installed="$bootstrap_installed $dep"
+                add_change "installed $dep with $pkg"
+            else
+                warn "could not install $dep with $pkg."
+            fi
+            refresh_tool_path
+            if [ "$dry_run" = 0 ] && ! have "$dep"; then
+                warn "$dep is installed but not visible in this shell; open a new terminal and re-run if the build fails."
+            fi
+        done
+    fi
+    # winget's protobuf package is not shimmed into PATH, so a build from a
+    # fresh terminal would not find protoc even though it is installed. A
+    # user-level PROTOC is what prost-build reads, and it survives the shell.
+    # Only Windows needs it: apt, dnf, pacman, zypper and brew all install
+    # protoc onto PATH.
+    if [ "$windows" = 1 ]; then
+        protoc_found="${PROTOC:-}"
+        [ -n "$protoc_found" ] || protoc_found="$(command -v protoc 2>/dev/null || true)"
+        if [ -n "$protoc_found" ]; then
+            protoc_native="$(to_native "$(to_unix "$protoc_found")")"
+            current_protoc="$(MSYS2_ARG_CONV_EXCL='*' reg.exe query 'HKCU\Environment' /v PROTOC 2>/dev/null | tr -d '\r' | sed -n 's/^[[:space:]]*PROTOC[[:space:]]\{1,\}REG_[A-Z_]*[[:space:]]\{1,\}//p' | head -1)" || current_protoc=""
+            if [ -n "$current_protoc" ] && [ "$(path_key "$(to_unix "$current_protoc")")" = "$(path_key "$(to_unix "$protoc_native")")" ]; then
+                say "PROTOC (user) already $current_protoc - unchanged"
+            elif [ "$dry_run" = 1 ]; then
+                say "would run: setx PROTOC \"$protoc_native\"   (${current_protoc:-(unset)} -> $protoc_native)"
+            else
+                setx PROTOC "$protoc_native" >/dev/null || fail "setx PROTOC failed."
+                protoc_changed=1
+                protoc_previous="$current_protoc"
+                add_change "set PROTOC (user): ${current_protoc:-(unset)} -> $protoc_native"
+                say "set PROTOC (user): ${current_protoc:-(unset)} -> $protoc_native"
+            fi
+        fi
+    fi
 fi
 
 # ---- 1. build --------------------------------------------------------------
@@ -386,17 +606,7 @@ else
 
     cmake_dir=""
     if ! command -v cmake >/dev/null 2>&1; then
-        if [ "$windows" = 1 ]; then
-            for root_var in 'ProgramFiles(x86)' 'ProgramFiles'; do
-                root="$(printenv "$root_var" 2>/dev/null || true)"
-                [ -n "$root" ] || continue
-                root="$(cygpath -u -- "$root")"
-                for d in "$root"/"Microsoft Visual Studio"/*/*/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin; do
-                    if [ -f "$d/cmake.exe" ]; then cmake_dir="$d"; fi
-                done
-                [ -z "$cmake_dir" ] || break
-            done
-        fi
+        cmake_dir="$(vs_cmake_dir)"
         [ -n "$cmake_dir" ] || problems="${problems}cmake not found on PATH (nor in a Visual Studio install on Windows); install CMake (macOS: brew install cmake; Linux: apt install cmake; Windows: https://cmake.org/download/)"$'\n'
     fi
 
@@ -509,14 +719,23 @@ else
         target_u="$HOME/.konnect/bin/konnect$exe"
         if [ "$unreadable" = 1 ]; then
             say "Claude config not read (install jq or python, or pass --target); using the default $(to_native "$target_u")"
-            target_note="If Konnect is not registered with Claude Code yet (this installer never does it), run:"
         else
             say "no konnect MCP server registered in the Claude config; using the default $(to_native "$target_u")"
-            target_note="Konnect is not registered with Claude Code. To register it (this installer never does), run:"
         fi
-        target_note="$target_note
+        # --bootstrap registers the server itself further down, so the manual
+        # command is only worth printing when this run will not do it.
+        if [ "$bootstrap" = 1 ]; then
+            say "the MCP registration step below will register this path with Claude"
+        else
+            if [ "$unreadable" = 1 ]; then
+                target_note="If Konnect is not registered with Claude Code yet (this installer only does it with --bootstrap), run:"
+            else
+                target_note="Konnect is not registered with Claude Code. To register it (or re-run with --bootstrap), run:"
+            fi
+            target_note="$target_note
     claude mcp add --scope user konnect -- \"$(to_native "$target_u")\""
-        say "NOTE: $target_note"
+            say "NOTE: $target_note"
+        fi
     fi
 fi
 target_shown="$(to_native "$target_u")"
@@ -654,6 +873,34 @@ retrace_note=""
 if [ "$no_retrace" = 1 ]; then
     say "skipped (--no-retrace)"
 else
+    if [ "$with_retrace" = 1 ] && [ -z "$retrace_python" ]; then
+        venv="$repo_root/.venv-retrace"
+        venv_py="$venv/bin/python"
+        [ "$windows" = 0 ] || venv_py="$venv/Scripts/python.exe"
+        if [ -f "$venv_py" ]; then
+            say "venv: $venv already exists"
+        else
+            base_py=""
+            for cand in python3 python; do
+                if have "$cand"; then base_py="$cand"; break; fi
+            done
+            [ -n "$base_py" ] || fail "--with-retrace needs python3 (3.10+) on PATH."
+            run_cmd "$base_py" -m venv "$venv" || fail "$base_py -m venv $venv failed."
+            [ "$dry_run" = 1 ] || add_change "created $venv"
+        fi
+        if [ "$dry_run" = 1 ]; then
+            say "would run: $venv_py -m pip install git+https://github.com/ericrihm/retrace.git"
+        elif probe "$venv_py" -c 'import retrace' >/dev/null 2>&1; then
+            say "retrace is already importable from the venv"
+        else
+            run_cmd "$venv_py" -m pip install --quiet --upgrade pip || warn "pip self-upgrade failed; continuing."
+            if run_cmd "$venv_py" -m pip install --quiet 'git+https://github.com/ericrihm/retrace.git'; then
+                add_change "installed retrace into $venv"
+            else
+                warn "pip install retrace failed; see docs/PHOTO_TO_BOARD_WORKFLOW.md. Photo intake stays unconfigured."
+            fi
+        fi
+    fi
     py=""
     if [ -n "$retrace_python" ]; then
         py="$(abs_path "$retrace_python")"
@@ -707,6 +954,116 @@ else
             fi
         fi
     fi
+fi
+
+# ---- 6. MCP registration ---------------------------------------------------
+# What makes a fresh clone actually usable: a client that does not know about
+# the binary never starts it. Only --bootstrap writes here; the default run
+# still touches no client config.
+step "MCP server registration"
+mcp_command="$(to_native "$target_u")"
+
+# The name is listed by both CLIs; matching a whole word keeps 'konnect-dev'
+# from counting as an existing 'konnect'.
+mcp_cli_has_konnect() {
+    probe "$1" mcp list 2>/dev/null | tr -d '\r' | grep -qE '(^|[^[:alnum:]_-])konnect([^[:alnum:]_-]|$)'
+}
+
+# OMP has no `mcp add` subcommand, so its user-level mcp.json is edited in
+# place: the file is copied aside first, which is what the rollback restores.
+register_omp_mcp() {
+    local file="$HOME/.omp/agent/mcp.json" current="" payload tmp stamp
+    if [ -z "$json_reader" ]; then
+        warn "no jq or python found; add konnect to $(to_native "$file") by hand."
+        return 0
+    fi
+    if [ -f "$file" ]; then
+        if [ "$json_reader" = jq ]; then
+            current="$(jq -r '.mcpServers.konnect.command // empty' <"$file" 2>/dev/null || true)"
+        else
+            current="$("$json_reader" -c '
+import json, sys
+text = sys.stdin.buffer.read().decode("utf-8")
+data = json.loads(text) if text.strip() else {}
+servers = data.get("mcpServers") if isinstance(data, dict) else None
+entry = servers.get("konnect") if isinstance(servers, dict) else None
+value = entry.get("command") if isinstance(entry, dict) else None
+sys.stdout.write(value if isinstance(value, str) else "")
+' <"$file" 2>/dev/null || true)"
+        fi
+        current="$(printf '%s' "$current" | tr -d '\r')"
+    fi
+    if [ -n "$current" ] && [ "$(path_key "$(to_unix "$current")")" = "$(path_key "$target_u")" ]; then
+        say "omp: konnect already points at $mcp_command"
+        return 0
+    fi
+    if [ "$dry_run" = 1 ]; then
+        say "would set mcpServers.konnect.command = $mcp_command in $(to_native "$file")"
+        return 0
+    fi
+    mkdir -p "$(dirname "$file")"
+    payload='{}'
+    if [ -f "$file" ]; then
+        payload="$(cat "$file")"
+        [ -n "$(printf '%s' "$payload" | tr -d '[:space:]')" ] || payload='{}'
+        stamp="$(date +%Y%m%d-%H%M%S)"
+        mcp_omp_backup="$file.$stamp.bak"
+        cp -p -- "$file" "$mcp_omp_backup" || fail "could not copy $file aside."
+    fi
+    mcp_omp_file="$file"
+    tmp="$file.konnect-tmp"
+    if [ "$json_reader" = jq ]; then
+        printf '%s' "$payload" | jq --arg cmd "$mcp_command" \
+            '. + {mcpServers: ((.mcpServers // {}) + {konnect: {type: "stdio", command: $cmd}})}' >"$tmp" \
+            || fail "could not write $tmp; $file is unchanged."
+    else
+        KONNECT_MCP_COMMAND="$mcp_command" "$json_reader" -c '
+import json, os, sys
+text = sys.stdin.buffer.read().decode("utf-8")
+data = json.loads(text) if text.strip() else {}
+if not isinstance(data, dict):
+    raise SystemExit("mcp.json is not a JSON object")
+servers = data.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+servers["konnect"] = {"type": "stdio", "command": os.environ["KONNECT_MCP_COMMAND"]}
+data["mcpServers"] = servers
+sys.stdout.write(json.dumps(data, indent=2) + "\n")
+' <<<"$payload" >"$tmp" || fail "could not write $tmp; $file is unchanged."
+    fi
+    mv -f -- "$tmp" "$file" || fail "could not replace $file."
+    mcp_added="$mcp_added omp"
+    add_change "registered the konnect MCP server for OMP in $(to_native "$file")"
+    say "omp: mcpServers.konnect -> $mcp_command"
+}
+
+if [ "$bootstrap" = 0 ]; then
+    say "skipped (pass --bootstrap to register konnect with the selected clients)"
+else
+    for c in $clients; do
+        case "$c" in
+            claude|codex)
+                if ! have "$c"; then
+                    warn "$c is not on PATH; register by hand: $c mcp add konnect -- \"$mcp_command\""
+                    continue
+                fi
+                if mcp_cli_has_konnect "$c"; then
+                    say "$c: konnect is already registered"
+                    continue
+                fi
+                if [ "$c" = claude ]; then
+                    run_cmd claude mcp add konnect -s user -- "$mcp_command" || { warn "claude mcp add konnect failed."; continue; }
+                else
+                    run_cmd codex mcp add konnect -- "$mcp_command" --client codex || { warn "codex mcp add konnect failed."; continue; }
+                fi
+                if [ "$dry_run" = 1 ]; then continue; fi
+                mcp_added="$mcp_added $c"
+                add_change "registered the konnect MCP server with $c"
+                ;;
+            omp) register_omp_mcp;;
+        esac
+    done
+    say "restart the client so it picks the server up."
 fi
 
 # ---- summary ---------------------------------------------------------------

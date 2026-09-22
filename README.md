@@ -161,6 +161,35 @@ geometry are rejected before mutation.
 cargo build --release -p konnect
 ```
 
+#### One command on a fresh machine
+
+`--bootstrap` turns the developer installer into a full setup: it installs
+cargo, protoc and cmake when they are missing (winget or choco on Windows, brew
+on macOS, apt-get/dnf/pacman/zypper on Linux), builds, installs the binary,
+installs the guidance, and registers the konnect MCP server with each selected
+client — Claude and Codex through their own CLIs, OMP by writing
+`~/.omp/agent/mcp.json`. On Windows it also pins a user-level `PROTOC`, because
+winget's protobuf package is not shimmed onto `PATH`.
+
+```powershell
+git clone https://github.com/mixelpixx/Konnect && cd Konnect
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Bootstrap -WithRetrace
+```
+
+```bash
+git clone https://github.com/mixelpixx/Konnect && cd Konnect
+scripts/install.sh --bootstrap --with-retrace
+```
+
+`--with-retrace` / `-WithRetrace` also creates `.venv-retrace` and installs the
+optional `retrace` package the photo intake uses. Add `--dry-run` to see every
+command first; the summary always ends with the lines that undo the run. Without
+`--bootstrap` the installer behaves as before: it reports missing dependencies
+and touches no client config.
+
+KiCad 10 itself is not installed by the script. Install it separately, then
+[install the plugin package](#from-the-kicad-plugin-manager-recommended).
+
 ### Install guidance for your AI client
 
 Konnect bundles shared KiCad skills for Claude, Codex, and OMP. Select the

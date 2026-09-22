@@ -3,6 +3,10 @@
 *.ico binary
 *.icns binary
 
+# A Windows checkout of a shell script must stay LF: bash reads the CR at the
+# end of the shebang as part of the interpreter path and refuses to run it.
+*.sh text eol=lf
+
 # KiCad-authored fixtures are byte-evidence: never eol-normalize them.
 crates/konnect-sexp/tests/fixtures/** -text
 crates/konnect-core/tests/fixtures/** -text

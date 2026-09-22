@@ -45,7 +45,7 @@ Deeper reading: `docs/ARCHITECTURE.md`, `docs/TOOL_SYSTEM.md`, `docs/KICAD_INTEG
 | `xtask/` | `cargo xtask fix-doc-counts` |
 | `plugin/` | Python KiCad ActionPlugin + `tests/` (unittest) |
 | `packaging/` | PCM zip build (`build-pcm.{sh,ps1}`), `validate-pcm.py`, `metadata.json`, vendored schema |
-| `scripts/` | `install.{sh,ps1}`: developer local-build installer, defaults to `--client claude,omp` (not the end-user path) |
+| `scripts/` | `install.{sh,ps1}`: developer local-build installer, defaults to `--client claude,omp`; `--bootstrap` also installs cargo/protoc/cmake and registers the MCP server (not the end-user path) |
 | `docs/` | Contracts and integration docs (see Important Files) |
 | `openspec/` | Spec-driven change workflow: `specs/<capability>/spec.md`, `changes/<name>/`, `changes/archive/` |
 | `.claude/` | `orc` orchestrator skill, `openspec-*` skills, `orc-*` agents, `opsx` commands |
