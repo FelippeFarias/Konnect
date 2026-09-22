@@ -184,6 +184,9 @@ price re-check before payment. Never mark them done. List them under
   left an artifact missing, or passed with a warning (the skill's
   "Any warning or missing requested artifact type keeps the result `INCOMPLETE`"),
   or when a purchase-gate check is still open.
+  A DRC or preflight run that did not complete — for example schematic
+  parity not checked — is an open item that keeps the package from leaving
+  the phase, never a warning to adjudicate away.
   An adjudicated DRC or preflight warning is not an open item and does not
   by itself keep the verdict `INCOMPLETE`. You never mark the three
   purchase-gate checks done, so a package whose own checks all passed reads
