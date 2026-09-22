@@ -27,7 +27,13 @@
 // removed in the same series, once `flow_advance` uses the last of them.
 #![allow(dead_code)]
 
+use crate::design_hash::design_state_hash;
+use crate::mcp::error::ToolErrorKind;
+use crate::mcp::protocol::CallToolResult;
+use crate::tool;
+use crate::tools::{invalid_arg, opt_str_list, require_str, ToolContext, ToolDef};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -912,6 +918,401 @@ fn normalize_eol(content: &[u8]) -> Vec<u8> {
     out
 }
 
+// ─── Flow-directory layout (design D2) ────────────────────────────────────────
+
+const RECORDS_DIR: &str = "records";
+const GATES_DIR: &str = "gates";
+const LOG_DIR: &str = "log";
+const MEMORY_DIR: &str = "memory";
+const HANDOFFS_DIR: &str = "handoffs";
+const LESSONS_FILE: &str = "lessons-candidates.md";
+
+/// The review phases whose rewinds count as FIX rounds (D3).
+const REVIEW_PHASES: [&str; 2] = ["schematic_review", "prefab_review"];
+
+/// One job, one log file: `log/<started_at date>-<job_id>.md` (D2). Both
+/// parts were validated by [`parse_state`] or minted by `flow_start`.
+fn log_file_name(state: &JobState) -> String {
+    format!("{}-{}.md", &state.started_at[..10], state.job_id)
+}
+
+/// The package a gate phase binds to, hashed from the records on disk now.
+pub(crate) fn current_package(
+    flow_dir: &Path,
+    phases: &[String],
+    gate_token: &str,
+) -> std::io::Result<PackageDigest> {
+    package_hash(
+        &flow_dir.join(RECORDS_DIR),
+        &package_records(phases, gate_token),
+    )
+}
+
+/// Read and parse `STATE.md` under the shared document lock. `Ok(None)` when
+/// the flow directory holds no state file.
+fn read_state(flow_dir: &Path) -> Result<Option<JobState>, String> {
+    let path = flow_dir.join(STATE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = konnect_sexp::read_consistent(&path)
+        .map_err(|error| format!("Could not read {} ({error})", path.display()))?;
+    parse_state(&text).map(Some)
+}
+
+// ─── Typed errors ─────────────────────────────────────────────────────────────
+
+fn conflict(path: &Path, message: String) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: vec![path.display().to_string()],
+        },
+        message,
+    )
+}
+
+fn stale(target: &str, reason: String) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: target.to_string(),
+            reason: reason.clone(),
+        },
+        reason,
+    )
+}
+
+// ─── flow_status (design D1, D4, D11) ─────────────────────────────────────────
+
+/// What a `read` name resolves to (D4's readable names). There is no caller
+/// path: every name maps onto a fixed layout slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadTarget {
+    /// Path components below the flow directory.
+    Flow(Vec<String>),
+    /// The current job's log file.
+    Log,
+    /// A file in the current job's handoff directory.
+    Handoff(String),
+}
+
+fn classify_read_name(name: &str) -> Option<ReadTarget> {
+    let flow = |parts: &[&str]| {
+        Some(ReadTarget::Flow(
+            parts.iter().map(|part| part.to_string()).collect(),
+        ))
+    };
+    if RECORD_NAMES.contains(&name) || name == LESSONS_FILE {
+        return flow(&[RECORDS_DIR, name]);
+    }
+    if name == "log" {
+        return Some(ReadTarget::Log);
+    }
+    if let Some(file) = name.strip_prefix("gates/") {
+        let gate = file.strip_suffix(".md")?;
+        return if GATE_NAMES.contains(&gate) {
+            flow(&[RECORDS_DIR, GATES_DIR, file])
+        } else {
+            None
+        };
+    }
+    if let Some(file) = name.strip_prefix("memory/") {
+        let role = file.strip_suffix(".md")?;
+        return if ROLES.contains(&role) {
+            flow(&[MEMORY_DIR, file])
+        } else {
+            None
+        };
+    }
+    if let Some(file) = name.strip_prefix("handoffs/") {
+        return is_handoff_file_name(file).then(|| ReadTarget::Handoff(file.to_string()));
+    }
+    None
+}
+
+/// `<NN>-<role>.md`: at least two digits, a D7 role slug.
+fn is_handoff_file_name(file: &str) -> bool {
+    let Some((number, role)) = file
+        .strip_suffix(".md")
+        .and_then(|stem| stem.split_once('-'))
+    else {
+        return false;
+    };
+    number.len() >= 2 && number.bytes().all(|byte| byte.is_ascii_digit()) && ROLES.contains(&role)
+}
+
+fn read_targets(args: &Value) -> Result<Vec<(String, ReadTarget)>, CallToolResult> {
+    let names = opt_str_list(args, "read")?.unwrap_or_default();
+    names
+        .into_iter()
+        .map(|name| match classify_read_name(&name) {
+            Some(target) => Ok((name, target)),
+            None => Err(invalid_arg(
+                "read",
+                &format!(
+                    "{name:?} is not a readable name. Readable: the ten record names, \
+                     {LESSONS_FILE}, gates/<architecture|placement|purchase>.md, log, \
+                     memory/<role>.md, handoffs/<NN>-<role>.md. Nothing was read."
+                ),
+            )),
+        })
+        .collect()
+}
+
+async fn handle_flow_status(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let read = match read_targets(args) {
+        Ok(read) => read,
+        Err(rejection) => return Ok(rejection),
+    };
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    Ok(tokio::task::spawn_blocking(move || status_report(&project, &read)).await?)
+}
+
+/// The whole status. Refuses only for argument reasons; flow-state problems
+/// become fields (`state_error`), and nothing is created.
+fn status_report(project: &Path, read: &[(String, ReadTarget)]) -> CallToolResult {
+    let (design_hash, design_files) = match design_state_hash(project) {
+        Ok(hashed) => hashed,
+        Err(error) => {
+            return CallToolResult::error(format!(
+                "Could not hash the design under {}: {error:#}",
+                project.display()
+            ))
+        }
+    };
+    let lock_files = lock_files(project, &design_files);
+
+    let mut state_error = None;
+    let flow_dir = existing_flow_dir(project).unwrap_or_else(|error| {
+        state_error = Some(error);
+        None
+    });
+    let state = match flow_dir.as_deref().map(read_state) {
+        Some(Ok(state)) => state,
+        Some(Err(error)) => {
+            state_error = Some(error);
+            None
+        }
+        None => None,
+    };
+
+    let mut contents = serde_json::Map::new();
+    let mut missing = Vec::new();
+    for (name, target) in read {
+        match read_target(flow_dir.as_deref(), state.as_ref(), target) {
+            Ok(Some(text)) => {
+                contents.insert(name.clone(), Value::String(text));
+            }
+            Ok(None) => missing.push(name.clone()),
+            Err(rejection) => return rejection,
+        }
+    }
+
+    let mut response = json!({
+        "project_dir": project.display().to_string(),
+        "job": null,
+        "phase": null,
+        "design_hash": design_hash,
+        "design_files": design_files,
+        "lock_files": lock_files,
+        "gate_approvals": {},
+        "pending_approvals": [],
+        "deferred_findings": [],
+        "queue": [],
+        "fix_rounds": fix_rounds(None),
+        "last_transition": null,
+        "handoffs": [],
+        "next_step": null,
+        "contents": contents,
+        "missing": missing,
+        "state_error": state_error,
+    });
+    if let (Some(flow_dir), Some(state)) = (&flow_dir, &state) {
+        response["job"] = json!({
+            "job_id": state.job_id,
+            "objective": state.objective,
+            "lane": state.lane,
+            "mode": state.mode,
+            "started_at": state.started_at,
+            "phases": state.phases,
+        });
+        response["phase"] = json!(state.phase);
+        response["gate_approvals"] = gate_validity(flow_dir, state, &design_hash);
+        response["pending_approvals"] = json!(state.pending_approvals);
+        response["deferred_findings"] = json!(state.deferred_findings);
+        response["queue"] = json!(state.queue);
+        response["fix_rounds"] = fix_rounds(Some(state));
+        response["last_transition"] = json!(state.history.last());
+        response["handoffs"] = json!(list_handoffs(flow_dir, &state.job_id));
+        response["next_step"] = next_step(state).map_or(Value::Null, |step| {
+            json!({
+                "phase": step.phase,
+                "required_records": step.required_records,
+                "next_phase": step.next_phase,
+                "is_gate": step.is_gate,
+            })
+        });
+    }
+    CallToolResult::json(&response)
+}
+
+/// KiCad's `~<file>.lck` beside **every** covered file, `.kicad_pro`
+/// included — `kicad_editor_lock_path` ignores `.kicad_pro` (D11).
+fn lock_files(project: &Path, design_files: &[String]) -> Vec<String> {
+    let mut locks: Vec<String> = design_files
+        .iter()
+        .filter_map(|relative| {
+            let lock = match relative.rsplit_once('/') {
+                Some((dir, name)) => format!("{dir}/~{name}.lck"),
+                None => format!("~{relative}.lck"),
+            };
+            std::fs::symlink_metadata(project.join(&lock))
+                .is_ok()
+                .then_some(lock)
+        })
+        .collect();
+    locks.sort();
+    locks.dedup();
+    locks
+}
+
+/// Each recorded approval with `valid` recomputed: both keys still equal the
+/// design and the package as they are now.
+fn gate_validity(flow_dir: &Path, state: &JobState, design_hash: &str) -> Value {
+    let mut gates = serde_json::Map::new();
+    for (gate, approval) in &state.gate_approvals {
+        let mut entry = json!(approval);
+        match current_package(flow_dir, &state.phases, &format!("gate:{gate}")) {
+            Ok(package) => {
+                entry["valid"] = json!(
+                    approval.design_hash_at_approval == design_hash
+                        && approval.package_hash_at_approval == package.hash
+                );
+            }
+            Err(error) => {
+                entry["valid"] = json!(false);
+                entry["validity_error"] = json!(format!("package unreadable: {error}"));
+            }
+        }
+        gates.insert(gate.clone(), entry);
+    }
+    Value::Object(gates)
+}
+
+fn fix_rounds(state: Option<&JobState>) -> Value {
+    let mut rounds = serde_json::Map::new();
+    for phase in REVIEW_PHASES {
+        let count = state.map_or(0, |state| {
+            state
+                .history
+                .iter()
+                .filter(|entry| {
+                    entry.kind == HistoryKind::Rewind && entry.from.as_deref() == Some(phase)
+                })
+                .count()
+        });
+        rounds.insert(phase.to_string(), json!(count));
+    }
+    Value::Object(rounds)
+}
+
+/// The job's handoff file names, sorted; anything not shaped like a handoff
+/// is not listed (and so not readable).
+fn list_handoffs(flow_dir: &Path, job_id: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(flow_dir.join(HANDOFFS_DIR).join(job_id)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_handoff_file_name(name))
+        .collect();
+    names.sort();
+    names
+}
+
+/// One `read` name's content: `Ok(None)` when absent (reported in
+/// `missing`), a refusal when it resolves outside the flow directory.
+fn read_target(
+    flow_dir: Option<&Path>,
+    state: Option<&JobState>,
+    target: &ReadTarget,
+) -> Result<Option<String>, CallToolResult> {
+    let Some(flow_dir) = flow_dir else {
+        return Ok(None);
+    };
+    let path = match (target, state) {
+        (ReadTarget::Flow(parts), _) => parts
+            .iter()
+            .fold(flow_dir.to_path_buf(), |path, part| path.join(part)),
+        (ReadTarget::Log, Some(state)) => flow_dir.join(LOG_DIR).join(log_file_name(state)),
+        (ReadTarget::Handoff(file), Some(state)) => {
+            flow_dir.join(HANDOFFS_DIR).join(&state.job_id).join(file)
+        }
+        (_, None) => return Ok(None),
+    };
+    let canonical = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CallToolResult::error(format!(
+                "Could not resolve {} ({error})",
+                path.display()
+            )))
+        }
+    };
+    if let Err(reason) = confine(&canonical, flow_dir, &path) {
+        return Err(invalid_arg("read", &reason));
+    }
+    if !canonical.is_file() {
+        return Ok(None);
+    }
+    std::fs::read(&canonical)
+        .map(|bytes| Some(String::from_utf8_lossy(&bytes).into_owned()))
+        .map_err(|error| {
+            CallToolResult::error(format!("Could not read {} ({error})", path.display()))
+        })
+}
+
+// ─── Tool definitions (design D1) ─────────────────────────────────────────────
+
+/// The `flow` tools in D1 order. The router registers them (task 1.8).
+pub fn tools() -> Vec<ToolDef> {
+    vec![tool!(
+        "flow_status",
+        "Read a KiCad project's orchestration state and the reality it binds to: the \
+         job and its phase (null when none), the current design_state_hash and the files \
+         it covered, KiCad lock files beside them, gate approvals with a recomputed \
+         `valid`, deferred items, FIX rounds per review phase, the newest transition, the \
+         job's handoffs, the next step, and the content of each requested `read` name. \
+         Creates nothing and never refuses because of flow state — an unparseable \
+         STATE.md is reported in `state_error`.",
+        json!({
+            "type": "object",
+            "properties": {
+                "project_dir": {
+                    "type": "string",
+                    "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                },
+                "read": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Records to return in `contents` (absent ones are listed in `missing`): a record name such as constraints.md or architecture.md, lessons-candidates.md, gates/<architecture|placement|purchase>.md, log (this job's log), memory/<role>.md, or handoffs/<NN>-<role>.md as `handoffs` lists them."
+                }
+            },
+            "required": ["project_dir"]
+        }),
+        |args, ctx| async move { handle_flow_status(args, ctx).await }
+    )]
+}
+
 // ─── Tests: foundations (task 1.1) ────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1321,5 +1722,400 @@ mod foundation_tests {
         }
         assert!(required_records("gate:architecture").is_empty());
         assert!(required_records("learn").is_empty());
+    }
+}
+
+// ─── Tests: shared handler fixtures ───────────────────────────────────────────
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+    use crate::mcp::protocol::{CallToolResult, ToolContent};
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    pub(super) const JOB_ID: &str = "demo-20260921-140000";
+    pub(super) const STARTED_AT: &str = "2026-09-21T14:00:00Z";
+
+    pub(super) fn ctx() -> ToolContext {
+        ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()))
+    }
+
+    pub(super) fn text(result: &CallToolResult) -> String {
+        match &result.content[0] {
+            ToolContent::Text { text } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    pub(super) fn body(result: &CallToolResult) -> Value {
+        serde_json::from_str(&text(result)).expect("payload is json")
+    }
+
+    /// The structured error's `kind`, asserting the result is an error.
+    pub(super) fn error_kind(result: &CallToolResult) -> String {
+        assert!(result.is_error, "expected an error, got {}", text(result));
+        body(result)["error"]["kind"]
+            .as_str()
+            .unwrap_or("(no kind)")
+            .to_string()
+    }
+
+    /// A KiCad project directory: a project file and one schematic.
+    pub(super) fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("demo.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch)\n").unwrap();
+        dir
+    }
+
+    pub(super) fn arg(dir: &tempfile::TempDir) -> String {
+        dir.path().to_str().unwrap().to_string()
+    }
+
+    pub(super) fn flow_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join(".konnect").join("flow")
+    }
+
+    /// A `new_board` job standing at `phase`, with only its start entry.
+    pub(super) fn job_at(phase: &str) -> JobState {
+        JobState {
+            schema: STATE_SCHEMA,
+            job_id: JOB_ID.into(),
+            objective: "Demo board".into(),
+            lane: Lane::NewBoard,
+            mode: Mode::Guided,
+            phases: CANONICAL_PHASES.iter().map(|p| p.to_string()).collect(),
+            phase: phase.into(),
+            started_at: STARTED_AT.into(),
+            gate_approvals: BTreeMap::new(),
+            pending_approvals: Vec::new(),
+            deferred_findings: Vec::new(),
+            queue: Vec::new(),
+            history: vec![HistoryEntry::new(
+                HistoryKind::Start,
+                None,
+                "requirements",
+                STARTED_AT,
+                "0000",
+            )],
+        }
+    }
+
+    /// Write `STATE.md` directly, as an earlier call (or a hand edit) left it.
+    pub(super) fn plant_state(dir: &tempfile::TempDir, state: &JobState) {
+        std::fs::create_dir_all(flow_path(dir)).unwrap();
+        std::fs::write(flow_path(dir).join(STATE_FILE), render_state(state)).unwrap();
+    }
+
+    pub(super) fn plant_file(dir: &tempfile::TempDir, relative: &str, content: &str) {
+        let path = flow_path(dir).join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+}
+
+// ─── Tests: flow_status (task 1.2) ────────────────────────────────────────────
+
+#[cfg(test)]
+mod status_tests {
+    use super::test_support::*;
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn status_without_a_flow_directory_reports_no_job_and_creates_nothing() {
+        let dir = project();
+        let result = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let status = body(&result);
+        assert!(status["job"].is_null(), "{status}");
+        assert!(status["phase"].is_null(), "{status}");
+        assert!(status["state_error"].is_null(), "{status}");
+        assert!(status["next_step"].is_null(), "{status}");
+        assert_eq!(status["design_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            status["design_files"],
+            json!(["demo.kicad_pro", "demo.kicad_sch"])
+        );
+        assert_eq!(status["lock_files"], json!([]));
+        assert_eq!(
+            status["fix_rounds"],
+            json!({ "schematic_review": 0, "prefab_review": 0 })
+        );
+        assert!(
+            !dir.path().join(".konnect").exists(),
+            "flow_status must create nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_lists_every_kicad_lock_beside_a_covered_file() {
+        let dir = project();
+        let root = dir.path();
+        std::fs::write(root.join("demo.kicad_pcb"), "(kicad_pcb)\n").unwrap();
+        std::fs::write(root.join("~demo.kicad_pro.lck"), "felip host").unwrap();
+        std::fs::write(root.join("~demo.kicad_pcb.lck"), "felip host").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("sheet.kicad_sch"), "(kicad_sch)\n").unwrap();
+        std::fs::write(root.join("sub").join("~sheet.kicad_sch.lck"), "x").unwrap();
+        // A lock beside no covered file is not a lock on this design.
+        std::fs::write(root.join("~ghost.kicad_sch.lck"), "x").unwrap();
+
+        let result = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            body(&result)["lock_files"],
+            json!([
+                "sub/~sheet.kicad_sch.lck",
+                "~demo.kicad_pcb.lck",
+                "~demo.kicad_pro.lck"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_state_file_is_reported_not_fatal() {
+        let dir = project();
+        plant_file(&dir, STATE_FILE, "---\n{ \"schema\": 1,, }\n---\n");
+        let result = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let status = body(&result);
+        let state_error = status["state_error"].as_str().expect("state_error set");
+        assert!(state_error.contains(STATE_FILE), "{state_error}");
+        assert!(status["job"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_read_name_outside_the_readable_set_is_an_invalid_argument() {
+        let dir = project();
+        for name in [
+            "../x",
+            "STATE.md",
+            "records/constraints.md",
+            "gates/other.md",
+            "memory/hacker.md",
+            "memory/../STATE.md",
+            "handoffs/1-review.md",
+            "handoffs/01-nobody.md",
+            "log/../../x",
+        ] {
+            let result =
+                handle_flow_status(&json!({ "project_dir": arg(&dir), "read": [name] }), &ctx())
+                    .await
+                    .unwrap();
+            assert_eq!(error_kind(&result), "invalid_argument", "{name}");
+            assert_eq!(body(&result)["error"]["field"], "read", "{name}");
+        }
+        assert!(!dir.path().join(".konnect").exists());
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_job_and_reads_records_through_the_tool() {
+        let dir = project();
+        let mut state = job_at("architecture");
+        let mut advance = HistoryEntry::new(
+            HistoryKind::Advance,
+            Some("requirements"),
+            "architecture",
+            "2026-09-21T14:20:00Z",
+            "0000",
+        );
+        advance.records = vec!["constraints.md".into()];
+        state.history.push(advance);
+        plant_state(&dir, &state);
+        plant_file(&dir, "records/constraints.md", "# Constraints\n");
+        plant_file(&dir, &format!("log/2026-09-21-{JOB_ID}.md"), "log line\n");
+        plant_file(
+            &dir,
+            &format!("handoffs/{JOB_ID}/01-requirements.md"),
+            "handoff\n",
+        );
+        plant_file(
+            &dir,
+            &format!("handoffs/{JOB_ID}/notes.txt"),
+            "not a handoff\n",
+        );
+
+        let result = handle_flow_status(
+            &json!({
+                "project_dir": arg(&dir),
+                "read": [
+                    "constraints.md",
+                    "architecture.md",
+                    "log",
+                    "handoffs/01-requirements.md",
+                    "memory/layout.md"
+                ]
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let status = body(&result);
+        assert_eq!(status["job"]["job_id"], JOB_ID);
+        assert_eq!(status["job"]["lane"], "new_board");
+        assert_eq!(status["job"]["mode"], "guided");
+        assert_eq!(status["job"]["phases"], json!(CANONICAL_PHASES));
+        assert_eq!(status["phase"], "architecture");
+        assert_eq!(
+            status["next_step"],
+            json!({
+                "phase": "architecture",
+                "required_records": ["architecture.md", "worst-case.md", "pin-plan.md"],
+                "next_phase": "gate:architecture",
+                "is_gate": false
+            })
+        );
+        assert_eq!(status["last_transition"]["kind"], "advance");
+        assert_eq!(status["last_transition"]["to"], "architecture");
+        assert_eq!(status["handoffs"], json!(["01-requirements.md"]));
+        assert_eq!(status["contents"]["constraints.md"], "# Constraints\n");
+        assert_eq!(status["contents"]["log"], "log line\n");
+        assert_eq!(
+            status["contents"]["handoffs/01-requirements.md"],
+            "handoff\n"
+        );
+        assert_eq!(
+            status["missing"],
+            json!(["architecture.md", "memory/layout.md"])
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_validity_is_recomputed_against_the_current_hashes() {
+        let dir = project();
+        for record in [
+            "constraints.md",
+            "architecture.md",
+            "worst-case.md",
+            "pin-plan.md",
+        ] {
+            plant_file(
+                &dir,
+                &format!("records/{record}"),
+                "content\nReadiness: PASS\n",
+            );
+        }
+        let canonical = dir.path().canonicalize().unwrap();
+        let (design_hash, _) = crate::design_hash::design_state_hash(&canonical).unwrap();
+        let mut state = job_at("schematic");
+        let package = package_hash(
+            &flow_path(&dir).join("records"),
+            &package_records(&state.phases, "gate:architecture"),
+        )
+        .unwrap();
+        state.gate_approvals.insert(
+            "architecture".into(),
+            GateApproval {
+                decision: GateDecision::Approve,
+                approved_by: ApprovedBy::User,
+                approved_at: "2026-09-21T15:00:00Z".into(),
+                design_hash_at_approval: design_hash,
+                package_hash_at_approval: package.hash,
+                visit: 1,
+                summary: "ok".into(),
+                user_words: "aprovado".into(),
+            },
+        );
+        let mut rewind = HistoryEntry::new(
+            HistoryKind::Rewind,
+            Some("schematic_review"),
+            "schematic",
+            "2026-09-21T16:00:00Z",
+            "0000",
+        );
+        rewind.reason = Some("ERC finding".into());
+        state.history.push(rewind);
+        plant_state(&dir, &state);
+
+        let status = |dir: &tempfile::TempDir| {
+            let project_dir = arg(dir);
+            async move {
+                body(
+                    &handle_flow_status(&json!({ "project_dir": project_dir }), &ctx())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        let fresh = status(&dir).await;
+        assert_eq!(
+            fresh["gate_approvals"]["architecture"]["valid"], true,
+            "{fresh}"
+        );
+        assert_eq!(
+            fresh["gate_approvals"]["architecture"]["user_words"],
+            "aprovado"
+        );
+        assert_eq!(
+            fresh["fix_rounds"],
+            json!({ "schematic_review": 1, "prefab_review": 0 })
+        );
+
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch (changed))\n").unwrap();
+        let design_changed = status(&dir).await;
+        assert_eq!(
+            design_changed["gate_approvals"]["architecture"]["valid"],
+            false
+        );
+
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch)\n").unwrap();
+        assert_eq!(
+            status(&dir).await["gate_approvals"]["architecture"]["valid"],
+            true
+        );
+        plant_file(&dir, "records/architecture.md", "edited\nReadiness: PASS\n");
+        let package_changed = status(&dir).await;
+        assert_eq!(
+            package_changed["gate_approvals"]["architecture"]["valid"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn status_refuses_a_directory_that_is_not_a_kicad_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(error_kind(&result), "invalid_argument");
+        assert!(!dir.path().join(".konnect").exists());
+    }
+}
+
+// ─── Tests: published schemas ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolDef {
+        tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is not defined"))
+    }
+
+    /// Unit tests call handlers directly; the dispatcher validates against the
+    /// closed schema FIRST, so each documented call shape is checked here.
+    #[test]
+    fn the_published_schemas_accept_the_documented_calls() {
+        let status = tool("flow_status");
+        assert!(status
+            .input_validator
+            .is_valid(&json!({ "project_dir": "p", "read": ["constraints.md", "log"] })));
+        assert!(!status
+            .input_validator
+            .is_valid(&json!({ "project_dir": "p", "surprise": 1 })));
+        assert!(!status.input_validator.is_valid(&json!({ "read": [] })));
     }
 }
