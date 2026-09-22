@@ -39,7 +39,7 @@ fn guidance_snapshot(home: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     }
 
     let mut entries = Vec::new();
-    for name in [".claude", ".agents"] {
+    for name in [".claude", ".agents", ".omp"] {
         let path = home.join(name);
         if path.exists() {
             entries.push((PathBuf::from(name), None));
@@ -50,6 +50,7 @@ fn guidance_snapshot(home: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         ".konnect/.installed",
         ".konnect/.installed-claude",
         ".konnect/.installed-codex",
+        ".konnect/.installed-omp",
     ] {
         let path = home.join(name);
         if path.exists() {
@@ -99,7 +100,7 @@ fn start_and_initialize_server(home: &Path, client: &str) {
 
 #[test]
 fn mcp_start_does_not_install_into_a_clean_home() {
-    for client in ["claude", "codex"] {
+    for client in ["claude", "codex", "omp"] {
         let temp = tempfile::tempdir().unwrap();
         let before = guidance_snapshot(temp.path());
 
@@ -111,7 +112,7 @@ fn mcp_start_does_not_install_into_a_clean_home() {
 
 #[test]
 fn mcp_start_does_not_reverse_an_explicit_uninstall() {
-    for client in ["claude", "codex"] {
+    for client in ["claude", "codex", "omp"] {
         let temp = tempfile::tempdir().unwrap();
 
         assert!(konnect(temp.path())

@@ -16,6 +16,10 @@ pub enum InstallClient {
     #[default]
     Claude,
     Codex,
+    /// The OMP CLI: skills under `~/.omp/agent/skills`, agents under
+    /// `~/.omp/agent/agents`. OMP's hook format is its own, so hooks are
+    /// deliberately not installed for it.
+    Omp,
 }
 
 impl InstallClient {
@@ -23,6 +27,7 @@ impl InstallClient {
         match self {
             Self::Claude => ".installed-claude",
             Self::Codex => ".installed-codex",
+            Self::Omp => ".installed-omp",
         }
     }
 }
@@ -32,6 +37,7 @@ impl fmt::Display for InstallClient {
         match self {
             Self::Claude => write!(f, "Claude"),
             Self::Codex => write!(f, "Codex"),
+            Self::Omp => write!(f, "OMP"),
         }
     }
 }
@@ -43,13 +49,14 @@ impl FromStr for InstallClient {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            _ => bail!("unsupported client '{value}'; expected 'claude' or 'codex'"),
+            "omp" => Ok(Self::Omp),
+            _ => bail!("unsupported client '{value}'; expected 'claude', 'codex' or 'omp'"),
         }
     }
 }
 
-/// Parse `--client <claude|codex>` from a subcommand's arguments, refusing any
-/// argument this build does not recognise. Claude remains the default for
+/// Parse `--client <claude|codex|omp>` from a subcommand's arguments, refusing
+/// any argument this build does not recognise. Claude remains the default for
 /// compatibility.
 ///
 /// Skipping unrecognised arguments is how `konnect init --help` came to run the
@@ -80,7 +87,7 @@ fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallCl
             }
             let value = args
                 .get(index + 1)
-                .context("--client requires 'claude' or 'codex'")?;
+                .context("--client requires 'claude', 'codex' or 'omp'")?;
             selected = Some(value.parse()?);
             index += 2;
         } else if also.contains(&arg) {
@@ -237,11 +244,18 @@ impl InstallPaths {
         match client {
             InstallClient::Claude => self.home.join(".claude").join("skills"),
             InstallClient::Codex => self.home.join(".agents").join("skills"),
+            InstallClient::Omp => self.home.join(".omp").join("agent").join("skills"),
         }
     }
 
-    fn claude_agents_dir(&self) -> PathBuf {
-        self.home.join(".claude").join("agents")
+    /// Where a client reads subagent definitions, when it has such a place.
+    /// Codex has none: it receives the shared skills only.
+    fn agents_dir(&self, client: InstallClient) -> Option<PathBuf> {
+        match client {
+            InstallClient::Claude => Some(self.home.join(".claude").join("agents")),
+            InstallClient::Codex => None,
+            InstallClient::Omp => Some(self.home.join(".omp").join("agent").join("agents")),
+        }
     }
 
     fn claude_settings_path(&self) -> PathBuf {
@@ -264,14 +278,14 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
                 println!("Installing Konnect skills, agents, and hooks for Claude...\n")
             }
             InstallClient::Codex => println!("Installing Konnect skills for Codex...\n"),
+            InstallClient::Omp => println!("Installing Konnect skills and agents for OMP...\n"),
         }
     }
 
     let skill_count = install_skills(client, paths, verbose)?;
     let mut agent_count = 0;
     let mut hook_count = 0;
-    if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
+    if let Some(agents_dir) = paths.agents_dir(client) {
         fs::create_dir_all(&agents_dir)?;
         for agent in AGENTS {
             fs::write(agents_dir.join(agent.filename), agent.content)?;
@@ -280,7 +294,11 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
                 println!("  [+] Agent: {}", agent.filename);
             }
         }
+    }
 
+    // Hooks stay Claude-only: the settings file and the event names patched
+    // here are Claude's, and OMP reads hooks from its own extension format.
+    if client == InstallClient::Claude {
         let exe = std::env::current_exe()?;
         let settings_path = paths.claude_settings_path();
         let exe_str = exe.to_string_lossy();
@@ -317,6 +335,9 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
             ),
             InstallClient::Codex => {
                 println!("\nDone: {skill_count} skills installed for Codex.")
+            }
+            InstallClient::Omp => {
+                println!("\nDone: {skill_count} skills, {agent_count} agents installed for OMP.")
             }
         }
     } else {
@@ -363,8 +384,7 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
         }
     }
 
-    if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
+    if let Some(agents_dir) = paths.agents_dir(client) {
         for agent in AGENTS {
             let dest = agents_dir.join(agent.filename);
             if dest.exists() {
@@ -374,6 +394,9 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
                 }
             }
         }
+    }
+
+    if client == InstallClient::Claude {
         let exe = std::env::current_exe()?;
         remove_hooks_from_settings(
             &paths.claude_settings_path(),
@@ -408,9 +431,11 @@ fn print_status_at(client: InstallClient, paths: &InstallPaths) -> Result<()> {
         println!("  [{marker}] {}", skill.name);
     }
 
-    if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
-        println!("\nAgents (~/.claude/agents/):");
+    if let Some(agents_dir) = paths.agents_dir(client) {
+        println!(
+            "\nAgents ({}):",
+            display_home_path(&agents_dir, &paths.home)
+        );
         for agent in AGENTS {
             let marker = if agents_dir.join(agent.filename).exists() {
                 "+"
@@ -419,6 +444,9 @@ fn print_status_at(client: InstallClient, paths: &InstallPaths) -> Result<()> {
             };
             println!("  [{marker}] {}", agent.filename);
         }
+    }
+
+    if client == InstallClient::Claude {
         println!("\nHooks (~/.claude/settings.json):");
         let raw = fs::read_to_string(paths.claude_settings_path()).unwrap_or_default();
         for hook in HOOK_SKILLS {
@@ -687,6 +715,54 @@ mod tests {
         assert!(!paths.marker(InstallClient::Claude).exists());
     }
 
+    /// OMP reads skills from `~/.omp/agent/skills` and subagents from
+    /// `~/.omp/agent/agents`, so both land — and neither `~/.claude` nor the
+    /// Codex root is written on the way.
+    #[test]
+    fn omp_install_writes_skills_and_agents_under_the_omp_agent_dir() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Omp, &paths, false).unwrap();
+
+        let skills_dir = temp.path().join(".omp").join("agent").join("skills");
+        let agents_dir = temp.path().join(".omp").join("agent").join("agents");
+        for skill in SKILLS {
+            let skill_dir = skills_dir.join(skill.name);
+            assert_eq!(
+                fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
+                skill.content
+            );
+            for (filename, content) in skill.references {
+                assert_eq!(
+                    fs::read_to_string(skill_dir.join("references").join(filename)).unwrap(),
+                    *content
+                );
+            }
+        }
+        for agent in AGENTS {
+            assert_eq!(
+                fs::read_to_string(agents_dir.join(agent.filename)).unwrap(),
+                agent.content
+            );
+        }
+        assert!(!temp.path().join(".claude").exists());
+        assert!(!temp.path().join(".agents").exists());
+        assert!(paths.marker(InstallClient::Omp).exists());
+
+        run_uninstall_at(InstallClient::Omp, &paths, false).unwrap();
+        for skill in SKILLS {
+            assert!(!skills_dir.join(skill.name).exists(), "{}", skill.name);
+        }
+        for agent in AGENTS {
+            assert!(
+                !agents_dir.join(agent.filename).exists(),
+                "{}",
+                agent.filename
+            );
+        }
+        assert!(!paths.marker(InstallClient::Omp).exists());
+    }
+
     #[test]
     fn claude_install_is_idempotent_and_preserves_settings() {
         let temp = TempDir::new().unwrap();
@@ -706,7 +782,11 @@ mod tests {
                 .exists());
         }
         for agent in AGENTS {
-            assert!(paths.claude_agents_dir().join(agent.filename).exists());
+            assert!(paths
+                .agents_dir(InstallClient::Claude)
+                .unwrap()
+                .join(agent.filename)
+                .exists());
         }
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
@@ -743,7 +823,13 @@ mod tests {
             "kicad-schematic-build-agent.md",
             "kicad-design-review-agent.md",
         ] {
-            let agent = fs::read_to_string(paths.claude_agents_dir().join(filename)).unwrap();
+            let agent = fs::read_to_string(
+                paths
+                    .agents_dir(InstallClient::Claude)
+                    .unwrap()
+                    .join(filename),
+            )
+            .unwrap();
             assert!(
                 agent.contains("references/reliability-contract.md"),
                 "{filename}"

@@ -163,8 +163,8 @@ cargo build --release -p konnect
 
 ### Install guidance for your AI client
 
-Konnect bundles shared KiCad skills for Claude and Codex. Select the client when
-installing, checking, or removing that guidance:
+Konnect bundles shared KiCad skills for Claude, Codex, and OMP. Select the
+client when installing, checking, or removing that guidance:
 
 ```bash
 # Existing behavior remains the default: Claude skills, agents, and hooks
@@ -174,6 +174,12 @@ konnect init
 konnect init --client codex
 konnect status --client codex
 konnect uninstall --client codex
+
+# OMP installs skills under ~/.omp/agent/skills and agents under
+# ~/.omp/agent/agents; no hooks, because OMP's hook format differs
+konnect init --client omp
+konnect status --client omp
+konnect uninstall --client omp
 ```
 
 MCP server startup never installs or restores guidance. Run `konnect init`
@@ -187,8 +193,10 @@ codex mcp add konnect -- /path/to/konnect --client codex
 ```
 
 Claude remains the default when `--client` is omitted. The installer tracks the
-two clients independently, and a Codex install does not create or modify
-`~/.claude`.
+three clients independently under their own markers in `~/.konnect`
+(`.installed-claude`, `.installed-codex`, `.installed-omp`), so a Codex or OMP
+install does not create or modify `~/.claude`, and an OMP install writes
+nothing under `~/.agents`.
 
 `--help` on any subcommand prints that subcommand's usage and writes nothing —
 `konnect init --help` describes the installer rather than running it. An

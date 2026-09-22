@@ -25,6 +25,8 @@ fn client_scoped_installer_help_is_advertised() {
     assert!(stdout.contains("claude (default)"));
     assert!(stdout.contains("codex"));
     assert!(stdout.contains("~/.agents/skills"));
+    assert!(stdout.contains("omp"));
+    assert!(stdout.contains("~/.omp/agent"));
 }
 
 #[test]
