@@ -1281,36 +1281,347 @@ fn read_target(
         })
 }
 
+// ─── The job log ──────────────────────────────────────────────────────────────
+
+/// One timestamped log entry: a heading and bullet lines.
+fn log_entry(at: &str, title: &str, lines: &[String]) -> String {
+    let mut entry = format!("## {at} · {title}\n\n");
+    for line in lines {
+        entry.push_str(&format!("- {line}\n"));
+    }
+    entry.push('\n');
+    entry
+}
+
+/// Append one entry to the job's log with a single `write_all` on an
+/// append-mode handle (the observer's JSONL pattern), creating `log/` on
+/// demand.
+fn append_log(flow_dir: &Path, state: &JobState, entry: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let dir = ensure_flow_subdir(flow_dir, &[LOG_DIR])?;
+    let path = dir.join(log_file_name(state));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(entry.as_bytes()))
+        .map_err(|error| format!("Could not append to {} ({error})", path.display()))
+}
+
+// ─── flow_start (design D1, D2, D3) ───────────────────────────────────────────
+
+/// D1's slug: lowercase ASCII alphanumerics, every other run → one `-`,
+/// trimmed, at most 40 characters, `job` when nothing is left.
+pub(crate) fn job_slug(objective: &str) -> String {
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for character in objective.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator_pending = false;
+            slug.push(character.to_ascii_lowercase());
+        } else {
+            separator_pending = true;
+        }
+    }
+    let mut truncated: String = slug.chars().take(40).collect();
+    while truncated.ends_with('-') {
+        truncated.pop();
+    }
+    if truncated.is_empty() {
+        "job".to_string()
+    } else {
+        truncated
+    }
+}
+
+/// `2026-09-21T14:00:05Z` → `20260921-140005`.
+fn compact_stamp(at: &str) -> String {
+    let digits = |range: std::ops::Range<usize>| at.get(range).unwrap_or("00");
+    format!(
+        "{}{}{}-{}{}{}",
+        digits(0..4),
+        digits(5..7),
+        digits(8..10),
+        digits(11..13),
+        digits(14..16),
+        digits(17..19)
+    )
+}
+
+async fn handle_flow_start(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let objective = match require_str(args, "objective") {
+        Ok(value) if !value.trim().is_empty() => value.to_string(),
+        Ok(_) => {
+            return Ok(invalid_arg(
+                "objective",
+                "must not be empty. Nothing was written.",
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let lane = match require_str(args, "lane").map(Lane::parse) {
+        Ok(Some(lane)) => lane,
+        Ok(None) => {
+            return Ok(invalid_arg(
+                "lane",
+                &format!(
+                    "must be one of: {}. Nothing was written.",
+                    Lane::ALL.map(Lane::as_str).join(", ")
+                ),
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let mode = match args.get("mode") {
+        None | Some(Value::Null) => Mode::Guided,
+        Some(value) => match value.as_str().and_then(Mode::parse) {
+            Some(mode) => mode,
+            None => {
+                return Ok(invalid_arg(
+                    "mode",
+                    "must be guided or autonomous. Nothing was written.",
+                ))
+            }
+        },
+    };
+    let phases = match opt_str_list(args, "phases") {
+        Ok(Some(phases)) => phases,
+        Ok(None) if lane == Lane::NewBoard => {
+            CANONICAL_PHASES.iter().map(|p| p.to_string()).collect()
+        }
+        Ok(None) => {
+            return Ok(invalid_arg(
+                "phases",
+                &format!(
+                    "is required for lane {}; only new_board defaults to the full sequence. \
+                     Nothing was written.",
+                    lane.as_str()
+                ),
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    if let Err(reason) = validate_phases(&phases) {
+        return Ok(invalid_arg(
+            "phases",
+            &format!("{reason}. Nothing was written."),
+        ));
+    }
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    Ok(
+        tokio::task::spawn_blocking(move || start_job(&project, objective, lane, mode, phases))
+            .await?,
+    )
+}
+
+/// Every argument is valid by now; the only remaining refusal is an existing
+/// job that is not closed (or a state file that does not parse).
+fn start_job(
+    project: &Path,
+    objective: String,
+    lane: Lane,
+    mode: Mode,
+    phases: Vec<String>,
+) -> CallToolResult {
+    let (design_hash, _) = match design_state_hash(project) {
+        Ok(hashed) => hashed,
+        Err(error) => {
+            return CallToolResult::error(format!(
+                "Could not hash the design under {}: {error:#}. Nothing was written.",
+                project.display()
+            ))
+        }
+    };
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let first = phases[0].clone();
+    let state = JobState {
+        schema: STATE_SCHEMA,
+        job_id: format!("{}-{}", job_slug(&objective), compact_stamp(&at)),
+        objective,
+        lane,
+        mode,
+        phases,
+        phase: first.clone(),
+        started_at: at.clone(),
+        gate_approvals: BTreeMap::new(),
+        pending_approvals: Vec::new(),
+        deferred_findings: Vec::new(),
+        queue: Vec::new(),
+        history: vec![HistoryEntry::new(
+            HistoryKind::Start,
+            None,
+            &first,
+            &at,
+            &design_hash,
+        )],
+    };
+
+    let flow_dir = match create_flow_dir(project) {
+        Ok(flow_dir) => flow_dir,
+        Err(reason) => return CallToolResult::error(reason),
+    };
+    let state_path = flow_dir.join(STATE_FILE);
+    if let Err(refusal) = write_first_state(&state_path, &render_state(&state)) {
+        return refusal;
+    }
+
+    let entry = log_entry(
+        &at,
+        "start",
+        &[
+            format!(
+                "job `{}` · lane `{}` · mode `{}`",
+                state.job_id,
+                lane.as_str(),
+                mode.as_str()
+            ),
+            format!("objective: {}", one_line(&state.objective)),
+            format!("phases: {}", state.phases.join(" → ")),
+            format!("design_hash: `{design_hash}`"),
+        ],
+    );
+    let log_error = append_log(&flow_dir, &state, &entry).err();
+
+    CallToolResult::json(&json!({
+        "job_id": state.job_id,
+        "project_dir": project.display().to_string(),
+        "objective": state.objective,
+        "lane": state.lane,
+        "mode": state.mode,
+        "phases": state.phases,
+        "phase": state.phase,
+        "started_at": state.started_at,
+        "design_hash": design_hash,
+        "state_file": state_path.display().to_string(),
+        "log_error": log_error,
+    }))
+}
+
+/// Create `STATE.md` no-clobber, so two racing starts cannot both open a job;
+/// the loser — or any call finding a state file — falls through to the locked
+/// path, which replaces the file only when its job is closed.
+fn write_first_state(state_path: &Path, rendered: &str) -> Result<(), CallToolResult> {
+    match konnect_sexp::write_new_atomic(state_path, rendered) {
+        Ok(()) => return Ok(()),
+        Err(konnect_sexp::SexpError::Io(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(CallToolResult::error(format!(
+                "Could not create {} ({error})",
+                state_path.display()
+            )))
+        }
+    }
+    let outcome = konnect_sexp::transact_atomic(state_path, |current| {
+        let refusal = match parse_state(current) {
+            Ok(existing) if existing.phase == CLOSED => {
+                return Ok((rendered.to_string(), Ok(())));
+            }
+            Ok(existing) => format!(
+                "Job {} is still active at phase {:?} in {}. Close or abandon it with \
+                 flow_advance before starting another. Nothing was written.",
+                existing.job_id,
+                existing.phase,
+                state_path.display()
+            ),
+            Err(error) => format!(
+                "{error}. Fix or remove {} by hand; it was left untouched and no job was \
+                 started.",
+                state_path.display()
+            ),
+        };
+        Ok((current.to_string(), Err(conflict(state_path, refusal))))
+    });
+    match outcome {
+        Ok(result) => result,
+        Err(error) => Err(CallToolResult::error(format!(
+            "Could not update {} ({error})",
+            state_path.display()
+        ))),
+    }
+}
+
 // ─── Tool definitions (design D1) ─────────────────────────────────────────────
 
 /// The `flow` tools in D1 order. The router registers them (task 1.8).
 pub fn tools() -> Vec<ToolDef> {
-    vec![tool!(
-        "flow_status",
-        "Read a KiCad project's orchestration state and the reality it binds to: the \
+    vec![
+        tool!(
+            "flow_status",
+            "Read a KiCad project's orchestration state and the reality it binds to: the \
          job and its phase (null when none), the current design_state_hash and the files \
          it covered, KiCad lock files beside them, gate approvals with a recomputed \
          `valid`, deferred items, FIX rounds per review phase, the newest transition, the \
          job's handoffs, the next step, and the content of each requested `read` name. \
          Creates nothing and never refuses because of flow state — an unparseable \
          STATE.md is reported in `state_error`.",
-        json!({
-            "type": "object",
-            "properties": {
-                "project_dir": {
-                    "type": "string",
-                    "description": "KiCad project directory: must hold a *.kicad_pro directly."
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "read": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Records to return in `contents` (absent ones are listed in `missing`): a record name such as constraints.md or architecture.md, lessons-candidates.md, gates/<architecture|placement|purchase>.md, log (this job's log), memory/<role>.md, or handoffs/<NN>-<role>.md as `handoffs` lists them."
+                    }
                 },
-                "read": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Records to return in `contents` (absent ones are listed in `missing`): a record name such as constraints.md or architecture.md, lessons-candidates.md, gates/<architecture|placement|purchase>.md, log (this job's log), memory/<role>.md, or handoffs/<NN>-<role>.md as `handoffs` lists them."
-                }
-            },
-            "required": ["project_dir"]
-        }),
-        |args, ctx| async move { handle_flow_status(args, ctx).await }
-    )]
+                "required": ["project_dir"]
+            }),
+            |args, ctx| async move { handle_flow_status(args, ctx).await }
+        ),
+        tool!(
+            "flow_start",
+            "Open an orchestration job on a KiCad project: validates the lane's phase \
+             sequence, writes .konnect/flow/STATE.md with the first phase and a start \
+             history entry carrying the current design_state_hash, and logs it. Only one \
+             job at a time: a job that is not closed is a conflict (close or abandon it \
+             with flow_advance first). Returns the server-minted job_id every later flow \
+             call names.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "objective": {
+                        "type": "string",
+                        "description": "What the job delivers, in the user's terms. Also seeds the job_id slug."
+                    },
+                    "lane": {
+                        "type": "string",
+                        "enum": Lane::ALL.map(Lane::as_str),
+                        "description": "new_board runs the full sequence by default; every other lane must pass `phases`."
+                    },
+                    "phases": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": CANONICAL_PHASES },
+                        "description": "A strictly increasing subsequence of the canonical order that never starts at a gate and keeps each gate its phase brings (architecture, placement, manufacturing → purchase). Required unless lane is new_board."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": Mode::ALL.map(Mode::as_str),
+                        "description": "guided (default): every gate needs the user's own words. autonomous: architecture and placement may be approved by the session; purchase still needs the user."
+                    }
+                },
+                "required": ["project_dir", "objective", "lane"]
+            }),
+            |args, ctx| async move { handle_flow_start(args, ctx).await }
+        ),
+    ]
 }
 
 // ─── Tests: foundations (task 1.1) ────────────────────────────────────────────
@@ -2117,5 +2428,217 @@ mod schema_tests {
             .input_validator
             .is_valid(&json!({ "project_dir": "p", "surprise": 1 })));
         assert!(!status.input_validator.is_valid(&json!({ "read": [] })));
+
+        let start = tool("flow_start");
+        assert!(start.input_validator.is_valid(&json!({
+            "project_dir": "p",
+            "objective": "o",
+            "lane": "fab_only",
+            "phases": ["manufacturing", "gate:purchase"],
+            "mode": "autonomous"
+        })));
+        assert!(!start
+            .input_validator
+            .is_valid(&json!({ "project_dir": "p", "objective": "o", "lane": "sideways" })));
+        assert!(!start.input_validator.is_valid(&json!({
+            "project_dir": "p",
+            "objective": "o",
+            "lane": "new_board",
+            "phases": ["layout"]
+        })));
+    }
+}
+
+// ─── Tests: flow_start (task 1.3) ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod start_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::mcp::protocol::CallToolResult;
+    use serde_json::{json, Value};
+
+    /// `flow_start` with a new_board default call, overlaid with `extra`.
+    async fn start(dir: &tempfile::TempDir, extra: Value) -> CallToolResult {
+        let mut args = json!({
+            "project_dir": arg(dir),
+            "objective": "Demo board",
+            "lane": "new_board",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_flow_start(&args, &ctx()).await.unwrap()
+    }
+
+    fn state_on_disk(dir: &tempfile::TempDir) -> JobState {
+        let text = std::fs::read_to_string(flow_path(dir).join(STATE_FILE)).unwrap();
+        parse_state(&text).unwrap()
+    }
+
+    #[test]
+    fn job_ids_are_a_slug_and_a_utc_stamp() {
+        assert_eq!(
+            job_slug("Conversor USB-serial com ESP32"),
+            "conversor-usb-serial-com-esp32"
+        );
+        assert_eq!(job_slug("  --Ação!! "), "a-o");
+        assert_eq!(job_slug("!!!"), "job");
+        assert_eq!(job_slug(""), "job");
+        assert_eq!(job_slug(&"a".repeat(39)).len(), 39);
+        assert_eq!(
+            job_slug(&format!("{} tail", "b".repeat(39))),
+            "b".repeat(39),
+            "a cut that lands on a separator is trimmed"
+        );
+        assert_eq!(job_slug(&"c".repeat(60)).len(), 40);
+        assert_eq!(compact_stamp("2026-09-21T14:00:05Z"), "20260921-140005");
+    }
+
+    #[tokio::test]
+    async fn a_new_board_job_opens_at_its_first_phase() {
+        let dir = project();
+        let result = start(&dir, json!({})).await;
+        assert!(!result.is_error, "{}", text(&result));
+        let started = body(&result);
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        assert!(job_id.starts_with("demo-board-"), "{job_id}");
+        assert_eq!(job_id.len(), "demo-board-".len() + "20260921-140000".len());
+        assert_eq!(validate_job_id(&job_id), Ok(()));
+        assert_eq!(started["phase"], "requirements");
+        assert_eq!(started["mode"], "guided");
+
+        let state = state_on_disk(&dir);
+        assert_eq!(state.job_id, job_id);
+        assert_eq!(state.phase, "requirements");
+        assert_eq!(state.phases, CANONICAL_PHASES);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].kind, HistoryKind::Start);
+        assert_eq!(state.history[0].to, "requirements");
+        assert_eq!(state.history[0].design_hash, started["design_hash"]);
+        assert_eq!(state.history[0].design_hash.len(), 64);
+
+        let log = flow_path(&dir)
+            .join("log")
+            .join(format!("{}-{job_id}.md", &state.started_at[..10]));
+        let log_text = std::fs::read_to_string(&log).expect("the start is logged");
+        assert!(log_text.contains("start"), "{log_text}");
+
+        let status = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(body(&status)["job"]["job_id"], job_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_second_start_while_a_job_is_active_is_a_conflict_and_changes_nothing() {
+        let dir = project();
+        assert!(!start(&dir, json!({})).await.is_error);
+        let state_file = flow_path(&dir).join(STATE_FILE);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let second = start(&dir, json!({ "objective": "Another board" })).await;
+        assert_eq!(error_kind(&second), "conflict");
+        let paths = body(&second)["error"]["paths"].to_string();
+        assert!(paths.contains(STATE_FILE), "{paths}");
+        assert_eq!(std::fs::read(&state_file).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_arguments_are_refused_before_anything_is_created() {
+        let cases = [
+            (json!({ "lane": "fab_only" }), "phases", ""),
+            (
+                json!({ "phases": ["placement", "routing"] }),
+                "phases",
+                "\\\"placement\\\"",
+            ),
+            (
+                json!({ "lane": "board_revision", "phases": ["schematic", "requirements"] }),
+                "phases",
+                "\\\"requirements\\\"",
+            ),
+            (json!({ "lane": "review_only", "phases": [] }), "phases", ""),
+            (json!({ "objective": "  " }), "objective", ""),
+            (json!({ "lane": "sideways" }), "lane", ""),
+            (json!({ "mode": "reckless" }), "mode", ""),
+        ];
+        for (extra, field, named) in cases {
+            let dir = project();
+            let result = start(&dir, extra.clone()).await;
+            assert_eq!(error_kind(&result), "invalid_argument", "{extra}");
+            assert_eq!(body(&result)["error"]["field"], field, "{extra}");
+            assert!(text(&result).contains(named), "{extra}: {}", text(&result));
+            assert!(
+                !dir.path().join(".konnect").exists(),
+                "{extra}: a refusal creates nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_directory_without_a_top_level_project_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested").join("demo.kicad_pro"), "{}").unwrap();
+        let result = start(&dir, json!({})).await;
+        assert_eq!(error_kind(&result), "invalid_argument");
+        assert_eq!(body(&result)["error"]["field"], "project_dir");
+        assert!(!dir.path().join(".konnect").exists());
+    }
+
+    #[tokio::test]
+    async fn a_closed_job_lets_the_next_one_start() {
+        let dir = project();
+        plant_state(&dir, &job_at(CLOSED));
+        let result = start(
+            &dir,
+            json!({
+                "objective": "Fab run",
+                "lane": "fab_only",
+                "phases": ["manufacturing", "gate:purchase"],
+                "mode": "autonomous"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let state = state_on_disk(&dir);
+        assert_eq!(state.objective, "Fab run");
+        assert_eq!(state.lane, Lane::FabOnly);
+        assert_eq!(state.mode, Mode::Autonomous);
+        assert_eq!(state.phase, "manufacturing");
+        assert_ne!(state.job_id, JOB_ID);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_state_file_is_a_conflict_not_an_overwrite() {
+        let dir = project();
+        plant_file(&dir, STATE_FILE, "hand-edited garbage\n");
+        let state_file = flow_path(&dir).join(STATE_FILE);
+        let result = start(&dir, json!({})).await;
+        assert_eq!(error_kind(&result), "conflict");
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap(),
+            "hand-edited garbage\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn racing_starts_open_exactly_one_job() {
+        let dir = project();
+        let (first, second) = tokio::join!(
+            start(&dir, json!({ "objective": "Racer one" })),
+            start(&dir, json!({ "objective": "Racer two" }))
+        );
+        let outcomes = [first.is_error, second.is_error];
+        assert_eq!(
+            outcomes.iter().filter(|failed| !**failed).count(),
+            1,
+            "{} / {}",
+            text(&first),
+            text(&second)
+        );
+        let loser = if first.is_error { &first } else { &second };
+        assert_eq!(error_kind(loser), "conflict");
     }
 }
