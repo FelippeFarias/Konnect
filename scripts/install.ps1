@@ -88,19 +88,31 @@ $retraceChanged = $false
 $retracePrevious = $null
 $recoveryShown = $false
 
-# A PowerShell single-quoted literal; a ' in the text doubles.
-function Format-PsLiteral([string]$text) { return "'" + $text.Replace("'", "''") + "'" }
+# A PowerShell single-quoted literal. PowerShell reads each of these five
+# characters as a single quote (' and the typographic quotes), so each doubles.
+$psSingleQuotes = @([char]0x27, [char]0x2018, [char]0x2019, [char]0x201A, [char]0x201B)
+function Format-PsLiteral([string]$text) {
+    foreach ($q in $psSingleQuotes) { $text = $text.Replace([string]$q, [string]$q + [string]$q) }
+    return "'" + $text + "'"
+}
 
 # Commands that undo what this run changed, in paste order. Each is safe to
-# paste twice: Move-Item without -Force never overwrites.
+# paste twice: the file moves sit behind one Test-Path guard, so a second paste,
+# or a paste when there is nothing to undo, moves nothing and says why. A dry
+# run changed nothing, so it gets no commands at all.
+$rollbackStopped = "'rollback stopped: nothing to undo, already undone, or the files were moved - check the folder'"
 function Get-RollbackLines {
     $lines = @()
+    if ($DryRun) { return $lines }
     if ($targetPath) { $t = Format-PsLiteral $targetPath }
+    if ($parkedPath) { $p = Format-PsLiteral $parkedPath }
     if ($backupPath) {
-        if ($DryRun -or (Test-Path -LiteralPath $targetPath)) {
-            $lines += "Move-Item -LiteralPath $t -Destination $(Format-PsLiteral $parkedPath)"
+        $b = Format-PsLiteral $backupPath
+        if (Test-Path -LiteralPath $targetPath) {
+            $lines += "if ((Test-Path -LiteralPath $b) -and (Test-Path -LiteralPath $t) -and -not (Test-Path -LiteralPath $p)) { Move-Item -LiteralPath $t -Destination $p -ErrorAction Stop; Move-Item -LiteralPath $b -Destination $t } else { $rollbackStopped }"
+        } else {
+            $lines += "if ((Test-Path -LiteralPath $b) -and -not (Test-Path -LiteralPath $t)) { Move-Item -LiteralPath $b -Destination $t } else { $rollbackStopped }"
         }
-        $lines += "Move-Item -LiteralPath $(Format-PsLiteral $backupPath) -Destination $t"
         foreach ($c in $initClients) {
             if ($c -eq "codex") { $lines += "& $t init --client codex" } else { $lines += "& $t init" }
         }
@@ -108,7 +120,7 @@ function Get-RollbackLines {
         foreach ($c in $initClients) {
             if ($c -eq "codex") { $lines += "& $t uninstall --client codex" } else { $lines += "& $t uninstall" }
         }
-        $lines += "Move-Item -LiteralPath $t -Destination $(Format-PsLiteral $parkedPath)"
+        $lines += "if ((Test-Path -LiteralPath $t) -and -not (Test-Path -LiteralPath $p)) { Move-Item -LiteralPath $t -Destination $p } else { 'undo stopped: already done, or the file was moved - check the folder' }"
     }
     if ($retraceChanged) {
         if ($retracePrevious) { $lines += "[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', $(Format-PsLiteral $retracePrevious), 'User')" }
@@ -643,17 +655,20 @@ if ($NoRetrace) {
 
 # ---- summary ---------------------------------------------------------------
 Step "Summary"
-if ($DryRun) { Say "DRY RUN - nothing was changed." }
+if ($DryRun) { Say "DRY RUN (preview) - nothing was changed; this is what a real run would do." }
 if ($changes.Count -eq 0) { Say "nothing changed." }
 foreach ($line in $changes) { Say "- $line" }
 Say "target:  $targetPath (new build version $sourceVersion)"
-if ($backupPath) { Say "backup:  $backupPath" }
+if ($backupPath -and $DryRun) { Say "backup (would be):  $backupPath" }
+elseif ($backupPath) { Say "backup:  $backupPath" }
 elseif ($freshInstall) { Say "backup:  (none - fresh install: there was no konnect at $targetPath before)" }
 else { Say "backup:  (none)" }
 if ($targetNote) { Say "NOTE: $targetNote" }
 if ($retraceNote) { Say "NOTE: $retraceNote" }
 $rollbackLines = @(Get-RollbackLines)
-if ($rollbackLines.Count -gt 0) {
+if ($DryRun) {
+    Say "undo: preview only - nothing to undo now. After a real run, the summary will show how to undo it."
+} elseif ($rollbackLines.Count -gt 0) {
     if ($freshInstall) { Say "undo (PowerShell; safe to paste twice) - this was a fresh install, so undoing it moves the new file aside:" }
     else { Say "rollback (PowerShell; safe to paste twice):" }
     foreach ($line in $rollbackLines) { Say "    $line" }
