@@ -41,6 +41,11 @@ gate:purchase → learn
 - A job's `phases` never drops a human gate: `architecture` brings
   `gate:architecture`, `placement` brings `gate:placement`, `manufacturing`
   brings `gate:purchase`. A gate is never first.
+  A phase brings its gate, and a gate's phase must be present too:
+  `gate:architecture` requires `architecture`, `gate:placement` requires
+  `placement`, `gate:purchase` requires `manufacturing` — a lane cannot show
+  an approval bound to a record from a closed or earlier job. `flow_start`
+  refuses a `phases` list that breaks either rule.
 - Record the lane and why at once, with
   `flow_log(project_dir, job_id, kind, message, why, rollback)` and `kind`
   `decision`.
@@ -213,9 +218,19 @@ state already answers.
   closed (the operating notes, §1).
 - `gate_approvals` with `valid: false` — the design or the package changed
   since that approval.
+  `valid` matters only while `phase == "gate:<name>"` (the job's current gate,
+  reported as `status: current`); an approval of a gate already left reports
+  `status: passed` with the hashes it was approved at and no `valid` field —
+  not a reason to re-ask or rewind.
 - `next_step` — the phase, the records it must supply, and the phase after it.
 - `handoffs` — read the newest with `flow_status(project_dir, read)`; then
   `pending_approvals`, `deferred_findings` and `queue`.
+- A successful `flow_gate`, `flow_advance` or `flow_defer` response always
+  carries `warning`: `null` when every derived side file landed. A string
+  means the state change committed in `STATE.md` but a side file (the gate
+  file or the job's log entry) was not written: never repeat the call, which
+  would apply the change again; repair only what the warning names, and read
+  `flow_status(project_dir)` for the committed state.
 
 ## 8. Requirements: one question round
 
