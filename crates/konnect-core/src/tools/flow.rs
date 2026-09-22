@@ -1216,13 +1216,23 @@ fn lock_files(project: &Path, design_files: &[String]) -> Vec<String> {
     locks
 }
 
-/// Each recorded approval with `valid` recomputed: both keys still equal the
-/// design and the package as they are now.
+/// Each recorded approval with its `status` (Fix round 1, DECISION D): the
+/// gate the job stands at is `current`, with `valid` recomputed — both keys
+/// still equal the design and the package as they are now. Every other
+/// approval is `passed` and carries no `valid`: work after a gate changes the
+/// design by design, and the hashes it was approved at are already there.
 fn gate_validity(flow_dir: &Path, state: &JobState, design_hash: &str) -> Value {
     let mut gates = serde_json::Map::new();
     for (gate, approval) in &state.gate_approvals {
         let mut entry = json!(approval);
-        match current_package(flow_dir, &state.phases, &format!("gate:{gate}")) {
+        let gate_token = format!("gate:{gate}");
+        if gate_token != state.phase {
+            entry["status"] = json!("passed");
+            gates.insert(gate.clone(), entry);
+            continue;
+        }
+        entry["status"] = json!("current");
+        match current_package(flow_dir, &state.phases, &gate_token) {
             Ok(package) => {
                 entry["valid"] = json!(
                     approval.design_hash_at_approval == design_hash
@@ -3949,6 +3959,10 @@ mod status_tests {
         );
     }
 
+    /// The job stands AT `gate:architecture`, reached through a FIX-round
+    /// rewind to `architecture`: since Fix round 1 (DECISION D) only the
+    /// current gate's approval gets a recomputed `valid` — this test stood at
+    /// `schematic` before, where the approval now reports `passed`.
     #[tokio::test]
     async fn gate_validity_is_recomputed_against_the_current_hashes() {
         let dir = project();
@@ -3966,34 +3980,41 @@ mod status_tests {
         }
         let canonical = dir.path().canonicalize().unwrap();
         let (design_hash, _) = crate::design_hash::design_state_hash(&canonical).unwrap();
-        let mut state = job_at("schematic");
+        let mut state = job_at("gate:architecture");
         let package = package_hash(
             &flow_path(&dir).join("records"),
             &package_records(&state.phases, "gate:architecture"),
         )
         .unwrap();
-        state.gate_approvals.insert(
-            "architecture".into(),
-            GateApproval {
-                decision: GateDecision::Approve,
-                approved_by: ApprovedBy::User,
-                approved_at: "2026-09-21T15:00:00Z".into(),
-                design_hash_at_approval: design_hash,
-                package_hash_at_approval: package.hash,
-                visit: 1,
-                summary: "ok".into(),
-                user_words: "aprovado".into(),
-            },
-        );
         let mut rewind = HistoryEntry::new(
             HistoryKind::Rewind,
             Some("schematic_review"),
-            "schematic",
+            "architecture",
             "2026-09-21T16:00:00Z",
             "0000",
         );
         rewind.reason = Some("ERC finding".into());
         state.history.push(rewind);
+        state.history.push(HistoryEntry::new(
+            HistoryKind::Advance,
+            Some("architecture"),
+            "gate:architecture",
+            "2026-09-21T16:30:00Z",
+            &design_hash,
+        ));
+        state.gate_approvals.insert(
+            "architecture".into(),
+            GateApproval {
+                decision: GateDecision::Approve,
+                approved_by: ApprovedBy::User,
+                approved_at: "2026-09-21T17:00:00Z".into(),
+                design_hash_at_approval: design_hash,
+                package_hash_at_approval: package.hash,
+                visit: 2,
+                summary: "ok".into(),
+                user_words: "aprovado".into(),
+            },
+        );
         plant_state(&dir, &state);
 
         let status = |dir: &tempfile::TempDir| {
@@ -4007,6 +4028,10 @@ mod status_tests {
             }
         };
         let fresh = status(&dir).await;
+        assert_eq!(
+            fresh["gate_approvals"]["architecture"]["status"], "current",
+            "{fresh}"
+        );
         assert_eq!(
             fresh["gate_approvals"]["architecture"]["valid"], true,
             "{fresh}"
@@ -4037,6 +4062,71 @@ mod status_tests {
         assert_eq!(
             package_changed["gate_approvals"]["architecture"]["valid"],
             false
+        );
+    }
+
+    /// Fix round 1, DECISION D (reviewer 11 minor 2): only the gate the job
+    /// stands at gets a recomputed `valid`. An approval of a gate already left
+    /// reports `status: "passed"` with the hashes it was approved at — the
+    /// first schematic save after the architecture gate is normal work, not a
+    /// reason to re-ask or rewind.
+    #[tokio::test]
+    async fn a_passed_gates_approval_reports_status_passed_without_a_valid_field() {
+        use super::advance_tests::{advance, at_architecture_gate};
+        use super::gate_tests::{at_placement_gate, gate};
+
+        let status = |dir: &tempfile::TempDir| {
+            let project_dir = arg(dir);
+            async move {
+                body(
+                    &handle_flow_status(&json!({ "project_dir": project_dir }), &ctx())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        let approved = gate(&dir, &job_id, "architecture", "approve", "pode seguir").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+        let approved_at = body(&approved)["design_hash_at_approval"].clone();
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
+        // The first schematic save: the design no longer matches the approval.
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch (saved))\n").unwrap();
+        let moved_on = status(&dir).await;
+        let passed = &moved_on["gate_approvals"]["architecture"];
+        assert_eq!(passed["status"], "passed", "{moved_on}");
+        assert!(
+            passed.get("valid").is_none(),
+            "a passed gate carries no recomputed valid: {moved_on}"
+        );
+        assert!(passed.get("validity_error").is_none(), "{moved_on}");
+        assert_eq!(passed["design_hash_at_approval"], approved_at, "{moved_on}");
+        assert_eq!(passed["user_words"], "pode seguir");
+
+        let at_gate = project();
+        let job_id = at_placement_gate(&at_gate, "guided").await;
+        let approved = gate(&at_gate, &job_id, "placement", "approve", "roteia").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+        let standing = status(&at_gate).await;
+        let current = &standing["gate_approvals"]["placement"];
+        assert_eq!(current["status"], "current", "{standing}");
+        assert_eq!(current["valid"], true, "{standing}");
+        std::fs::write(
+            at_gate.path().join("demo.kicad_sch"),
+            "(kicad_sch (moved))\n",
+        )
+        .unwrap();
+        let stale = status(&at_gate).await;
+        assert_eq!(
+            stale["gate_approvals"]["placement"]["status"], "current",
+            "{stale}"
+        );
+        assert_eq!(
+            stale["gate_approvals"]["placement"]["valid"], false,
+            "the current gate's valid is recomputed: {stale}"
         );
     }
 
