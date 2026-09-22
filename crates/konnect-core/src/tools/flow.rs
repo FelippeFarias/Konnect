@@ -1339,8 +1339,14 @@ fn log_entry(at: &str, title: &str, lines: &[String]) -> String {
 
 /// Append one entry to the job's log, creating `log/` on demand.
 fn append_log(flow_dir: &Path, state: &JobState, entry: &str) -> Result<(), String> {
+    append_log_file(flow_dir, &log_file_name(state), entry)
+}
+
+/// [`append_log`] by file name, for a write that runs after the state it was
+/// named from has been committed.
+fn append_log_file(flow_dir: &Path, file_name: &str, entry: &str) -> Result<(), String> {
     let dir = ensure_flow_subdir(flow_dir, &[LOG_DIR])?;
-    append_file(&dir.join(log_file_name(state)), entry)
+    append_file(&dir.join(file_name), entry)
 }
 
 /// Append one entry with a single `write_all` on an append-mode handle (the
@@ -1832,24 +1838,93 @@ fn transact_state(
     project: &Path,
     apply: impl FnOnce(&Path, &Path, &str) -> Result<(String, Value), CallToolResult>,
 ) -> CallToolResult {
-    let (flow_dir, state_path) = match existing_state_path(project) {
-        Ok(paths) => paths,
-        Err(refusal) => return refusal,
-    };
+    match transact(project, apply) {
+        Ok((_, response)) => CallToolResult::json(&response),
+        Err(refusal) => refusal,
+    }
+}
+
+/// The locked read-modify-write behind every mutation of an existing job:
+/// `Ok` (with the flow directory and `apply`'s payload) only once the new
+/// `STATE.md` is in place.
+fn transact<T>(
+    project: &Path,
+    apply: impl FnOnce(&Path, &Path, &str) -> Result<(String, T), CallToolResult>,
+) -> Result<(PathBuf, T), CallToolResult> {
+    let (flow_dir, state_path) = existing_state_path(project)?;
     let outcome = konnect_sexp::transact_atomic(&state_path, |current| {
         Ok(match apply(&flow_dir, &state_path, current) {
-            Ok((next, response)) => (next, Ok(response)),
+            Ok((next, payload)) => (next, Ok(payload)),
             Err(refusal) => (current.to_string(), Err(refusal)),
         })
     });
     match outcome {
-        Ok(Ok(response)) => CallToolResult::json(&response),
-        Ok(Err(refusal)) => refusal,
-        Err(error) => CallToolResult::error(format!(
+        Ok(Ok(payload)) => Ok((flow_dir, payload)),
+        Ok(Err(refusal)) => Err(refusal),
+        Err(error) => Err(CallToolResult::error(format!(
             "Could not update {} ({error})",
             state_path.display()
-        )),
+        ))),
     }
+}
+
+/// An accepted gate decision or transition: its response, and the derived
+/// side files that must FOLLOW the `STATE.md` commit (D2, Fix round 1,
+/// DECISION C) so neither can record a change `STATE.md` never held.
+struct Committed {
+    response: Value,
+    /// `records/gates/<gate>.md`'s file name and full text (`flow_gate` only).
+    gate_file: Option<(String, String)>,
+    /// The job's log file name and the entry to append.
+    log: (String, String),
+}
+
+/// `transact_state` for `flow_gate` and `flow_advance`: `STATE.md`'s
+/// successful write is the one commit point. The gate file and the log entry
+/// are written only after it, and a failure there is a `warning` on the
+/// success response (the `flow_start` `log_error` pattern) — never an error,
+/// which would invite a retry of a decision `STATE.md` already holds.
+fn transact_then_record(
+    project: &Path,
+    apply: impl FnOnce(&Path, &Path, &str) -> Result<(String, Committed), CallToolResult>,
+) -> CallToolResult {
+    let (flow_dir, committed) = match transact(project, apply) {
+        Ok(done) => done,
+        Err(refusal) => return refusal,
+    };
+    let mut response = committed.response;
+    response["warning"] = json!(record_after_commit(
+        &flow_dir,
+        committed.gate_file.as_ref(),
+        &committed.log
+    ));
+    CallToolResult::json(&response)
+}
+
+/// Write the derived side files of a committed change; `None` when both
+/// landed, otherwise the warning naming every write that failed.
+fn record_after_commit(
+    flow_dir: &Path,
+    gate_file: Option<&(String, String)>,
+    (log_name, entry): &(String, String),
+) -> Option<String> {
+    let mut failures = Vec::new();
+    if let Some((name, text)) = gate_file {
+        let written = ensure_flow_subdir(flow_dir, &[RECORDS_DIR, GATES_DIR]).and_then(|dir| {
+            let path = dir.join(name);
+            konnect_sexp::write_atomic(&path, text)
+                .map_err(|error| format!("Could not write {} ({error})", path.display()))
+        });
+        failures.extend(written.err());
+    }
+    failures.extend(append_log_file(flow_dir, log_name, entry).err());
+    (!failures.is_empty()).then(|| {
+        format!(
+            "{STATE_FILE} holds this change, but a derived side file was not written: {}. Do \
+             not repeat the call; flow_status shows the committed state.",
+            failures.join("; ")
+        )
+    })
 }
 
 /// The job in `current`, refused as a `conflict` when the front matter does
@@ -1875,22 +1950,23 @@ fn load_job(state_path: &Path, current: &str, job_id: &str) -> Result<JobState, 
     Ok(state)
 }
 
-/// Run the transition under the `STATE.md` lock.
+/// Run the transition under the `STATE.md` lock; its log entry follows the
+/// commit.
 fn advance_job(project: &Path, request: &AdvanceRequest) -> CallToolResult {
-    transact_state(project, |flow_dir, state_path, current| {
+    transact_then_record(project, |flow_dir, state_path, current| {
         apply_advance(project, flow_dir, state_path, current, request)
     })
 }
 
 /// Parse, check the job, classify, then dispatch on the transition. Returns
-/// the new `STATE.md` text and the response.
+/// the new `STATE.md` text and the committed change.
 fn apply_advance(
     project: &Path,
     flow_dir: &Path,
     state_path: &Path,
     current: &str,
     request: &AdvanceRequest,
-) -> Result<(String, Value), CallToolResult> {
+) -> Result<(String, Committed), CallToolResult> {
     let state = load_job(state_path, current, &request.job_id)?;
     if state.phase == CLOSED {
         return Err(stale(
@@ -1907,9 +1983,7 @@ fn apply_advance(
         Transition::Forward | Transition::Close => {
             advance_forward(project, flow_dir, state, request, transition)
         }
-        Transition::Rewind | Transition::Abandon => {
-            move_back(project, flow_dir, state, request, transition)
-        }
+        Transition::Rewind | Transition::Abandon => move_back(project, state, request, transition),
     }
 }
 
@@ -2052,7 +2126,7 @@ fn advance_forward(
     state: JobState,
     request: &AdvanceRequest,
     transition: Transition,
-) -> Result<(String, Value), CallToolResult> {
+) -> Result<(String, Committed), CallToolResult> {
     let leaving = state.phase.clone();
     check_forward_records(&leaving, &request.records)?;
     let design_hash = hash_design(project)?;
@@ -2060,7 +2134,9 @@ fn advance_forward(
         check_gate_exit(flow_dir, &state, &design_hash)?;
     }
 
-    // Everything is validated: side files first, STATE.md last (D2).
+    // Everything is validated: the phase records before STATE.md (D2, D4 — a
+    // stray copy is harmless, a retry must re-supply it); the log entry only
+    // after the commit (Fix round 1, DECISION C).
     if !request.records.is_empty() {
         let records_dir =
             ensure_flow_subdir(flow_dir, &[RECORDS_DIR]).map_err(CallToolResult::error)?;
@@ -2088,7 +2164,7 @@ fn advance_forward(
     entry.evidence_check = request.evidence_check.clone();
     entry.reason = request.reason.clone();
     record_gate_keys(flow_dir, &state.phases, &mut entry)?;
-    commit_transition(flow_dir, state, entry, Vec::new())
+    Ok(commit_transition(state, entry, Vec::new()))
 }
 
 /// A rewind (any earlier entry) or an abandon (`closed` before the last
@@ -2098,11 +2174,10 @@ fn advance_forward(
 /// records the keys the next approval is compared against (D11).
 fn move_back(
     project: &Path,
-    flow_dir: &Path,
     mut state: JobState,
     request: &AdvanceRequest,
     transition: Transition,
-) -> Result<(String, Value), CallToolResult> {
+) -> Result<(String, Committed), CallToolResult> {
     // Fix round 1, DECISION B: a rewind into a gate would bind the next
     // approval to the design as it is now, behind a package produced before.
     if is_gate(&request.to_phase) {
@@ -2172,7 +2247,7 @@ fn move_back(
     entry.evidence_calls = request.evidence_calls.clone();
     entry.evidence_check = request.evidence_check.clone();
     entry.reason = Some(reason);
-    commit_transition(flow_dir, state, entry, cleared)
+    Ok(commit_transition(state, entry, cleared))
 }
 
 /// `design_state_hash` of the project, or a refusal that wrote nothing.
@@ -2208,15 +2283,16 @@ fn record_gate_keys(
     Ok(())
 }
 
-/// The tail every accepted transition shares: log the entry, move the phase,
-/// append the history, render the new `STATE.md`. The log is appended before
-/// the state file is replaced, so a failed append refuses the transition.
+/// The tail every accepted transition shares: compose the log entry, move the
+/// phase, append the history, render the new `STATE.md`. The log entry is
+/// returned, not written: it is appended only once the state file has been
+/// replaced (Fix round 1, DECISION C), so it never records a transition
+/// `STATE.md` does not hold.
 fn commit_transition(
-    flow_dir: &Path,
     mut state: JobState,
     entry: HistoryEntry,
     cleared_approvals: Vec<String>,
-) -> Result<(String, Value), CallToolResult> {
+) -> (String, Committed) {
     let leaving = entry.from.clone().unwrap_or_default();
     let mut lines = vec![format!("design_hash: `{}`", entry.design_hash)];
     if !entry.records.is_empty() {
@@ -2269,8 +2345,12 @@ fn commit_transition(
     });
     state.phase = entry.to.clone();
     state.history.push(entry);
-    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
-    Ok((render_state(&state), response))
+    let committed = Committed {
+        response,
+        gate_file: None,
+        log: (log_file_name(&state), log),
+    };
+    (render_state(&state), committed)
 }
 
 // ─── flow_gate (design D1, D3, D5, D11) ───────────────────────────────────────
@@ -2343,23 +2423,24 @@ async fn handle_flow_gate(args: &Value, _ctx: &ToolContext) -> anyhow::Result<Ca
         user_words,
     };
     Ok(tokio::task::spawn_blocking(move || {
-        transact_state(&project, |flow_dir, state_path, current| {
+        transact_then_record(&project, |flow_dir, state_path, current| {
             apply_gate(&project, flow_dir, state_path, current, &request)
         })
     })
     .await?)
 }
 
-/// Record the decision: every check first, then the gate file and the log,
-/// then the new `STATE.md`. The phase never moves — leaving the gate is
-/// `flow_advance`'s.
+/// Record the decision: every check first, then the new `STATE.md`; the gate
+/// file and the log entry are returned for the caller to write once it is
+/// committed (Fix round 1, DECISION C). The phase never moves — leaving the
+/// gate is `flow_advance`'s.
 fn apply_gate(
     project: &Path,
     flow_dir: &Path,
     state_path: &Path,
     current: &str,
     request: &GateRequest,
-) -> Result<(String, Value), CallToolResult> {
+) -> Result<(String, Committed), CallToolResult> {
     let mut state = load_job(state_path, current, &request.job_id)?;
     let gate_token = format!("gate:{}", request.gate);
     if state.phase != gate_token {
@@ -2381,17 +2462,17 @@ fn apply_gate(
         GateDecision::Reject => (None, state.gate_approvals.contains_key(&request.gate)),
     };
 
-    // Every check passed: side files first, STATE.md last (D2).
-    let gates_dir =
-        ensure_flow_subdir(flow_dir, &[RECORDS_DIR, GATES_DIR]).map_err(CallToolResult::error)?;
-    let gate_path = gates_dir.join(format!("{}.md", request.gate));
+    // Every check passed. The gate file and the log entry are composed here
+    // and written by the caller only after STATE.md commits (DECISION C).
+    let gate_file_name = format!("{}.md", request.gate);
+    let gate_path = flow_dir
+        .join(RECORDS_DIR)
+        .join(GATES_DIR)
+        .join(&gate_file_name);
     let history_package = current_visit(&state)
         .and_then(|visit| state.history.get(visit))
         .map(|entry| &entry.package_files);
     let file = gate_file_text(&state, request, &at, approval.as_ref(), history_package);
-    konnect_sexp::write_atomic(&gate_path, &file).map_err(|error| {
-        CallToolResult::error(format!("Could not write {} ({error})", gate_path.display()))
-    })?;
 
     let mut lines = Vec::new();
     if let Some(approval) = &approval {
@@ -2418,7 +2499,6 @@ fn apply_gate(
         &format!("gate {} {}", request.gate, request.decision.as_str()),
         &lines,
     );
-    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
 
     let response = json!({
         "job_id": state.job_id,
@@ -2445,7 +2525,12 @@ fn apply_gate(
             state.gate_approvals.remove(&request.gate);
         }
     }
-    Ok((render_state(&state), response))
+    let committed = Committed {
+        response,
+        gate_file: Some((gate_file_name, file)),
+        log: (log_file_name(&state), log),
+    };
+    Ok((render_state(&state), committed))
 }
 
 /// The approval rules, in order (D1, D3, D5, D11): the user's own words
@@ -4572,6 +4657,43 @@ mod advance_tests {
         job_id
     }
 
+    /// Fix round 1, DECISION C: the log entry follows the `STATE.md` commit.
+    /// With `log` a plain file the append fails, yet the transition stands —
+    /// the phase has moved, the record written before the commit (D4) is on
+    /// disk, and the failure is a `warning` on a success.
+    #[tokio::test]
+    async fn a_log_append_failure_after_state_commits_is_a_warning() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let log_dir = flow_path(&dir).join("log");
+        std::fs::remove_dir_all(&log_dir).unwrap();
+        std::fs::write(&log_dir, "not a directory\n").unwrap();
+
+        let moved = advance(
+            &dir,
+            &job_id,
+            "architecture",
+            &[("constraints.md", "# C\n")],
+        )
+        .await;
+        assert!(!moved.is_error, "{}", text(&moved));
+        assert_eq!(body(&moved)["phase"], "architecture");
+        let warning = body(&moved)["warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a warning field: {}", text(&moved)))
+            .to_string();
+        assert!(
+            warning.contains(&format!("flow{}log", std::path::MAIN_SEPARATOR)),
+            "the warning names the failed write: {warning}"
+        );
+        assert_eq!(state_on_disk(&dir).phase, "architecture");
+        assert_eq!(
+            std::fs::read_to_string(record_path(&dir, "constraints.md")).unwrap(),
+            "# C\n"
+        );
+        assert!(log_dir.is_file(), "the blocker is left as it was");
+    }
+
     #[tokio::test]
     async fn leaving_requirements_with_its_record_writes_it_and_moves_the_phase() {
         let dir = project();
@@ -4585,6 +4707,12 @@ mod advance_tests {
         .await;
         assert!(!result.is_error, "{}", text(&result));
         assert_eq!(body(&result)["phase"], "architecture");
+        assert_eq!(
+            body(&result).get("warning"),
+            Some(&Value::Null),
+            "every side file landed after the commit: {}",
+            text(&result)
+        );
 
         assert_eq!(
             std::fs::read_to_string(record_path(&dir, "constraints.md")).unwrap(),
@@ -5582,6 +5710,55 @@ mod gate_tests {
         assert!(file.contains("reject"), "{file}");
         let left = advance(&dir, &job_id, "schematic", &[]).await;
         assert_eq!(error_kind(&left), "stale_target");
+    }
+
+    /// Fix round 1, DECISION C (reviewer 11 minor 1): `STATE.md` is the one
+    /// commit point. `records/gates` is a plain file, so the gate file cannot
+    /// be written — the approval is still committed, the log still records
+    /// it, and the failure comes back as a `warning` on a success, never as
+    /// an error inviting a retry of a decision `STATE.md` already holds.
+    #[tokio::test]
+    async fn a_gate_file_write_failure_after_state_commits_is_a_warning() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        let blocker = flow_path(&dir).join("records").join("gates");
+        std::fs::write(&blocker, "not a directory\n").unwrap();
+
+        let approved = gate(&dir, &job_id, "architecture", "approve", "pode seguir").await;
+        assert!(!approved.is_error, "{}", text(&approved));
+        let warning = body(&approved)["warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a warning field: {}", text(&approved)))
+            .to_string();
+        assert!(
+            warning.contains(&format!("records{}gates", std::path::MAIN_SEPARATOR)),
+            "the warning names the failed write: {warning}"
+        );
+        assert_eq!(body(&approved)["decision"], "approve");
+
+        let status = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        let approval = &body(&status)["gate_approvals"]["architecture"];
+        assert_eq!(approval["status"], "current", "{}", text(&status));
+        assert_eq!(approval["approved_by"], "user", "{}", text(&status));
+        assert_eq!(approval["user_words"], "pode seguir");
+        assert!(blocker.is_file(), "the blocker is left as it was");
+        let log_dir = flow_path(&dir).join("log");
+        let log = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(
+            log.contains("gate architecture approve"),
+            "the log entry is still written after the commit: {log}"
+        );
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(
+            !left.is_error,
+            "the committed approval opens the gate: {}",
+            text(&left)
+        );
     }
 
     /// After a rewind to the gate's phase and the forward move back into the
