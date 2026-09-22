@@ -17,7 +17,7 @@
 #   3. install   identical binary -> skip; otherwise RENAME the old binary to
 #                <name>-<version>-<yyyyMMdd-HHmmss>[.exe].bak (never deleted),
 #                then copy the new build into place
-#   4. init      <target> init (Claude) and/or <target> init --client codex,
+#   4. init      <target> init (Claude) and/or <target> init --client <codex|omp>,
 #                then <target> status --client <c>
 #   5. retrace   point RETRACE_PYTHON at a Python that can `import retrace`
 #                (default: <repo>/.venv-retrace): setx on Windows shells; on
@@ -27,7 +27,7 @@
 # projects and never deletes a binary.
 #
 # Usage:
-#   scripts/install.sh [--client claude|codex|both] [--target PATH]
+#   scripts/install.sh [--client claude|codex|omp|both|all] [--target PATH]
 #                      [--claude-config PATH] [--skip-build | --rebuild]
 #                      [--skip-init] [--retrace-python PATH | --no-retrace]
 #                      [--dry-run] [--help]
@@ -37,7 +37,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-client="claude"
+client="claude,omp"
 target=""
 claude_config=""
 skip_build=0
@@ -49,7 +49,7 @@ dry_run=0
 
 usage() {
     cat <<'EOF'
-Usage: scripts/install.sh [--client claude|codex|both] [--target PATH]
+Usage: scripts/install.sh [--client claude|codex|omp|both|all] [--target PATH]
                           [--claude-config PATH] [--skip-build | --rebuild]
                           [--skip-init] [--retrace-python PATH | --no-retrace]
                           [--dry-run] [--help]
@@ -58,7 +58,10 @@ Builds Konnect from this checkout, installs it where Claude Code runs it,
 installs the bundled guidance (konnect init) and points RETRACE_PYTHON at the
 photo-intake Python.
 
-  --client          guidance to install: claude (default), codex or both
+  --client          guidance to install (default: claude,omp): claude, codex,
+                    omp (guidance for the OMP CLI under ~/.omp/agent/),
+                    both (= claude codex) or all (= claude codex omp); a comma-
+                    or space-separated list also works, e.g. --client claude,omp
   --target          install path of the konnect binary (default: the command
                     registered in the Claude config, else ~/.konnect/bin/konnect)
   --claude-config   Claude config to read the target from (default ~/.claude.json)
@@ -104,10 +107,30 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-case "$client" in
-    claude|codex|both) ;;
-    *) fail "--client must be claude, codex or both (got '$client').";;
-esac
+# ---- --client: one or more of claude, codex and omp, comma- and/or space-
+# separated. "both" keeps its legacy meaning (claude codex), "all" adds omp.
+# The result is a deduplicated list in a stable order.
+# Fills $clients; fail() must run in this shell, so no command substitution.
+normalize_clients() {
+    local want_claude=0 want_codex=0 want_omp=0 tok
+    clients=""
+    for tok in $(printf '%s' "$1" | tr ',' ' '); do
+        case "$tok" in
+            claude) want_claude=1;;
+            codex)  want_codex=1;;
+            omp)    want_omp=1;;
+            both)   want_claude=1; want_codex=1;;
+            all)    want_claude=1; want_codex=1; want_omp=1;;
+            *) fail "--client must be claude, codex, omp, both or all (got '$tok').";;
+        esac
+    done
+    [ "$want_claude" = 1 ] && clients="$clients claude"
+    [ "$want_codex" = 1 ] && clients="$clients codex"
+    [ "$want_omp" = 1 ] && clients="$clients omp"
+    clients="${clients# }"
+}
+normalize_clients "$client"
+[ -n "$clients" ] || fail "--client needs at least one of claude, codex, omp, both or all (got '$client')."
 [ "$skip_build" = 1 ] && [ "$rebuild" = 1 ] && fail "--skip-build and --rebuild contradict each other; pass one."
 [ "$no_retrace" = 1 ] && [ -n "$retrace_python" ] && fail "--retrace-python and --no-retrace contradict each other; pass one."
 
@@ -191,11 +214,11 @@ rollback_lines() {
             printf '%s\n' "[ ! -e $t ] && [ -e $(sh_quote "$backup") ] && mv -- $(sh_quote "$backup") $t || echo 'rollback stopped: already done, or the files were moved - check the folder'"
         fi
         for c in $init_clients; do
-            if [ "$c" = codex ]; then printf '%s\n' "$t init --client codex"; else printf '%s\n' "$t init"; fi
+            if [ "$c" = claude ]; then printf '%s\n' "$t init"; else printf '%s\n' "$t init --client $c"; fi
         done
     elif [ "$fresh_install" = 1 ]; then
         for c in $init_clients; do
-            if [ "$c" = codex ]; then printf '%s\n' "$t uninstall --client codex"; else printf '%s\n' "$t uninstall"; fi
+            if [ "$c" = claude ]; then printf '%s\n' "$t uninstall"; else printf '%s\n' "$t uninstall --client $c"; fi
         done
         printf '%s\n' "[ ! -e $(sh_quote "$parked") ] && [ -e $t ] && mv -- $t $(sh_quote "$parked") || echo 'undo stopped: already done, or the file was moved - check the folder'"
     fi
@@ -574,14 +597,31 @@ else
 fi
 
 # ---- 4. init + status ------------------------------------------------------
-clients="$client"
-[ "$client" != both ] || clients="claude codex"
+# Compares the counts konnect init reported against manifest.rs.
+# $1 = client name as konnect prints it, $2 = "<skills> <agents>" or empty.
+check_init_counts() {
+    local label="$1" counts="$2" got_skills got_agents
+    if [ -z "$counts" ]; then
+        warn "konnect init printed no 'Done: ... installed for $label.' line; counts not checked."
+    elif [ -z "$expected_skills" ]; then
+        warn "no manifest at $manifest; counts not checked."
+    else
+        got_skills="${counts% *}"
+        got_agents="${counts#* }"
+        if [ "$got_skills" != "$expected_skills" ] || [ "$got_agents" != "$expected_agents" ]; then
+            warn "init installed $got_skills skills / $got_agents agents for $label but manifest.rs lists $expected_skills / $expected_agents - is the installed build current?"
+        else
+            say "counts match manifest.rs for $label: $got_skills skills, $got_agents agents"
+        fi
+    fi
+}
 step "Guidance (konnect init)"
 if [ "$skip_init" = 1 ]; then
     say "skipped (--skip-init)"
 else
     for c in $clients; do
-        if [ "$c" = codex ]; then init_args=(init --client codex); else init_args=(init); fi
+        # claude is the binary's default client, so it takes no --client flag.
+        if [ "$c" = claude ]; then init_args=(init); else init_args=(init --client "$c"); fi
         init_clients="$init_clients $c"
         if [ "$dry_run" = 1 ]; then
             say "would run: \"$target_shown\" ${init_args[*]}"
@@ -595,22 +635,11 @@ else
         printf '%s\n' "$init_out" | sed 's/^/    /'
         [ "$rc" = 0 ] || fail "konnect ${init_args[*]} failed (exit $rc)."
         add_change "installed $c guidance ($target_shown ${init_args[*]})"
-        if [ "$c" = claude ]; then
-            counts="$(printf '%s\n' "$init_out" | sed -n 's/^Done: \([0-9]\{1,\}\) skills, \([0-9]\{1,\}\) agents, \([0-9]\{1,\}\) hooks installed for Claude\..*/\1 \2/p' | tail -1)"
-            if [ -z "$counts" ]; then
-                warn "konnect init printed no 'Done: ... installed for Claude.' line; counts not checked."
-            elif [ -z "$expected_skills" ]; then
-                warn "no manifest at $manifest; counts not checked."
-            else
-                got_skills="${counts% *}"
-                got_agents="${counts#* }"
-                if [ "$got_skills" != "$expected_skills" ] || [ "$got_agents" != "$expected_agents" ]; then
-                    warn "init installed $got_skills skills / $got_agents agents but manifest.rs lists $expected_skills / $expected_agents - is the installed build current?"
-                else
-                    say "counts match manifest.rs: $got_skills skills, $got_agents agents"
-                fi
-            fi
-        fi
+        # codex installs skills only, so there is nothing to compare for it.
+        case "$c" in
+            claude) check_init_counts Claude "$(printf '%s\n' "$init_out" | sed -n 's/^Done: \([0-9]\{1,\}\) skills, \([0-9]\{1,\}\) agents, \([0-9]\{1,\}\) hooks installed for Claude\..*/\1 \2/p' | tail -1)";;
+            omp)    check_init_counts OMP "$(printf '%s\n' "$init_out" | sed -n 's/^Done: \([0-9]\{1,\}\) skills, \([0-9]\{1,\}\) agents installed for OMP\..*/\1 \2/p' | tail -1)";;
+        esac
         say "running: \"$target_shown\" status --client $c"
         rc=0
         status_out="$("$target_u" status --client "$c")" || rc=$?
@@ -692,6 +721,9 @@ else say "backup:  (none)"
 fi
 [ -z "$target_note" ] || say "NOTE: $target_note"
 [ -z "$retrace_note" ] || say "NOTE: $retrace_note"
+case " $init_clients " in
+    *" omp "*) say "OMP guidance: ~/.omp/agent/skills (skills) and ~/.omp/agent/agents (agents)";;
+esac
 rollback="$(rollback_lines)"
 if [ -n "$rollback" ]; then
     if [ "$fresh_install" = 1 ]; then say "undo (this shell; safe to paste twice) - this was a fresh install, so undoing it moves the new file aside:"

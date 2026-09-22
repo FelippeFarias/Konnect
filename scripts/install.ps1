@@ -14,8 +14,9 @@
 #   3. install   identical binary -> skip; otherwise RENAME the old binary to
 #                <name>-<version>-<yyyyMMdd-HHmmss>.exe.bak (never deleted),
 #                then copy the new build into place
-#   4. init      <target> init (Claude) and/or <target> init --client codex,
-#                then <target> status --client <c>
+#   4. init      <target> init (Claude) and/or <target> init --client codex|omp,
+#                then <target> status --client <c>; the default installs the
+#                Claude and the OMP guidance
 #   5. retrace   point the user-level RETRACE_PYTHON at a Python that can
 #                `import retrace` (default: <repo>/.venv-retrace)
 #
@@ -23,7 +24,7 @@
 # projects and never deletes a binary.
 #
 # Usage:
-#   ./scripts/install.ps1 [-Client claude|codex|both] [-Target PATH] `
+#   ./scripts/install.ps1 [-Client claude,codex,omp|both|all] [-Target PATH] `
 #       [-ClaudeConfig PATH] [-SkipBuild | -Rebuild] [-SkipInit] `
 #       [-RetracePython PATH | -NoRetrace] [-DryRun] [-Help]
 #
@@ -33,7 +34,7 @@
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet("claude", "codex", "both")][string]$Client = "claude",
+    [string]$Client = "claude,omp",
     [string]$Target = "",
     [string]$ClaudeConfig = "",
     [switch]$SkipBuild,
@@ -51,7 +52,7 @@ $userHome = [Environment]::GetFolderPath("UserProfile")
 
 function Show-Usage {
     Write-Host @"
-Usage: scripts/install.ps1 [-Client claude|codex|both] [-Target PATH]
+Usage: scripts/install.ps1 [-Client claude,codex,omp|both|all] [-Target PATH]
                            [-ClaudeConfig PATH] [-SkipBuild | -Rebuild] [-SkipInit]
                            [-RetracePython PATH | -NoRetrace] [-DryRun] [-Help]
 
@@ -59,7 +60,10 @@ Builds Konnect from this checkout, installs it where Claude Code runs it,
 installs the bundled guidance (konnect init) and points RETRACE_PYTHON at the
 photo-intake Python.
 
-  -Client         guidance to install: claude (default), codex or both
+  -Client         guidance to install (default claude,omp): a comma- or
+                  space-separated list of claude, codex and omp, or both
+                  (claude + codex) or all (claude + codex + omp). omp writes
+                  the guidance the OMP CLI reads from ~/.omp/agent/.
   -Target         install path of konnect.exe (default: the command registered
                   in the Claude config, else ~/.konnect/bin/konnect.exe)
   -ClaudeConfig   Claude config to read the target from (default ~/.claude.json)
@@ -96,6 +100,13 @@ function Format-PsLiteral([string]$text) {
     return "'" + $text + "'"
 }
 
+# konnect names every client but Claude, which is the bare default: `init` and
+# `uninstall` for claude, `init --client <c>` for codex and omp.
+function Get-ClientArgs([string]$verb, [string]$client) {
+    if ($client -eq "claude") { return $verb }
+    return "$verb --client $client"
+}
+
 # Commands that undo what this run changed, in paste order. Each is safe to
 # paste twice: the file moves sit behind one Test-Path guard, so a second paste,
 # or a paste when there is nothing to undo, moves nothing and says why. A dry
@@ -113,13 +124,9 @@ function Get-RollbackLines {
         } else {
             $lines += "if ((Test-Path -LiteralPath $b) -and -not (Test-Path -LiteralPath $t)) { Move-Item -LiteralPath $b -Destination $t } else { $rollbackStopped }"
         }
-        foreach ($c in $initClients) {
-            if ($c -eq "codex") { $lines += "& $t init --client codex" } else { $lines += "& $t init" }
-        }
+        foreach ($c in $initClients) { $lines += "& $t $(Get-ClientArgs 'init' $c)" }
     } elseif ($freshInstall) {
-        foreach ($c in $initClients) {
-            if ($c -eq "codex") { $lines += "& $t uninstall --client codex" } else { $lines += "& $t uninstall" }
-        }
+        foreach ($c in $initClients) { $lines += "& $t $(Get-ClientArgs 'uninstall' $c)" }
         $lines += "if ((Test-Path -LiteralPath $t) -and -not (Test-Path -LiteralPath $p)) { Move-Item -LiteralPath $t -Destination $p } else { 'undo stopped: already done, or the file was moved - check the folder' }"
     }
     if ($retraceChanged) {
@@ -162,6 +169,27 @@ trap {
 if ($Help) { Show-Usage; exit 0 }
 if ($SkipBuild -and $Rebuild) { Fail "-SkipBuild and -Rebuild contradict each other; pass one." }
 if ($NoRetrace -and $RetracePython) { Fail "-RetracePython and -NoRetrace contradict each other; pass one." }
+
+# ---- the clients to install guidance for. Single values, the legacy "both"
+# (claude + codex), "all", or a comma- or space-separated list; matched without
+# regard to case and reduced to one stable order so the init, the rollback and
+# the summary all agree on it. Validated here, not with a ValidateSet on the
+# parameter, because a set cannot describe a list.
+$clientOrder = @("claude", "codex", "omp")
+$seenClients = @()
+foreach ($token in ($Client -split '[,\s]+')) {
+    if (-not $token) { continue }
+    switch ($token.ToLowerInvariant()) {
+        "claude" { $seenClients += "claude" }
+        "codex"  { $seenClients += "codex" }
+        "omp"    { $seenClients += "omp" }
+        "both"   { $seenClients += @("claude", "codex") }
+        "all"    { $seenClients += $clientOrder }
+        default  { Fail "-Client must be claude, codex, omp, both (claude + codex), all, or a comma-separated list of them (got '$token')." }
+    }
+}
+$clients = @($clientOrder | Where-Object { $seenClients -contains $_ })
+if ($clients.Count -eq 0) { Fail "-Client needs at least one of claude, codex, omp, both or all." }
 
 $verb = "Changed"
 if ($DryRun) { $verb = "Would change" }
@@ -564,15 +592,13 @@ if ($identical) {
 }
 
 # ---- 4. init + status ------------------------------------------------------
-$clients = @($Client)
-if ($Client -eq "both") { $clients = @("claude", "codex") }
 Step "Guidance (konnect init)"
 if ($SkipInit) {
     Say "skipped (-SkipInit)"
 } else {
     foreach ($c in $clients) {
         $initArgs = @("init")
-        if ($c -eq "codex") { $initArgs = @("init", "--client", "codex") }
+        if ($c -ne "claude") { $initArgs = @("init", "--client", $c) }
         [void]$initClients.Add($c)
         if ($DryRun) {
             Say "would run: `"$targetPath`" $($initArgs -join ' ')"
@@ -585,18 +611,24 @@ if ($SkipInit) {
         $initOut | ForEach-Object { Write-Host "    $_" }
         if ($initCode -ne 0) { Fail "konnect $($initArgs -join ' ') failed (exit $initCode)." }
         [void]$changes.Add("installed $c guidance ($targetPath $($initArgs -join ' '))")
-        if ($c -eq "claude") {
-            $done = $initOut | Where-Object { $_ -match '^Done: (\d+) skills, (\d+) agents, (\d+) hooks installed for Claude\.' } | Select-Object -Last 1
+        # claude and omp both report skills and agents (omp installs no hooks,
+        # so its line has no hooks group); codex installs skills only and gets
+        # no count check.
+        $countPattern = $null
+        if ($c -eq "claude") { $countPattern = '^Done: (\d+) skills, (\d+) agents, (\d+) hooks installed for Claude\.' }
+        elseif ($c -eq "omp") { $countPattern = '^Done: (\d+) skills, (\d+) agents installed for OMP\.' }
+        if ($countPattern) {
+            $done = $initOut | Where-Object { $_ -match $countPattern } | Select-Object -Last 1
             if (-not $done) {
-                Warn "konnect init printed no 'Done: ... installed for Claude.' line; counts not checked."
+                Warn "konnect init printed no 'Done: ... installed' line for $c; counts not checked."
             } else {
-                [void]($done -match '^Done: (\d+) skills, (\d+) agents, (\d+) hooks')
+                [void]($done -match $countPattern)
                 $gotSkills = [int]$Matches[1]
                 $gotAgents = [int]$Matches[2]
                 if ($null -eq $expectedSkills) {
                     Warn "no manifest at $manifestPath; counts not checked."
                 } elseif ($gotSkills -ne $expectedSkills -or $gotAgents -ne $expectedAgents) {
-                    Warn "init installed $gotSkills skills / $gotAgents agents but manifest.rs lists $expectedSkills / $expectedAgents - is the installed build current?"
+                    Warn "$c init installed $gotSkills skills / $gotAgents agents but manifest.rs lists $expectedSkills / $expectedAgents - is the installed build current?"
                 } else {
                     Say "counts match manifest.rs: $gotSkills skills, $gotAgents agents"
                 }
@@ -674,6 +706,9 @@ if ($DryRun) {
     foreach ($line in $rollbackLines) { Say "    $line" }
 } else {
     Say "rollback: nothing to roll back."
+}
+if ($initClients -contains "omp") {
+    Say "OMP guidance: $(Join-Path $userHome '.omp\agent\skills') and $(Join-Path $userHome '.omp\agent\agents') - start a new omp session to pick it up."
 }
 if ($retraceChanged) {
     Say "RETRACE_PYTHON only reaches programs started after it is set: close Claude Code completely"
