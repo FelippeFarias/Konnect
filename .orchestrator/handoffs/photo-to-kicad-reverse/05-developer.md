@@ -1,0 +1,37 @@
+---
+change: photo-to-kicad-reverse
+task: "round A1 tasks 1.1-1.5, 2.1-2.5"
+agent: developer
+verdict: DONE
+failing_layer: n/a
+---
+
+## Result
+
+1. All ten tasks implemented in the worktree and committed on `orc/photo-to-kicad-reverse` (`9585822` config, `c3bb26f` module). `cargo test -p konnect-core` is green (1334 passed, 0 failed), `cargo fmt --check` exits 0, `cargo clippy -p konnect-core --all-targets` produces no warnings.
+2. `config.rs`: `photo_intake` defaults added (1.1) and `pub(crate) async fn effective_config(project_dir: Option<&Path>)` added (1.5). **Deviation:** it merges `default_user_config()` *under* the user's file before the project layer — `read_config` returns a config file whole, so a `config.json` written before this change would otherwise yield no `photo_intake` key at all. `handle_get_effective_config` is untouched.
+3. `photo_intake.rs` (new, 1.2-1.4, 2.1-2.4): typed `analysis.json` with the mandatory `empty_string_as_none`; `run_retrace` with `HOME`+`USERPROFILE` redirection, `kill_on_drop(true)`, typed `RetraceRunError`, local diagnostics helper; `check_retrace` and `scan_pcb_photo` declared with the 4-argument `tool!` and no `with_board_access` call (precedent: `config.rs:195` for `tool!`, `integration.rs:1737/1795` for `CallToolResult::json`/`error`, `cli.rs:25` for the diagnostics shape, `cli.rs:357` for "zero exit is necessary but not sufficient").
+4. Fixture (2.3) copied byte-for-byte (`cmp` clean, sha256 `84b7dfb1…`); `image.workspace = true` added to `[dev-dependencies]` with the synthetic-board PNG helper (2.5). `tools()` returns the two tools it defines and is unit-tested; the registry entry is deliberately absent (task 4.1 is A2).
+5. **Both load-bearing tests were mutation-checked, not assumed.** Turning `empty_string_as_none` into `Ok(raw)` fails `absent_strings_deserialize_to_none_not_some_empty`; dropping `.env("USERPROFILE", …)` fails `run_retrace_redirects_home_and_userprofile_away_from_the_real_home` (and put a marker file in the real home, which is exactly what it exists to catch). Both were restored.
+
+## Evidence
+
+1. `cargo test -p konnect-core photo_intake::` → `test result: ok. 23 passed; 0 failed; 1 ignored; 0 measured; 1326 filtered out; finished in 1.04s`. Covers the three probe scenarios (`check_retrace_reports_a_full_install_with_both_extras`, `…absence_as_a_fact_not_an_error`, `…a_base_install_without_ml_extras`), the fixture round-trip (`captured_analysis_round_trips_through_the_typed_structs`), empty-string normalization (`absent_strings_deserialize_to_none_not_some_empty`), the scoped-HOME non-pollution (`run_retrace_redirects_home_and_userprofile_away_from_the_real_home`), the D2 schema (`scan_schema_requires_image_and_project_and_offers_no_output_dir`), D11 (`used_fallback_prefers_stderr_and_falls_back_to_the_extras_probe`) and D12 (`scan_timeout_prefers_the_argument_then_config_and_clamps_both`).
+2. `cargo test -p konnect-core config::` → `test result: ok. 12 passed; 0 failed`. `grep -n "pub(crate) async fn effective_config" crates/konnect-core/src/tools/config.rs` → `156:pub(crate) async fn effective_config(project_dir: Option<&Path>) -> serde_json::Value {`.
+3. Live path (2.4), `RETRACE_PYTHON=…/.venv-retrace/Scripts/python.exe cargo test -p konnect-core photo_intake::live -- --ignored` → `test result: ok. 1 passed; 0 failed; … finished in 0.59s`. A real `retrace 0.3.0` scan of the synthetic board returned components, `used_fallback == yolo_warning_seen || !extras_detection`, and an `analysis.json` under the temp project.
+4. Mutation proofs: `Ok(raw)` → `absent_strings_deserialize_to_none_not_some_empty … FAILED` ("assertion `left == right` failed: C0000 marking"); no `USERPROFILE` env → `run_retrace_redirects_home_and_userprofile_away_from_the_real_home … FAILED` ("the subprocess wrote somewhere other than the scoped home").
+5. `cargo test -p konnect-core` → `1334 passed; 0 failed; 16 ignored` + 4 + 12 + 1-ignored across the other targets. `cargo fmt --check` clean, `cargo clippy -p konnect-core --all-targets` clean. `git diff --name-only ea74faf` → `Cargo.lock`, `crates/konnect-core/Cargo.toml`, `…/src/tools/config.rs`, `…/src/tools/mod.rs`, `…/src/tools/photo_intake.rs`, `…/tests/fixtures/photo_intake/analysis.json`.
+
+## For the next agent
+
+1. **Names A2 needs.** `photo_intake::tools()` (currently 2 tools — add the 3 review-map ones and set `tool_count: 5`). Reusable: `run_retrace(program: &Path, args: &[String], scoped_home: &Path, timeout) -> Result<Output, RetraceRunError>`, `RetraceRunError::{Spawn, Timeout}`, `scoped_home_dir()`, `retrace_diagnostics(&Output)`, `subprocess_arg(&Path)` (strips the Windows `\\?\` verbatim prefix — every path in a response goes through it), `canonical_existing_dir/file(raw, field)`, `prepare_map_dir(project_dir, map_id)` (creates, canonicalizes and `starts_with`-checks; reuse it for save/approve), `RetraceCapability`/`RetraceExtras`, `resolve_retrace(arg, configured, scoped_home)`, and the typed `RetraceAnalysis`/`RetraceComponent`/`RetraceTrace`/`RetracePatternMatch`. Test helpers: `test_support::{test_ctx, response_json, response_text}` and `synthetic_board::write_synthetic_board_png`.
+2. **`effective_config` returns the merged `serde_json::Value`** (defaults ⊕ user file ⊕ project file), so read keys as `config["photo_intake"]["retrace_timeout_seconds"].as_u64()`. Pass `Some(&canonical project_dir)` when you have one; `check_retrace` passes `ctx.config.project_dir` because D2 gives it no `project_dir` argument.
+3. **Two deviations from the design, both deliberate.** (a) The version probe also prints `sys.executable` and *that* is the path reported and later run with `-m retrace`, so the interpreter that proved importable is the one that scans (D15's probe already imported `sys` unused). (b) `effective_config` layers the built-in defaults under the user file (see Result 2). Nothing else departs from D1-D4/D11-D15.
+4. **`approval_valid` (orchestrator decision) is easy here:** `load_photo_review_map` should read the file, compute `review_map_content_hash(&map)` (3.6) and emit `approval_valid = map["approved"] == true && hash == map["content_hash_at_approval"]` as a server-side field. Nothing in this round caches or memoizes a map, so there is no stale copy to reconcile.
+5. **Spawn a sleeping/blocking child directly, never through `cmd /C` or `sh -c`.** `kill_on_drop` kills the child, not its grandchild, and the surviving grandchild holds the inherited stdout pipe — which made a 1-second timeout test hold the whole test binary for 29 s at shutdown. Production is safe (`<python> -m retrace` is a direct child); it only bites in tests.
+
+## Deferred findings
+
+1. `check_retrace`'s discovery falls through to PATH when an explicit `python_path` fails to import `retrace` (D15 as written: "first candidate that passes wins"). That is reported honestly via `python_path`/`candidates_tried`, but it means a typo'd argument silently answers about a different interpreter. Worth revisiting in A2 if @architect wants an explicit argument to short-circuit.
+2. The `detection` extra is probed as `ultralytics` and `ocr` as `easyocr`, inferred from retrace's own fallback warnings; no machine here has either installed, so the `extras: true` branch is still unexercised (same gap the architect deferred).
+3. `Cargo.lock` is the one touched file outside the declared write set — a single mechanical `+ "image"` line under the `konnect-core` dependency list, no version changes. Leaving it out would make every build rewrite it.

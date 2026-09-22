@@ -1,0 +1,2 @@
+DECISION: removed 1 stale lock socket(s) under C:\Users\felip\.orc\locks\1965a67de8ec — WHY: two independent scans found them unconnectable, so their owners are gone and the kernel refuses connections to them; sweeping happens only while HOLDING the lock — ROLLBACK: none needed, a unique dead socket name can never come back to life
+DECISION: merged orc/install-scripts@6a2f7d2b into main — WHY: verifiers DONE and the battery passed on that exact commit — ROLLBACK: `git reset --hard <sha-before>` on the trunk

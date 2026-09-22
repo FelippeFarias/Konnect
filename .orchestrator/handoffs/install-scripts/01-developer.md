@@ -1,0 +1,36 @@
+---
+change: install-scripts
+task: write scripts/install.ps1 + scripts/install.sh (local-build installer) in one commit
+agent: developer
+verdict: DONE
+failing_layer: null
+---
+
+## Result
+
+1. Commit `897c4a0` on `orc/install-scripts` (worktree `C:\Users\felip\.orc\worktrees\konnect-3b7e2022\install-scripts`, base `9a0f1ce`). It adds `scripts/install.ps1` (100644) and `scripts/install.sh` (100755). Both are ASCII-only with LF endings. Not pushed.
+2. The two scripts run the same steps: build decision (missing / older than newest `git ls-files crates Cargo.lock` / `-Rebuild`; PROTOC from env or PATH; CMake from PATH or the VS `*\*\...\CMake\bin` glob, prepended only for the build); target discovery (`-Target` > top-level > single distinct project entry > default + printed `claude mcp add` note; a wrapper or a command with arguments stops the run); identical-hash skip or rename to `<name>-<ver>-<stamp>.exe.bak` then copy, renaming back if the copy fails; `init` / `init --client codex` + `status`, with a warn-only check of the `Done:` counts against the counts derived from manifest.rs; RETRACE_PYTHON; a summary with rollback commands and the restart-Claude line.
+3. How I read `-Client codex`: it runs ONLY `init --client codex` (claude runs `init`, both runs both). The brief's "run `<target> init` (and codex for codex/both)" could also mean claude init always runs.
+4. Additions beyond the brief, all small: PS 5.1 falls back to `JavaScriptSerializer` when `ConvertFrom-Json` rejects project keys that differ only in case; `--version` and `import retrace` probes run with stdin closed and a 15 s timeout; in a dry run with a build pending, the hash compare is skipped ("the new build does not exist yet") because the old build's hash proves nothing; build prerequisites that are missing become warnings under `-DryRun` and failures otherwise; contradictory flags (`-SkipBuild -Rebuild`, `-RetracePython -NoRetrace`) exit 1.
+
+## Evidence
+
+1. Parse and syntax: `[System.Management.Automation.Language.Parser]::ParseFile` gives `ps1 parse errors (PS 5.1.26100.9444): 0`, and `bash -n install.sh: OK`. Both files have `non-ascii 0 CR 0`. `grep` finds no `&&`/`||`/`??`/`?.` in the ps1. shellcheck is NOT installed here, so it did not run.
+2. SC1, dry run against the real `~/.claude.json`, both scripts exit 0: `from top-level mcpServers.konnect.command in C:\Users\felip\.claude.json -> C:\Users\felip\.konnect\bin\konnect.exe`; `build needed: no build at …\install-scripts\target\release\konnect.exe`; `PROTOC = C:/Users/felip/tools/protoc/bin/protoc.exe`; `CMake = C:\Program Files (x86)\…\CMake\bin (prepended to PATH for the build only)`; `would run: cargo build --release -p konnect`; `existing binary: version 0.12.0, sha256 dea8824b…dec5`; `would rename … -> konnect-0.12.0-20260922-094324.exe.bak`; `would run: "…konnect.exe" init` plus `status --client claude`; `retrace 0.3.0 importable …` / `would set RETRACE_PYTHON (user): (unset) -> …\.venv-retrace\Scripts\python.exe` (sh: `would run: setx …`). Before and after every run: `exe sha256: dea8824b1357f6587fa98792d8246c6516cbd5a12f30ecedb52f31b7a447dec5`, `exe mtime: 2026-09-21T18:30:27.9145510Z`, `bin dir: konnect-0.12.0-2026-09-17.exe.bak, konnect.exe, schematic-viewer.exe`, `RETRACE_PYTHON(user):` (empty), all identical.
+3. SC2, discovery fixtures run as ps1 + sh[jq] + sh[python]; all three give the same result: top → `…\top\konnect.exe` (a project entry also present, top wins); one-project (the same path in two entries with different case and separators, plus an entry without konnect) → `…\proj\konnect.exe`; two-projects → `ERROR: … registers konnect at several paths:` listing both with their project, `Pass -Target`, exit 1; none → default `C:\Users\felip\.konnect\bin\konnect.exe` plus `claude mcp add --scope user konnect -- "…"`, exit 0; wrapper `cmd /c C:\tools\konnect.exe` → `ERROR … not a path to a konnect executable … Pass -Target`; a project entry with args `C:\tools\konnect.exe --stdio` → the same refusal. Extra cases: casedup (PS 5.1 `ConvertFrom-Json REJECTS casedup`) → the fallback parser finds `…\proj\konnect.exe`; sh with neither jq nor python on PATH → `WARNING: neither jq nor python …` and the default.
+4. SC2, temp `-Target` with `-SkipBuild -SkipInit -NoRetrace`, per script: run 1 `copied … -> …\inst-*\konnect.exe`; run 2 `identical binary already at … - skipping backup and copy` (dir still just `konnect.exe`); run 3 with a dummy file (sha `b3794007…`) → `existing binary: version unknown`, `renamed … -> konnect-unknown-20260922-094855.exe.bak`, `copied`. The dir then holds `.bak` + `konnect.exe`, target sha = build sha `d0720347…`, and the backup still contains `not-a-real-binary`. Build decision in a temp git repo: `up to date`; after touching manifest.rs, `build needed: build (…09:49:03) is older than crates/konnect/src/manifest.rs (…09:49:06)`; with `-SkipBuild`, `WARNING: -SkipBuild: installing a stale build`. The `Done:` regexes in both languages parse the install.rs:316 format as `12 11`, and the manifest-derived `12 11` matches an independent count of `name:`/`filename:` in the SKILLS/AGENTS arrays.
+5. SC3: `git diff --name-only 9a0f1ce..HEAD` gives `scripts/install.ps1`, `scripts/install.sh`; `git rev-list --count 9a0f1ce..HEAD` gives `1`; worktree clean. Temp dirs removed.
+
+## For the next agent
+
+1. Re-running safely: build a temp fake repo (`<tmp>/repo/scripts/` holding copies of both scripts, `<tmp>/repo/target/release/konnect.exe` copied from the main checkout's build, `<tmp>/repo/crates/konnect/src/manifest.rs`). Point `-ClaudeConfig`/`--claude-config` at JSON fixtures and `-Target` at `<tmp>/...`, always with `-SkipInit -NoRetrace`, and add `-DryRun` for discovery. Snapshot the real exe's hash and mtime before and after.
+2. Never run without `-SkipInit` on this machine: init writes the real `~/.claude`, and konnect resolves home through the OS, so `$HOME`/`USERPROFILE` overrides do NOT isolate it. The init/status/`Done:`-count path and the "copy failed → rename back" path are therefore verified only by reading the code and checking the regexes, not end to end.
+3. Write fixtures that contain Windows paths with the file tool (for example Python using `chr(92)`). A backslash inside a Bash-tool heredoc loses one level.
+4. The sh's "current user value" on Windows comes from `reg.exe query HKCU\Environment` under `MSYS2_ARG_CONV_EXCL='*'`; on Linux/macOS it reads `$RETRACE_PYTHON` and prints only the `export` line.
+5. For the user's real run: `RETRACE_PYTHON` is unset at every scope today, so the first real run WILL set it (user scope) and rename the 0.12.0 exe to a `.bak`.
+
+## Deferred findings
+
+1. README/DEV should document `scripts/install.ps1` / `install.sh` (already queued separately by the orchestrator).
+2. Low: `.gitattributes` has only `* text=auto`, and this machine has `core.autocrlf=true`, so checkouts get `.sh` files with CRLF (`packaging/build-pcm.sh` already does). Git for Windows' bash tolerates that (a CRLF copy of install.sh completed a full dry run), but Cygwin bash would not. `*.sh text eol=lf` would close it.
+3. shellcheck is not installed on this machine, so the sh has only had `bash -n` and the scenario runs, no lint.

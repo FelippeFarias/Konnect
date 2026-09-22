@@ -1,0 +1,18 @@
+{
+  "session": "orc-konnect-session-8c29",
+  "pid": 13892,
+  "mode": "worktree",
+  "change": "install-scripts",
+  "worktree": "C:\\Users\\felip\\.orc\\worktrees\\konnect-3b7e2022\\install-scripts",
+  "branch": "orc/install-scripts",
+  "phase": "FAST",
+  "fileset": [
+    "scripts/install.ps1",
+    "scripts/install.sh"
+  ],
+  "started": "2026-09-22T01:52:56.598Z",
+  "last_heartbeat": "2026-09-22T12:36:36.955Z",
+  "runtime": "claude",
+  "merge_waiting_since": null,
+  "merge_sha": "9a0f1ced35679982449270b6b03815dcc310655d"
+}

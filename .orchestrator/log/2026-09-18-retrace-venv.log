@@ -1,0 +1,60 @@
+Requirement already satisfied: pip in c:\users\felip\documents\ffs-hardware-eng\konnect\.venv-retrace\lib\site-packages (25.0.1)
+Collecting pip
+  Downloading pip-26.2.1-py3-none-any.whl.metadata (4.6 kB)
+Downloading pip-26.2.1-py3-none-any.whl (1.8 MB)
+   ---------------------------------------- 1.8/1.8 MB 3.0 MB/s eta 0:00:00
+Installing collected packages: pip
+  Attempting uninstall: pip
+    Found existing installation: pip 25.0.1
+    Uninstalling pip-25.0.1:
+      Successfully uninstalled pip-25.0.1
+Successfully installed pip-26.2.1
+Collecting git+https://github.com/ericrihm/retrace.git
+  Cloning https://github.com/ericrihm/retrace.git to C:\Users\felip\AppData\Local\Temp\pip-req-build-jz9e4jjx
+  Running command git clone --filter=blob:none --quiet https://github.com/ericrihm/retrace.git 'C:\Users\felip\AppData\Local\Temp\pip-req-build-jz9e4jjx'
+  Resolved https://github.com/ericrihm/retrace.git to commit c1a394d0d029138b312a62d7466dbfe109ca185b
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Collecting click>=8.1 (from retrace-pcb==0.3.0)
+  Downloading click-8.5.0-py3-none-any.whl.metadata (2.6 kB)
+Collecting numpy>=1.24 (from retrace-pcb==0.3.0)
+  Downloading numpy-2.5.3-cp312-cp312-win_amd64.whl.metadata (6.6 kB)
+Collecting opencv-python>=4.8 (from retrace-pcb==0.3.0)
+  Downloading opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl.metadata (20 kB)
+Collecting Pillow>=10.0 (from retrace-pcb==0.3.0)
+  Downloading pillow-12.3.0-cp312-cp312-win_amd64.whl.metadata (9.3 kB)
+Collecting requests>=2.31 (from retrace-pcb==0.3.0)
+  Downloading requests-2.34.2-py3-none-any.whl.metadata (4.8 kB)
+Collecting charset_normalizer<4,>=2 (from requests>=2.31->retrace-pcb==0.3.0)
+  Downloading charset_normalizer-3.5.1-cp312-cp312-win_amd64.whl.metadata (46 kB)
+Collecting idna<4,>=2.5 (from requests>=2.31->retrace-pcb==0.3.0)
+  Downloading idna-3.20-py3-none-any.whl.metadata (7.2 kB)
+Collecting urllib3<3,>=1.26 (from requests>=2.31->retrace-pcb==0.3.0)
+  Downloading urllib3-2.8.0-py3-none-any.whl.metadata (7.4 kB)
+Collecting certifi>=2023.5.7 (from requests>=2.31->retrace-pcb==0.3.0)
+  Downloading certifi-2026.7.22-py3-none-any.whl.metadata (2.5 kB)
+Downloading click-8.5.0-py3-none-any.whl (125 kB)
+Downloading numpy-2.5.3-cp312-cp312-win_amd64.whl (12.6 MB)
+   ---------------------------------------- 12.6/12.6 MB 10.8 MB/s  0:00:01
+Downloading opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl (44.0 MB)
+   ---------------------------------------- 44.0/44.0 MB 17.0 MB/s  0:00:02
+Downloading pillow-12.3.0-cp312-cp312-win_amd64.whl (7.2 MB)
+   ---------------------------------------- 7.2/7.2 MB 10.1 MB/s  0:00:00
+Downloading requests-2.34.2-py3-none-any.whl (73 kB)
+Downloading charset_normalizer-3.5.1-cp312-cp312-win_amd64.whl (200 kB)
+Downloading idna-3.20-py3-none-any.whl (69 kB)
+Downloading urllib3-2.8.0-py3-none-any.whl (135 kB)
+Downloading certifi-2026.7.22-py3-none-any.whl (136 kB)
+Building wheels for collected packages: retrace-pcb
+  Building wheel for retrace-pcb (pyproject.toml): started
+  Building wheel for retrace-pcb (pyproject.toml): finished with status 'done'
+  Created wheel for retrace-pcb: filename=retrace_pcb-0.3.0-py3-none-any.whl size=183574 sha256=c0f03af2a29777c72e523e4f5aae9477890e48474ce6379994422d317c30ee0b
+  Stored in directory: C:\Users\felip\AppData\Local\Temp\pip-ephem-wheel-cache-819hgr2w\wheels\47\6b\4a\eb44d1d075b48f1ad76ceba90c2733eda87c92f26f43370fcc
+Successfully built retrace-pcb
+Installing collected packages: urllib3, Pillow, numpy, idna, click, charset_normalizer, certifi, requests, opencv-python, retrace-pcb
+
+Successfully installed Pillow-12.3.0 certifi-2026.7.22 charset_normalizer-3.5.1 click-8.5.0 idna-3.20 numpy-2.5.3 opencv-python-5.0.0.93 requests-2.34.2 retrace-pcb-0.3.0 urllib3-2.8.0
