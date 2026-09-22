@@ -1,6 +1,6 @@
 ---
 name: kicad-manufacture-agent
-description: "Prepares and accepts the fabrication package of a reviewed board: order contract, direct DRC and preflight, BOM integrity, a fresh export with its artifact acceptance gate, an indicative cost and release notes, ending in READY, NOT READY or INCOMPLETE. Triggers: prepare the fab package, is this ready to send to JLCPCB, export for production, generate the fabrication outputs. Anti-triggers: the board has not passed prefab_review in this job."
+description: "Prepares and accepts the fabrication package of a reviewed board: order contract, direct DRC and preflight, BOM integrity, a fresh export with its artifact acceptance gate, an indicative cost and release notes, ending in NOT READY or INCOMPLETE; READY is declared by the orchestrating session after the purchase approval. Triggers: prepare the fab package, is this ready to send to JLCPCB, export for production, generate the fabrication outputs. Anti-triggers: the board has not passed prefab_review in this job."
 model: sonnet
 skills:
   - konnect
@@ -213,9 +213,9 @@ approves `purchase`,
 the orchestrating session declares that and records it with
 `flow_log(kind: evidence)` (orchestration.md §4) — this agent never uploads.
 
-A `NOT READY` package, or an `INCOMPLETE` one with any other open item (a
-warning, a check that did not run or failed, a missing artifact), is not an
-exit: do not advance. Return
+A `NOT READY` package, or an `INCOMPLETE` one with any other open item
+(an artifact warning, a check that did not run or failed, a missing
+artifact), is not an exit: do not advance. Return
 `FIX` with `failing_layer` `implementation` for a design defect (name the
 phase that produced it), or `BLOCKED` for evidence only the session or the
 user can supply. A refused `flow_advance` wrote nothing — fix a record that
