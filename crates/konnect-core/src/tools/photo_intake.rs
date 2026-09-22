@@ -1156,7 +1156,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-fn now_rfc3339_utc() -> String {
+pub(crate) fn now_rfc3339_utc() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
