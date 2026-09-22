@@ -43,6 +43,18 @@ pub const SKILLS: &[SkillManifest] = &[
                 "operating-notes.md",
                 include_str!("../assets/skills/konnect/references/operating-notes.md"),
             ),
+            (
+                "orchestration.md",
+                include_str!("../assets/skills/konnect/references/orchestration.md"),
+            ),
+            (
+                "brief-template.md",
+                include_str!("../assets/skills/konnect/references/brief-template.md"),
+            ),
+            (
+                "handoff-template.md",
+                include_str!("../assets/skills/konnect/references/handoff-template.md"),
+            ),
         ],
     },
     SkillManifest {
@@ -181,6 +193,29 @@ pub const SKILLS: &[SkillManifest] = &[
         content: include_str!("../assets/skills/kicad-photo-to-board/SKILL.md"),
         references: &[],
     },
+    SkillManifest {
+        name: "kicad-architecture",
+        content: include_str!("../assets/skills/kicad-architecture/SKILL.md"),
+        references: &[
+            (
+                "constraint-record-schema.md",
+                include_str!(
+                    "../assets/skills/kicad-architecture/references/constraint-record-schema.md"
+                ),
+            ),
+            (
+                "architecture-record-schema.md",
+                include_str!(
+                    "../assets/skills/kicad-architecture/references/architecture-record-schema.md"
+                ),
+            ),
+        ],
+    },
+    SkillManifest {
+        name: "kicad-curator",
+        content: include_str!("../assets/skills/kicad-curator/SKILL.md"),
+        references: &[],
+    },
 ];
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
@@ -205,6 +240,30 @@ pub const AGENTS: &[AgentManifest] = &[
     AgentManifest {
         filename: "pcb-design-reconstruction-agent.md",
         content: include_str!("../assets/agents/pcb-design-reconstruction-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-requirements-agent.md",
+        content: include_str!("../assets/agents/kicad-requirements-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-architecture-agent.md",
+        content: include_str!("../assets/agents/kicad-architecture-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-sourcing-agent.md",
+        content: include_str!("../assets/agents/kicad-sourcing-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-library-agent.md",
+        content: include_str!("../assets/agents/kicad-library-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-manufacture-agent.md",
+        content: include_str!("../assets/agents/kicad-manufacture-agent.md"),
+    },
+    AgentManifest {
+        filename: "kicad-curator-agent.md",
+        content: include_str!("../assets/agents/kicad-curator-agent.md"),
     },
 ];
 

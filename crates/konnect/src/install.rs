@@ -751,6 +751,133 @@ mod tests {
         }
     }
 
+    /// Manifest files that are not copies of a file under `assets/`:
+    /// `(skill, reference filename, source relative to the crate directory)`.
+    /// The reliability contract is installed from its canonical copy in
+    /// `docs/`, so the walk below cannot find it and must be told.
+    const GENERATED_REFERENCES: &[(&str, &str, &str)] = &[(
+        "konnect",
+        "reliability-contract.md",
+        "../../docs/RELIABILITY_CONTRACT.md",
+    )];
+
+    /// Every skill, reference and agent under `assets/` ships, embedded from
+    /// the file it names (design D10 item 5).
+    ///
+    /// The asset guards in `tests/asset_references.rs` read `assets/` directly,
+    /// so a file left out of `SKILLS`/`AGENTS` passes every one of them and is
+    /// never installed — an agent the router names that no client receives.
+    /// The expected set is derived by walking `assets/`, never written by hand,
+    /// so a new asset cannot be forgotten in two places at once.
+    #[test]
+    fn manifest_ships_every_asset() {
+        use std::collections::BTreeMap;
+
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let assets = crate_dir.join("assets");
+
+        // What `assets/` holds, keyed by the install-relative path.
+        let mut on_disk: BTreeMap<String, String> = BTreeMap::new();
+        let mut stray = Vec::new();
+        let mut stack = vec![assets.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let key = path
+                    .strip_prefix(&assets)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let parts: Vec<&str> = key.split('/').collect();
+                let shippable = match parts.as_slice() {
+                    ["skills", _, "SKILL.md"] => true,
+                    ["skills", _, "references", file] | ["agents", file] => file.ends_with(".md"),
+                    _ => false,
+                };
+                if shippable {
+                    on_disk.insert(key, fs::read_to_string(&path).unwrap());
+                } else {
+                    stray.push(key);
+                }
+            }
+        }
+        for (skill, filename, source) in GENERATED_REFERENCES {
+            let key = format!("skills/{skill}/references/{filename}");
+            assert!(
+                !on_disk.contains_key(&key),
+                "{key} is generated from {source}; a copy under assets/ would ship stale"
+            );
+            on_disk.insert(key, fs::read_to_string(crate_dir.join(source)).unwrap());
+        }
+
+        // What the manifest ships, keyed the same way.
+        let mut shipped: BTreeMap<String, &str> = BTreeMap::new();
+        let mut duplicates = Vec::new();
+        let entries = SKILLS
+            .iter()
+            .flat_map(|skill| {
+                std::iter::once((format!("skills/{}/SKILL.md", skill.name), skill.content)).chain(
+                    skill.references.iter().map(|(filename, content)| {
+                        (
+                            format!("skills/{}/references/{filename}", skill.name),
+                            *content,
+                        )
+                    }),
+                )
+            })
+            .chain(
+                AGENTS
+                    .iter()
+                    .map(|agent| (format!("agents/{}", agent.filename), agent.content)),
+            );
+        for (key, content) in entries {
+            if shipped.insert(key.clone(), content).is_some() {
+                duplicates.push(key);
+            }
+        }
+
+        let unshipped: Vec<&String> = on_disk
+            .keys()
+            .filter(|key| !shipped.contains_key(*key))
+            .collect();
+        let phantom: Vec<&String> = shipped
+            .keys()
+            .filter(|key| !on_disk.contains_key(*key))
+            .collect();
+        let mismatched: Vec<&String> = on_disk
+            .iter()
+            .filter(|(key, content)| shipped.get(*key).is_some_and(|s| s != content))
+            .map(|(key, _)| key)
+            .collect();
+
+        assert!(
+            stray.is_empty(),
+            "assets/ holds files the manifest has no place for: {stray:?}"
+        );
+        assert!(
+            duplicates.is_empty(),
+            "the manifest ships these paths twice: {duplicates:?}"
+        );
+        assert!(
+            unshipped.is_empty(),
+            "these assets are never installed; add them to SKILLS/AGENTS in manifest.rs: \
+             {unshipped:?}"
+        );
+        assert!(
+            phantom.is_empty(),
+            "the manifest ships paths with no file under assets/: {phantom:?}"
+        );
+        assert!(
+            mismatched.is_empty(),
+            "these manifest entries embed a different file than the path they install to: \
+             {mismatched:?}"
+        );
+    }
+
     #[test]
     fn hook_matchers_are_derived_from_registered_board_contracts() {
         let registered = konnect_core::router::registry::ALL_TOOLSETS
