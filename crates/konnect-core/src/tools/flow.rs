@@ -1316,17 +1316,20 @@ fn log_entry(at: &str, title: &str, lines: &[String]) -> String {
     entry
 }
 
-/// Append one entry to the job's log with a single `write_all` on an
-/// append-mode handle (the observer's JSONL pattern), creating `log/` on
-/// demand.
+/// Append one entry to the job's log, creating `log/` on demand.
 fn append_log(flow_dir: &Path, state: &JobState, entry: &str) -> Result<(), String> {
-    use std::io::Write as _;
     let dir = ensure_flow_subdir(flow_dir, &[LOG_DIR])?;
-    let path = dir.join(log_file_name(state));
+    append_file(&dir.join(log_file_name(state)), entry)
+}
+
+/// Append one entry with a single `write_all` on an append-mode handle (the
+/// observer's JSONL pattern).
+fn append_file(path: &Path, entry: &str) -> Result<(), String> {
+    use std::io::Write as _;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .and_then(|mut file| file.write_all(entry.as_bytes()))
         .map_err(|error| format!("Could not append to {} ({error})", path.display()))
 }
@@ -2585,6 +2588,383 @@ fn blockquote(text: &str) -> String {
         .join("\n")
 }
 
+// ─── flow_log and flow_defer (design D1, D7) ──────────────────────────────────
+
+/// `flow_log`'s kinds: `decision`/`evidence` → the job log; `lesson` →
+/// `memory/<role>.md` or the candidates queue by `scope`; `handoff` → a new
+/// numbered file. Each destination has exactly this one writer.
+const LOG_KINDS: [&str; 4] = ["decision", "evidence", "lesson", "handoff"];
+
+/// A lesson's `scope` (D7 triage): `project` stays in `memory/<role>.md`,
+/// `role` and `technology` queue in `lessons-candidates.md` for the curator.
+const LESSON_SCOPES: [&str; 3] = ["role", "technology", "project"];
+
+/// `flow_defer`'s kinds: `finding` → `deferred_findings`, `queue_item` →
+/// `queue`, `pending_approval` → `pending_approvals` (see `apply_defer`).
+const DEFER_KINDS: [&str; 3] = ["finding", "queue_item", "pending_approval"];
+
+/// `(parameter, kinds it applies to, kinds that require it)` — D1: a
+/// parameter outside its kinds is refused, never silently dropped. Checked in
+/// this order, so a refusal names the first offending parameter.
+const LOG_PARAMETERS: [(&str, &[&str], &[&str]); 4] = [
+    ("why", &["decision"], &["decision"]),
+    ("rollback", &["decision"], &["decision"]),
+    (
+        "role",
+        &["decision", "evidence", "lesson", "handoff"],
+        &["lesson", "handoff"],
+    ),
+    ("scope", &["lesson"], &["lesson"]),
+];
+
+/// A validated `flow_log` call, before it meets the state file.
+struct LogRequest {
+    job_id: String,
+    kind: String,
+    message: String,
+    why: Option<String>,
+    rollback: Option<String>,
+    role: Option<String>,
+    scope: Option<String>,
+}
+
+/// An optional string argument: absent, null or blank is `None`; any other
+/// type is an argument error.
+fn opt_text(args: &Value, key: &str) -> Result<Option<String>, CallToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone()).filter(|text| !text.trim().is_empty())),
+        Some(_) => Err(invalid_arg(key, "must be a string")),
+    }
+}
+
+/// An optional closed-vocabulary argument (the schema enforces the enum; the
+/// handler re-checks, as every flow handler does).
+fn opt_token(args: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, CallToolResult> {
+    match opt_text(args, key)? {
+        Some(token) if !allowed.contains(&token.as_str()) => Err(invalid_arg(
+            key,
+            &format!(
+                "{token:?} is not one of: {}. Nothing was written.",
+                allowed.join(", ")
+            ),
+        )),
+        token => Ok(token),
+    }
+}
+
+async fn handle_flow_log(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let job_id = match require_str(args, "job_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let kind = match require_str(args, "kind") {
+        Ok(value) if LOG_KINDS.contains(&value) => value.to_string(),
+        Ok(value) => {
+            return Ok(invalid_arg(
+                "kind",
+                &format!(
+                    "{value:?} is not one of: {}. Nothing was written.",
+                    LOG_KINDS.join(", ")
+                ),
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let message = match require_str(args, "message") {
+        Ok(value) if !value.trim().is_empty() => value.to_string(),
+        Ok(_) => {
+            return Ok(invalid_arg(
+                "message",
+                "must not be empty. Nothing was written.",
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let request = match log_request(args, job_id, kind, message) {
+        Ok(request) => request,
+        Err(rejection) => return Ok(rejection),
+    };
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        transact_state(&project, |flow_dir, state_path, current| {
+            apply_log(flow_dir, state_path, current, &request)
+        })
+    })
+    .await?)
+}
+
+/// The optional parameters, typed and checked against [`LOG_PARAMETERS`].
+fn log_request(
+    args: &Value,
+    job_id: String,
+    kind: String,
+    message: String,
+) -> Result<LogRequest, CallToolResult> {
+    let request = LogRequest {
+        job_id,
+        kind,
+        message,
+        why: opt_text(args, "why")?,
+        rollback: opt_text(args, "rollback")?,
+        role: opt_token(args, "role", &ROLES)?,
+        scope: opt_token(args, "scope", &LESSON_SCOPES)?,
+    };
+    check_log_parameters(&request)?;
+    Ok(request)
+}
+
+/// [`LOG_PARAMETERS`] against the call: present outside its kinds, or
+/// absent (or blank) where its kind requires it, is refused.
+fn check_log_parameters(request: &LogRequest) -> Result<(), CallToolResult> {
+    let kind = request.kind.as_str();
+    for (parameter, applies_to, required_by) in LOG_PARAMETERS {
+        let present = match parameter {
+            "why" => request.why.is_some(),
+            "rollback" => request.rollback.is_some(),
+            "role" => request.role.is_some(),
+            _ => request.scope.is_some(),
+        };
+        if present && !applies_to.contains(&kind) {
+            return Err(invalid_arg(
+                parameter,
+                &format!(
+                    "does not apply to kind {kind} (only to: {}). Nothing was written.",
+                    applies_to.join(", ")
+                ),
+            ));
+        }
+        if !present && required_by.contains(&kind) {
+            return Err(invalid_arg(
+                parameter,
+                &format!("kind {kind} requires a non-empty {parameter}. Nothing was written."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Append the entry to the one file its kind owns, under the `STATE.md` lock
+/// (so handoff numbering cannot race), and hand `STATE.md` back unchanged.
+/// Allowed on a closed job: the journal outlives the transitions.
+fn apply_log(
+    flow_dir: &Path,
+    state_path: &Path,
+    current: &str,
+    request: &LogRequest,
+) -> Result<(String, Value), CallToolResult> {
+    let state = load_job(state_path, current, &request.job_id)?;
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let role = request.role.as_deref().unwrap_or_default();
+    let (path, read_name) = match (request.kind.as_str(), request.scope.as_deref()) {
+        ("decision" | "evidence", _) => {
+            let mut lines = Vec::new();
+            if let Some(why) = &request.why {
+                lines.push(format!("why: {}", one_line(why)));
+            }
+            if let Some(rollback) = &request.rollback {
+                lines.push(format!("rollback: {}", one_line(rollback)));
+            }
+            let title = match &request.role {
+                Some(role) => format!("{} · role `{role}`", request.kind),
+                None => request.kind.clone(),
+            };
+            let dir = ensure_flow_subdir(flow_dir, &[LOG_DIR]).map_err(CallToolResult::error)?;
+            let path = dir.join(log_file_name(&state));
+            append_file(&path, &journal_entry(&at, &title, &request.message, &lines))
+                .map_err(CallToolResult::error)?;
+            (path, "log".to_string())
+        }
+        ("lesson", Some("project")) => {
+            let dir = ensure_flow_subdir(flow_dir, &[MEMORY_DIR]).map_err(CallToolResult::error)?;
+            let file = format!("{role}.md");
+            let path = dir.join(&file);
+            let title = format!("lesson · job `{}`", state.job_id);
+            append_file(&path, &journal_entry(&at, &title, &request.message, &[]))
+                .map_err(CallToolResult::error)?;
+            (path, format!("{MEMORY_DIR}/{file}"))
+        }
+        ("lesson", Some(scope)) => {
+            let dir =
+                ensure_flow_subdir(flow_dir, &[RECORDS_DIR]).map_err(CallToolResult::error)?;
+            let path = dir.join(LESSONS_FILE);
+            let title = format!(
+                "lesson · role `{role}` · scope `{scope}` · job `{}`",
+                state.job_id
+            );
+            append_file(&path, &journal_entry(&at, &title, &request.message, &[]))
+                .map_err(CallToolResult::error)?;
+            (path, LESSONS_FILE.to_string())
+        }
+        ("handoff", _) => {
+            let dir = ensure_flow_subdir(flow_dir, &[HANDOFFS_DIR, state.job_id.as_str()])
+                .map_err(CallToolResult::error)?;
+            let file = format!(
+                "{:02}-{role}.md",
+                next_handoff_number(flow_dir, &state.job_id)
+            );
+            let path = dir.join(&file);
+            konnect_sexp::write_new_atomic(&path, &request.message).map_err(|error| {
+                CallToolResult::error(format!("Could not create {} ({error})", path.display()))
+            })?;
+            (path, format!("{HANDOFFS_DIR}/{file}"))
+        }
+        _ => {
+            return Err(invalid_arg(
+                "kind",
+                "has no destination for these parameters. Nothing was written.",
+            ))
+        }
+    };
+    let response = json!({
+        "job_id": state.job_id,
+        "kind": request.kind,
+        "at": at,
+        "read_name": read_name,
+        "file": path.display().to_string(),
+    });
+    Ok((current.to_string(), response))
+}
+
+/// One journal entry: a timestamped heading, the message blockquoted (kept
+/// verbatim, unable to forge a heading), then metadata bullets.
+fn journal_entry(at: &str, title: &str, message: &str, lines: &[String]) -> String {
+    let mut entry = format!("## {at} · {title}\n\n{}\n\n", blockquote(message));
+    for line in lines {
+        entry.push_str(&format!("- {line}\n"));
+    }
+    if !lines.is_empty() {
+        entry.push('\n');
+    }
+    entry
+}
+
+/// One past the highest handoff number in the job's directory: the existing
+/// count + 1 while none was removed, and never a number already taken when
+/// one was (so the no-clobber create cannot collide).
+fn next_handoff_number(flow_dir: &Path, job_id: &str) -> usize {
+    list_handoffs(flow_dir, job_id)
+        .iter()
+        .filter_map(|name| {
+            name.split_once('-')
+                .and_then(|(number, _)| number.parse::<usize>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+/// A validated `flow_defer` call.
+struct DeferRequest {
+    job_id: String,
+    kind: &'static str,
+    description: String,
+    owner: Option<String>,
+}
+
+async fn handle_flow_defer(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let job_id = match require_str(args, "job_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let kind = match require_str(args, "kind") {
+        Ok(value) => match DEFER_KINDS.iter().find(|kind| **kind == value) {
+            Some(kind) => *kind,
+            None => {
+                return Ok(invalid_arg(
+                    "kind",
+                    "must be finding, queue_item or pending_approval. Nothing was written.",
+                ))
+            }
+        },
+        Err(rejection) => return Ok(rejection),
+    };
+    let description = match require_str(args, "description") {
+        Ok(value) if !value.trim().is_empty() => value.to_string(),
+        Ok(_) => {
+            return Ok(invalid_arg(
+                "description",
+                "must not be empty. Nothing was written.",
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let owner = match opt_text(args, "owner") {
+        Ok(owner) => owner,
+        Err(rejection) => return Ok(rejection),
+    };
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    let request = DeferRequest {
+        job_id,
+        kind,
+        description,
+        owner,
+    };
+    Ok(tokio::task::spawn_blocking(move || {
+        transact_state(&project, |flow_dir, state_path, current| {
+            apply_defer(flow_dir, state_path, current, &request)
+        })
+    })
+    .await?)
+}
+
+/// Append the item to its list under the `STATE.md` lock, in any phase —
+/// `closed` included; lists are append-only (resolution is a `flow_log`).
+fn apply_defer(
+    flow_dir: &Path,
+    state_path: &Path,
+    current: &str,
+    request: &DeferRequest,
+) -> Result<(String, Value), CallToolResult> {
+    let mut state = load_job(state_path, current, &request.job_id)?;
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let item = DeferredItem {
+        description: request.description.clone(),
+        owner: request.owner.clone(),
+        added_at: at.clone(),
+        phase: state.phase.clone(),
+    };
+    let (list_name, list) = match request.kind {
+        "finding" => ("deferred_findings", &mut state.deferred_findings),
+        "queue_item" => ("queue", &mut state.queue),
+        _ => ("pending_approvals", &mut state.pending_approvals),
+    };
+    list.push(item.clone());
+    let count = list.len();
+
+    let mut lines = vec![
+        format!("description: {}", one_line(&item.description)),
+        format!("phase: `{}`", item.phase),
+    ];
+    if let Some(owner) = &item.owner {
+        lines.push(format!("owner: {}", one_line(owner)));
+    }
+    let log = log_entry(&at, &format!("defer {}", request.kind), &lines);
+    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
+    let response = json!({
+        "job_id": state.job_id,
+        "kind": request.kind,
+        "list": list_name,
+        "count": count,
+        "item": item,
+    });
+    Ok((render_state(&state), response))
+}
+
 // ─── Tool definitions (design D1) ─────────────────────────────────────────────
 
 /// The `flow` tools in D1 order. The router registers them (task 1.8).
@@ -2751,6 +3131,94 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["project_dir", "job_id", "gate_name", "decision", "summary", "user_words"]
             }),
             |args, ctx| async move { handle_flow_gate(args, ctx).await }
+        ),
+        tool!(
+            "flow_log",
+            "Append one journal entry for the project's job (active or closed); `kind` picks \
+             the one file that owns it: decision (needs why and rollback) or evidence → the \
+             job log; lesson (needs role and scope) → memory/<role>.md for scope project, \
+             records/lessons-candidates.md for scope role or technology; handoff (needs \
+             role) → a new handoffs/<job_id>/<NN>-<role>.md holding `message` verbatim. A \
+             parameter that does not apply to the kind is refused. Returns `read_name`, the \
+             name flow_status(read) takes. Never changes STATE.md.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id flow_start returned (flow_status reports it)."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": LOG_KINDS,
+                        "description": "decision | evidence → the job log; lesson → project memory or the candidates queue by scope; handoff → a new numbered handoff file."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The entry as Markdown; for a handoff, the whole handoff file."
+                    },
+                    "why": {
+                        "type": "string",
+                        "description": "decision only, required: why it was decided."
+                    },
+                    "rollback": {
+                        "type": "string",
+                        "description": "decision only, required: how to undo it."
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ROLES,
+                        "description": "Required for lesson (the memory file) and handoff (the file name); an optional author tag on decision and evidence."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": LESSON_SCOPES,
+                        "description": "lesson only, required: project (stays in memory/<role>.md), role or technology (queued in lessons-candidates.md)."
+                    }
+                },
+                "required": ["project_dir", "job_id", "kind", "message"]
+            }),
+            |args, ctx| async move { handle_flow_log(args, ctx).await }
+        ),
+        tool!(
+            "flow_defer",
+            "Append an item to the job's STATE.md list — finding → deferred_findings, \
+             queue_item → queue, pending_approval → pending_approvals — with the phase it was \
+             found in, and log it. Works in any phase, closed included; lists are \
+             append-only (record a resolution with flow_log). Refuses only a foreign job_id \
+             or an empty description.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id flow_start returned (flow_status reports it)."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": DEFER_KINDS,
+                        "description": "finding, queue_item or pending_approval."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "The item, in one or two sentences. Must not be empty."
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Who should pick it up (optional)."
+                    }
+                },
+                "required": ["project_dir", "job_id", "kind", "description"]
+            }),
+            |args, ctx| async move { handle_flow_defer(args, ctx).await }
         ),
     ]
 }
@@ -3635,6 +4103,51 @@ mod schema_tests {
         let mut without_words = approve.clone();
         without_words.as_object_mut().unwrap().remove("user_words");
         assert!(!gate.input_validator.is_valid(&without_words));
+
+        let log = tool("flow_log");
+        for call in [
+            json!({
+                "project_dir": "p", "job_id": "j", "kind": "decision", "message": "m",
+                "why": "w", "rollback": "r", "role": "requirements"
+            }),
+            json!({
+                "project_dir": "p", "job_id": "j", "kind": "lesson", "message": "m",
+                "role": "photo-intake", "scope": "technology"
+            }),
+            json!({ "project_dir": "p", "job_id": "j", "kind": "handoff", "message": "m", "role": "review" }),
+        ] {
+            assert!(log.input_validator.is_valid(&call), "{call}");
+        }
+        for bad in [
+            json!({ "project_dir": "p", "job_id": "j", "kind": "gossip", "message": "m" }),
+            json!({ "project_dir": "p", "job_id": "j", "kind": "lesson", "message": "m", "role": "nobody" }),
+            json!({ "project_dir": "p", "job_id": "j", "kind": "lesson", "message": "m", "scope": "global" }),
+            json!({ "project_dir": "p", "job_id": "j", "kind": "evidence" }),
+        ] {
+            assert!(!log.input_validator.is_valid(&bad), "{bad}");
+        }
+
+        let defer = tool("flow_defer");
+        assert!(defer.input_validator.is_valid(&json!({
+            "project_dir": "p", "job_id": "j", "kind": "queue_item", "description": "d", "owner": "o"
+        })));
+        assert!(!defer.input_validator.is_valid(&json!({
+            "project_dir": "p", "job_id": "j", "kind": "todo", "description": "d"
+        })));
+
+        let names: Vec<&str> = tools().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(
+            names,
+            [
+                "flow_status",
+                "flow_start",
+                "flow_advance",
+                "flow_gate",
+                "flow_log",
+                "flow_defer"
+            ],
+            "D1 order"
+        );
     }
 }
 
@@ -4917,5 +5430,369 @@ mod gate_tests {
         );
         let left = advance(&dir, &job_id, "schematic", &[]).await;
         assert!(!left.is_error, "{}", text(&left));
+    }
+}
+
+// ─── Tests: flow_log and flow_defer (task 1.7) ────────────────────────────────
+
+#[cfg(test)]
+mod journal_tests {
+    use super::advance_tests::*;
+    use super::test_support::*;
+    use super::*;
+    use crate::mcp::protocol::CallToolResult;
+    use serde_json::{json, Value};
+
+    async fn log(
+        dir: &tempfile::TempDir,
+        job_id: &str,
+        kind: &str,
+        extra: Value,
+    ) -> CallToolResult {
+        let mut args = json!({
+            "project_dir": arg(dir),
+            "job_id": job_id,
+            "kind": kind,
+            "message": "USB-C only; no micro-USB footprint.",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_flow_log(&args, &ctx()).await.unwrap()
+    }
+
+    async fn defer(
+        dir: &tempfile::TempDir,
+        job_id: &str,
+        kind: &str,
+        extra: Value,
+    ) -> CallToolResult {
+        let mut args = json!({
+            "project_dir": arg(dir),
+            "job_id": job_id,
+            "kind": kind,
+            "description": "silk R3 overlaps pad",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_flow_defer(&args, &ctx()).await.unwrap()
+    }
+
+    fn log_path(dir: &tempfile::TempDir, job_id: &str) -> std::path::PathBuf {
+        let state = state_on_disk(dir);
+        flow_path(dir)
+            .join("log")
+            .join(format!("{}-{job_id}.md", &state.started_at[..10]))
+    }
+
+    /// Every byte a flow_log refusal could have touched: the log, both lesson
+    /// destinations, the handoff directory's listing and STATE.md.
+    fn journal_snapshot(dir: &tempfile::TempDir, job_id: &str) -> Vec<Option<Vec<u8>>> {
+        let flow = flow_path(dir);
+        let mut snapshot: Vec<Option<Vec<u8>>> = [
+            log_path(dir, job_id),
+            flow.join("records").join("lessons-candidates.md"),
+            flow.join("STATE.md"),
+        ]
+        .iter()
+        .map(|path| std::fs::read(path).ok())
+        .collect();
+        for role in ROLES {
+            snapshot.push(std::fs::read(flow.join("memory").join(format!("{role}.md"))).ok());
+        }
+        snapshot.push(Some(list_handoffs(&flow, job_id).join("\n").into_bytes()));
+        snapshot
+    }
+
+    /// Acceptance 1.7: a decision needs a non-empty `why` and `rollback`; a
+    /// parameter that does not apply to the kind (`scope` on evidence) is
+    /// refused; a refusal appends nothing anywhere.
+    #[tokio::test]
+    async fn a_decision_needs_why_and_rollback_and_evidence_takes_no_scope() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let before = journal_snapshot(&dir, &job_id);
+        for (kind, extra, field) in [
+            (
+                "decision",
+                json!({ "why": "", "rollback": "revert" }),
+                "why",
+            ),
+            ("decision", json!({ "rollback": "revert" }), "why"),
+            (
+                "decision",
+                json!({ "why": "cost", "rollback": "  " }),
+                "rollback",
+            ),
+            ("decision", json!({ "why": "cost" }), "rollback"),
+            (
+                "decision",
+                json!({ "why": "c", "rollback": "r", "scope": "project" }),
+                "scope",
+            ),
+            ("evidence", json!({ "scope": "project" }), "scope"),
+            ("evidence", json!({ "why": "because" }), "why"),
+            ("evidence", json!({ "message": " " }), "message"),
+        ] {
+            let refused = log(&dir, &job_id, kind, extra.clone()).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{kind} {extra}");
+            assert_eq!(body(&refused)["error"]["field"], field, "{kind} {extra}");
+            assert_eq!(
+                journal_snapshot(&dir, &job_id),
+                before,
+                "{kind} {extra}: nothing appended"
+            );
+        }
+
+        let decided = log(
+            &dir,
+            &job_id,
+            "decision",
+            json!({ "why": "the enclosure has a USB-C cutout", "rollback": "swap J1", "role": "requirements" }),
+        )
+        .await;
+        assert!(!decided.is_error, "{}", text(&decided));
+        assert_eq!(body(&decided)["read_name"], "log");
+        let evidence = log(&dir, &job_id, "evidence", json!({})).await;
+        assert!(!evidence.is_error, "{}", text(&evidence));
+        let text = std::fs::read_to_string(log_path(&dir, &job_id)).unwrap();
+        assert!(text.contains("decision"), "{text}");
+        assert!(
+            text.contains("> USB-C only; no micro-USB footprint."),
+            "{text}"
+        );
+        assert!(
+            text.contains("the enclosure has a USB-C cutout") && text.contains("swap J1"),
+            "{text}"
+        );
+        assert!(text.contains("evidence"), "{text}");
+        assert_eq!(
+            state_bytes(&dir),
+            before[2].clone().unwrap(),
+            "flow_log never rewrites STATE.md"
+        );
+    }
+
+    /// Acceptance 1.7: each handoff is a new file numbered after the ones
+    /// already there, holding the message verbatim.
+    #[tokio::test]
+    async fn each_handoff_gets_its_own_numbered_file() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let handoffs = flow_path(&dir).join("handoffs").join(&job_id);
+        for (message, expected) in [
+            ("---\nverdict: FIX\n---\n# Review one\n", "01-review.md"),
+            ("---\nverdict: DONE\n---\n# Review two\n", "02-review.md"),
+        ] {
+            let result = log(
+                &dir,
+                &job_id,
+                "handoff",
+                json!({ "role": "review", "message": message }),
+            )
+            .await;
+            assert!(!result.is_error, "{}", text(&result));
+            assert_eq!(body(&result)["read_name"], format!("handoffs/{expected}"));
+            assert_eq!(
+                std::fs::read_to_string(handoffs.join(expected)).unwrap(),
+                message
+            );
+        }
+        let status = handle_flow_status(
+            &json!({ "project_dir": arg(&dir), "read": ["handoffs/02-review.md"] }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body(&status)["handoffs"],
+            json!(["01-review.md", "02-review.md"])
+        );
+        assert!(body(&status)["contents"]["handoffs/02-review.md"]
+            .as_str()
+            .unwrap()
+            .contains("Review two"));
+
+        let before = journal_snapshot(&dir, &job_id);
+        for (extra, field) in [
+            (json!({}), "role"),
+            (json!({ "role": "review", "scope": "role" }), "scope"),
+            (json!({ "role": "review", "rollback": "r" }), "rollback"),
+        ] {
+            let refused = log(&dir, &job_id, "handoff", extra.clone()).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{extra}");
+            assert_eq!(body(&refused)["error"]["field"], field, "{extra}");
+            assert_eq!(journal_snapshot(&dir, &job_id), before, "{extra}");
+        }
+    }
+
+    /// D7: a project lesson goes to memory/<role>.md, a role or technology
+    /// lesson to the candidates queue tagged with both; both need role and
+    /// scope, and both are readable through flow_status.
+    #[tokio::test]
+    async fn lessons_go_to_project_memory_or_the_candidates_queue() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let before = journal_snapshot(&dir, &job_id);
+        for (extra, field) in [
+            (json!({ "scope": "project" }), "role"),
+            (json!({ "role": "layout" }), "scope"),
+            (
+                json!({ "role": "layout", "scope": "project", "why": "w" }),
+                "why",
+            ),
+        ] {
+            let refused = log(&dir, &job_id, "lesson", extra.clone()).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{extra}");
+            assert_eq!(body(&refused)["error"]["field"], field, "{extra}");
+            assert_eq!(journal_snapshot(&dir, &job_id), before, "{extra}");
+        }
+
+        let project_lesson = log(
+            &dir,
+            &job_id,
+            "lesson",
+            json!({ "role": "layout", "scope": "project", "message": "J1 sits on the bottom edge here." }),
+        )
+        .await;
+        assert!(!project_lesson.is_error, "{}", text(&project_lesson));
+        assert_eq!(body(&project_lesson)["read_name"], "memory/layout.md");
+        let technology_lesson = log(
+            &dir,
+            &job_id,
+            "lesson",
+            json!({ "role": "schematic", "scope": "technology", "message": "ESP32 GPIO0 strapping needs a pull-up." }),
+        )
+        .await;
+        assert!(!technology_lesson.is_error, "{}", text(&technology_lesson));
+        assert_eq!(
+            body(&technology_lesson)["read_name"],
+            "lessons-candidates.md"
+        );
+
+        let status = handle_flow_status(
+            &json!({ "project_dir": arg(&dir), "read": ["memory/layout.md", "lessons-candidates.md"] }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let contents = &body(&status)["contents"];
+        let memory = contents["memory/layout.md"].as_str().unwrap();
+        assert!(
+            memory.contains("J1 sits on the bottom edge here."),
+            "{memory}"
+        );
+        assert!(!memory.contains("ESP32"), "{memory}");
+        let candidates = contents["lessons-candidates.md"].as_str().unwrap();
+        assert!(
+            candidates.contains("ESP32 GPIO0 strapping needs a pull-up."),
+            "{candidates}"
+        );
+        assert!(
+            candidates.contains("role `schematic`") && candidates.contains("scope `technology`"),
+            "{candidates}"
+        );
+        assert!(!candidates.contains("J1 sits"), "{candidates}");
+    }
+
+    /// D1: the journal stays open on a closed job, but only for the
+    /// project's own job, and never creates a flow directory.
+    #[tokio::test]
+    async fn the_journal_accepts_a_closed_job_but_not_a_foreign_one() {
+        let dir = project();
+        let orphan = log(&dir, JOB_ID, "evidence", json!({})).await;
+        assert_eq!(error_kind(&orphan), "stale_target");
+        let orphan_defer = defer(&dir, JOB_ID, "finding", json!({})).await;
+        assert_eq!(error_kind(&orphan_defer), "stale_target");
+        assert!(!dir.path().join(".konnect").exists(), "creates nothing");
+
+        plant_state(&dir, &job_at(CLOSED));
+        let closed = log(&dir, JOB_ID, "evidence", json!({})).await;
+        assert!(!closed.is_error, "{}", text(&closed));
+        let deferred = defer(&dir, JOB_ID, "queue_item", json!({})).await;
+        assert!(!deferred.is_error, "{}", text(&deferred));
+        assert_eq!(state_on_disk(&dir).queue.len(), 1);
+
+        let before = state_bytes(&dir);
+        let foreign = log(&dir, "another-20260101-000000", "evidence", json!({})).await;
+        assert_eq!(error_kind(&foreign), "stale_target");
+        let foreign_defer = defer(&dir, "another-20260101-000000", "finding", json!({})).await;
+        assert_eq!(error_kind(&foreign_defer), "stale_target");
+        assert_eq!(state_bytes(&dir), before);
+    }
+
+    /// Acceptance 1.7 / pre-mortem 6: two concurrent defers serialize on the
+    /// STATE.md lock and both land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_concurrent_defers_both_land() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let (first, second) = tokio::join!(
+            defer(
+                &dir,
+                &job_id,
+                "finding",
+                json!({ "description": "finding one" })
+            ),
+            defer(
+                &dir,
+                &job_id,
+                "finding",
+                json!({ "description": "finding two" })
+            )
+        );
+        assert!(!first.is_error, "{}", text(&first));
+        assert!(!second.is_error, "{}", text(&second));
+        let mut descriptions: Vec<String> = state_on_disk(&dir)
+            .deferred_findings
+            .into_iter()
+            .map(|item| item.description)
+            .collect();
+        descriptions.sort();
+        assert_eq!(descriptions, ["finding one", "finding two"]);
+    }
+
+    /// Each kind lands in its own list with the phase it was found in; an
+    /// empty description is refused and changes nothing.
+    #[tokio::test]
+    async fn a_deferred_item_lands_in_its_list_with_its_phase() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let queued = defer(
+            &dir,
+            &job_id,
+            "queue_item",
+            json!({ "description": "order the reel", "owner": "sourcing" }),
+        )
+        .await;
+        assert!(!queued.is_error, "{}", text(&queued));
+        assert_eq!(body(&queued)["list"], "queue");
+        let pending = defer(&dir, &job_id, "pending_approval", json!({ "owner": "" })).await;
+        assert!(!pending.is_error, "{}", text(&pending));
+
+        let state = state_on_disk(&dir);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue[0].description, "order the reel");
+        assert_eq!(state.queue[0].owner.as_deref(), Some("sourcing"));
+        assert_eq!(state.queue[0].phase, "requirements");
+        assert!(is_utc_timestamp(&state.queue[0].added_at));
+        assert_eq!(state.pending_approvals.len(), 1);
+        assert_eq!(
+            state.pending_approvals[0].owner, None,
+            "an empty owner is no owner"
+        );
+        assert!(state.deferred_findings.is_empty());
+        let text = std::fs::read_to_string(log_path(&dir, &job_id)).unwrap();
+        assert!(
+            text.contains("defer queue_item") && text.contains("order the reel"),
+            "{text}"
+        );
+
+        let before = state_bytes(&dir);
+        let empty = defer(&dir, &job_id, "finding", json!({ "description": "  " })).await;
+        assert_eq!(error_kind(&empty), "invalid_argument");
+        assert_eq!(body(&empty)["error"]["field"], "description");
+        assert_eq!(state_bytes(&dir), before);
     }
 }
