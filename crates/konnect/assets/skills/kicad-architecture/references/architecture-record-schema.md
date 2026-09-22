@@ -76,8 +76,22 @@ exactly this shape, and the architecture record copies them.
   library agent makes that part inside the `schematic` phase, before the build
   that places it.
 
-A row with no confirmed source (no stocked part meets the requirement, or the
-datasheet could not be obtained) keeps the readiness line BLOCKED.
+**A confirmed row.** A row is confirmed only when the orchestrating session's
+evidence entry for it exists in the job log: the session fetched the
+fabricator's live part page for the stock and opened the manufacturer's
+datasheet for that exact part, and recorded both with
+`flow_log(project_dir, job_id, kind, message)`, `kind` `evidence` (the
+konnect skill's `references/orchestration.md` §9). Read the log with
+`flow_status(project_dir, read)` naming `log`. The bundled agents cannot open
+either source, so their rows arrive unconfirmed. A row keeps the readiness
+line BLOCKED while any of these holds:
+
+- no evidence entry from the session names it;
+- its Datasheet cell reads `located, not validated`;
+- its stock is catalogue-only — `<quantity>, <catalogue date>, local
+  catalogue` from the sourcing agent, with no live figure behind it;
+- no stocked part meets the requirement, or the datasheet could not be
+  obtained.
 
 Example row — the volatile fields are shown as what to write, never as values
 to copy:
@@ -100,7 +114,8 @@ or invented value. Only blank lines may follow it.
 
 - `Readiness: PASS` — every value a block depends on traces to a datasheet, a
   measurement, a configuration key, or an assumption the user confirmed, and
-  every parts-list row has a confirmed source.
+  every parts-list row is confirmed — the session's evidence entry exists for
+  it ("A confirmed row", above).
 - `Readiness: BLOCKED — <value and what would supply it>` — anything else. A
   bare `Readiness: BLOCKED`, `Readiness: PASSED`, or text after `PASS` is
   malformed, and a malformed line is treated like BLOCKED.

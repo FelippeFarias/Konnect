@@ -108,7 +108,7 @@ decision in one message:
 |---|---|
 | architecture | `constraints.md`, `architecture.md` (blocks, power budget, parts with stock, open questions, the readiness line), `worst-case.md`, `pin-plan.md` |
 | placement | `placement.md` with the rendered per-layer images, and what `schematic-evidence.md` and `ledger-schematic.md` concluded |
-| purchase | `manufacturing.md`: indicative cost, BOM with stock and lot ceilings, the order settings; the readiness level from `ledger-prefab.md` |
+| purchase | `manufacturing.md`: indicative cost, BOM with stock and lot ceilings, the order settings; the readiness level from `ledger-prefab.md`; its `## Checks at the purchase gate` section — the session shows it to the user and runs or asks for each listed check before `flow_gate` for `purchase` |
 
 - Approve or reject with
   `flow_gate(project_dir, job_id, gate_name, decision, summary, user_words)`.
@@ -124,6 +124,15 @@ decision in one message:
   `flow_advance(project_dir, job_id, to_phase)` to the next phase. It is
   refused if anything changed since the approval; show the new state and ask
   again.
+- At `gate:purchase`, `manufacturing.md`'s `## Checks at the purchase gate`
+  lists what `kicad-manufacture-agent` could not run with its tools: the
+  Gerber and drill viewer check, the fabricator's order preview while the
+  placement orientation reads `PREVIEW_REQUIRED`, and the live stock and price
+  re-check. The session shows that section to the user, runs each check it
+  can (it fetches pages and runs a terminal) and asks the user for the rest,
+  and records each result with `flow_log(project_dir, job_id, kind, message)`,
+  `kind` `evidence`. Only then does it ask for the `purchase` decision with
+  `flow_gate`. A check that failed is a FIX (§5), not an approval.
 - A rejection records the decision; route its reason as a FIX (§5).
 - `flow_status` reports every approval's validity against the current files
   in `gate_approvals`.
@@ -225,6 +234,23 @@ For a large BOM, run several in parallel on disjoint part groups (by block)
 once a first architecture draft names the candidate parts. The next
 architecture brief names their handoffs (`handoffs/<NN>-sourcing.md`) in its
 Context; the architecture agent copies the rows and closes the readiness line.
+
+**The session confirms live stock and datasheets.** The bundled agents reach
+the local catalogue and a datasheet URL, never the live page or the document:
+a sourcing row arrives with catalogue-only stock and a datasheet marked
+`located, not validated`. The orchestrating session — which can fetch pages
+and run a terminal, unlike the bundled agents — confirms each parts-list row
+before the architecture gate, inside the `architecture` phase: the live stock
+on the fabricator's current part page (quantity, retrieval date, the page),
+and the manufacturer's datasheet for that exact part and suffix, opened as a
+real document. It records every confirmation with
+`flow_log(project_dir, job_id, kind, message)`, `kind` `evidence`, one entry
+per row naming the part number, the stock figure and date, and the datasheet
+revision. The next architecture brief names those entries in its Context
+(the job log, read with `flow_status(project_dir, read)` naming `log`). A row
+without the session's evidence entry is not confirmed and keeps the readiness
+line BLOCKED (the kicad-architecture skill's
+`references/architecture-record-schema.md`, "Parts list").
 
 ## 10. Library inside `schematic`
 
