@@ -969,6 +969,45 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "mounting_hole_pitch",
         "power_input",
         "led_string_1",
+        // Flow orchestration vocabulary, not callable tools. Every name below
+        // is a value a `flow` tool accepts or stores, a field of a `flow`
+        // response or of `STATE.md`, or a handoff header field. Derived from
+        // this test's own failing run after the orchestrator assets landed,
+        // not from the design's expected list: the design names it did not
+        // flag (`design_hash`, `design_files`, …) are left out. The `flow`
+        // tools' own top-level parameters (`job_id`, `to_phase`, `gate_name`,
+        // `user_words`, `evidence_calls`, …) are deliberately absent: the
+        // schemas exempt them, and listing them here would re-create the
+        // phantom allowlist this doc comment warns about.
+        //
+        // `flow_start` lane values.
+        "new_board",
+        "board_revision",
+        "review_only",
+        "fab_only",
+        "photo_to_kicad",
+        // Phase tokens of the canonical sequence.
+        "schematic_review",
+        "prefab_review",
+        // `flow_defer` kinds.
+        "queue_item",
+        "pending_approval",
+        // `STATE.md` lists and `flow_status` response fields.
+        "deferred_findings",
+        "pending_approvals",
+        "gate_approvals",
+        "lock_files",
+        "fix_rounds",
+        "last_transition",
+        "next_step",
+        "state_error",
+        // History-entry and gate-approval fields, and the `evidence_check`
+        // bucket of cited calls that did not return ok.
+        "evidence_check",
+        "not_ok",
+        "approved_by",
+        // Handoff header field (the konnect skill's handoff template).
+        "failing_layer",
     ];
 
     let mut phantom = Vec::new();
