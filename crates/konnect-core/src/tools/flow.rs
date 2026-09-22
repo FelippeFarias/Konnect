@@ -661,7 +661,8 @@ fn render_body(state: &JobState) -> String {
         ));
     }
     body.push_str(
-        "\nValidity is recomputed by `flow_status`; this body shows what was recorded.\n\n",
+        "\nValidity is recomputed by `flow_status` only for the gate the job stands at now; \
+         this body shows what was recorded.\n\n",
     );
 
     for (title, items) in [
@@ -3102,9 +3103,11 @@ pub fn tools() -> Vec<ToolDef> {
             "flow_status",
             "Read a KiCad project's orchestration state and the reality it binds to: the \
          job and its phase (null when none), the current design_state_hash and the files \
-         it covered, KiCad lock files beside them, gate approvals with a recomputed \
-         `valid`, deferred items, FIX rounds per review phase, the newest transition, the \
-         job's handoffs, the next step, and the content of each requested `read` name. \
+         it covered, KiCad lock files beside them, gate approvals (`valid` is recomputed \
+         only for the gate the job stands at now; a passed gate reports status: passed \
+         and no `valid`), deferred items, FIX rounds per review phase, the newest \
+         transition, the job's handoffs, the next step, and the content of each requested \
+         `read` name. \
          Creates nothing and never refuses because of flow state — an unparseable \
          STATE.md is reported in `state_error`.",
             json!({
@@ -3171,8 +3174,11 @@ pub fn tools() -> Vec<ToolDef> {
              each supplied record must belong to that phase; leaving architecture requires \
              architecture.md to end with `Readiness: PASS`; leaving a gate requires an \
              approval from this visit whose design and package hashes still match. Records \
-             are written only when the whole transition is accepted; a refusal writes \
-             nothing. The producer of a phase calls this as its last action.",
+             are written only when the whole transition is accepted; \
+             a validation refusal writes nothing. A success always carries `warning`: null, \
+             or a string naming the log entry not written after STATE.md committed — the \
+             move stands, so never repeat the call. The producer of a phase calls this as \
+             its last action.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3225,7 +3231,9 @@ pub fn tools() -> Vec<ToolDef> {
              user verbatim, except that an autonomous job may approve architecture or \
              placement with empty user_words (recorded as approved_by: session) — purchase \
              always needs them. reject removes any approval. Writes \
-             records/gates/<gate_name>.md and logs it; never moves the phase.",
+             records/gates/<gate_name>.md and logs it; never moves the phase. A success \
+             always carries `warning`: null, or a string naming a side file not written \
+             after STATE.md committed — the decision stands, so never repeat the call.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3318,7 +3326,9 @@ pub fn tools() -> Vec<ToolDef> {
              queue_item → queue, pending_approval → pending_approvals — with the phase it was \
              found in, and log it. Works in any phase, closed included; lists are \
              append-only (record a resolution with flow_log). Refuses only a foreign job_id \
-             or an empty description.",
+             or an empty description. A success always carries `warning`: null, or a string \
+             naming the log entry not written after STATE.md committed — the item is \
+             recorded, so never repeat the call.",
             json!({
                 "type": "object",
                 "properties": {
