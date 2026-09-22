@@ -26,6 +26,7 @@
 use crate::design_hash::design_state_hash;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
+use crate::observability::{CallRecord, CallStatus};
 use crate::tool;
 use crate::tools::{invalid_arg, opt_str_list, require_str, ToolContext, ToolDef};
 use serde::{Deserialize, Serialize};
@@ -1614,7 +1615,37 @@ struct AdvanceRequest {
     to_phase: String,
     records: Vec<(String, String)>,
     evidence_calls: Vec<String>,
+    /// D6, computed from the observer ring when the call arrived; `None`
+    /// when no evidence call was cited.
+    evidence_check: Option<EvidenceCheck>,
     reason: Option<String>,
+}
+
+/// D6: each cited tool (first occurrence only) against the observer ring —
+/// `confirmed` with at least one `ok` call, `not_ok` present only with
+/// another status, `absent` not in the ring. A report, never a refusal: a
+/// resumed job's evidence may predate this server process, and the ring has
+/// no caller identity, so it catches "never ran", not "ran elsewhere".
+pub(crate) fn evidence_check(cited: &[String], ring: &[CallRecord]) -> EvidenceCheck {
+    let mut check = EvidenceCheck {
+        ring_calls: ring.len(),
+        ..EvidenceCheck::default()
+    };
+    for (position, tool) in cited.iter().enumerate() {
+        if cited[..position].contains(tool) {
+            continue;
+        }
+        let mut calls = ring.iter().filter(|call| call.tool == *tool).peekable();
+        let bucket = if calls.peek().is_none() {
+            &mut check.absent
+        } else if calls.any(|call| call.status == CallStatus::Ok) {
+            &mut check.confirmed
+        } else {
+            &mut check.not_ok
+        };
+        bucket.push(tool.clone());
+    }
+    check
 }
 
 /// `records`: an array of `{filename, content}`, each filename one of D4's
@@ -1660,7 +1691,7 @@ fn parse_records(args: &Value) -> Result<Vec<(String, String)>, CallToolResult> 
     Ok(records)
 }
 
-async fn handle_flow_advance(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+async fn handle_flow_advance(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
     let project_arg = match require_str(args, "project_dir") {
         Ok(value) => value.to_string(),
         Err(rejection) => return Ok(rejection),
@@ -1696,11 +1727,22 @@ async fn handle_flow_advance(args: &Value, _ctx: &ToolContext) -> anyhow::Result
         Ok(project) => project,
         Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
     };
+    // D6: read the ring now, in the server process that served the producer's
+    // calls — they are its most recent ones at this moment.
+    let evidence_check = if evidence_calls.is_empty() {
+        None
+    } else {
+        Some(evidence_check(
+            &evidence_calls,
+            &ctx.observer.recent(0).await,
+        ))
+    };
     let request = AdvanceRequest {
         job_id,
         to_phase,
         records,
         evidence_calls,
+        evidence_check,
         reason,
     };
     Ok(tokio::task::spawn_blocking(move || advance_job(&project, &request)).await?)
@@ -1797,14 +1839,9 @@ fn apply_advance(
         Transition::Forward | Transition::Close => {
             advance_forward(project, flow_dir, state, request, transition)
         }
-        Transition::Rewind | Transition::Abandon => Err(invalid_arg(
-            "to_phase",
-            &format!(
-                "{:?} from {:?} is a rewind or an abandon; this build moves jobs forward \
-                 only. Nothing was written.",
-                request.to_phase, state.phase
-            ),
-        )),
+        Transition::Rewind | Transition::Abandon => {
+            move_back(project, flow_dir, state, request, transition)
+        }
     }
 }
 
@@ -1935,18 +1972,13 @@ fn check_gate_exit(
 fn advance_forward(
     project: &Path,
     flow_dir: &Path,
-    mut state: JobState,
+    state: JobState,
     request: &AdvanceRequest,
     transition: Transition,
 ) -> Result<(String, Value), CallToolResult> {
     let leaving = state.phase.clone();
     check_forward_records(&leaving, &request.records)?;
-    let (design_hash, _) = design_state_hash(project).map_err(|error| {
-        CallToolResult::error(format!(
-            "Could not hash the design under {}: {error:#}. Nothing was written.",
-            project.display()
-        ))
-    })?;
+    let design_hash = hash_design(project)?;
     if is_gate(&leaving) {
         check_gate_exit(flow_dir, &state, &design_hash)?;
     }
@@ -1976,20 +2008,124 @@ fn advance_forward(
         .map(|(name, _)| name.clone())
         .collect();
     entry.evidence_calls = request.evidence_calls.clone();
+    entry.evidence_check = request.evidence_check.clone();
     entry.reason = request.reason.clone();
-    if is_gate(&request.to_phase) {
-        let package =
-            current_package(flow_dir, &state.phases, &request.to_phase).map_err(|error| {
-                CallToolResult::error(format!(
-                    "Could not hash the package of {}: {error}",
-                    request.to_phase
-                ))
-            })?;
-        entry.package_hash = Some(package.hash);
-        entry.package_files = package.files;
+    record_gate_keys(flow_dir, &state.phases, &mut entry)?;
+    commit_transition(flow_dir, state, entry, Vec::new())
+}
+
+/// A rewind (any earlier entry) or an abandon (`closed` before the last
+/// entry), D3: a non-empty `reason`, no `records`. A rewind removes the
+/// approval of every gate at or after its target — they are granted again on
+/// the way back — and a rewind into a gate records that gate's keys, since
+/// its entry is the one the next approval is compared against (D11).
+fn move_back(
+    project: &Path,
+    flow_dir: &Path,
+    mut state: JobState,
+    request: &AdvanceRequest,
+    transition: Transition,
+) -> Result<(String, Value), CallToolResult> {
+    let leaving = state.phase.clone();
+    let kind = if transition == Transition::Rewind {
+        HistoryKind::Rewind
+    } else {
+        HistoryKind::Abandon
+    };
+    let Some(reason) = request.reason.clone() else {
+        return Err(invalid_arg(
+            "reason",
+            &format!(
+                "{:?} from {leaving:?} is {} and needs a non-empty reason. Nothing was \
+                 written.",
+                request.to_phase,
+                if kind == HistoryKind::Rewind {
+                    "a rewind"
+                } else {
+                    "an abandon (closed before the last phase)"
+                }
+            ),
+        ));
+    };
+    if !request.records.is_empty() {
+        return Err(invalid_arg(
+            "records",
+            &format!(
+                "a {} supplies no records; records are written only by a forward move. \
+                 Nothing was written.",
+                kind.as_str()
+            ),
+        ));
+    }
+    let design_hash = hash_design(project)?;
+
+    let mut cleared = Vec::new();
+    if let Some(target) = state
+        .phases
+        .iter()
+        .position(|phase| *phase == request.to_phase)
+    {
+        for token in state.phases[target..].iter().filter(|token| is_gate(token)) {
+            let gate = token.trim_start_matches("gate:");
+            if state.gate_approvals.remove(gate).is_some() {
+                cleared.push(gate.to_string());
+            }
+        }
     }
 
-    let mut lines = vec![format!("design_hash: `{design_hash}`")];
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let mut entry = HistoryEntry::new(kind, Some(&leaving), &request.to_phase, &at, &design_hash);
+    entry.evidence_calls = request.evidence_calls.clone();
+    entry.evidence_check = request.evidence_check.clone();
+    entry.reason = Some(reason);
+    record_gate_keys(flow_dir, &state.phases, &mut entry)?;
+    commit_transition(flow_dir, state, entry, cleared)
+}
+
+/// `design_state_hash` of the project, or a refusal that wrote nothing.
+fn hash_design(project: &Path) -> Result<String, CallToolResult> {
+    design_state_hash(project)
+        .map(|(hash, _)| hash)
+        .map_err(|error| {
+            CallToolResult::error(format!(
+                "Could not hash the design under {}: {error:#}. Nothing was written.",
+                project.display()
+            ))
+        })
+}
+
+/// An entry INTO a gate phase carries the keys that gate's approval is
+/// compared against (D11): the package hash and its per-record digests.
+fn record_gate_keys(
+    flow_dir: &Path,
+    phases: &[String],
+    entry: &mut HistoryEntry,
+) -> Result<(), CallToolResult> {
+    if !is_gate(&entry.to) {
+        return Ok(());
+    }
+    let package = current_package(flow_dir, phases, &entry.to).map_err(|error| {
+        CallToolResult::error(format!(
+            "Could not hash the package of {}: {error}. Nothing was written.",
+            entry.to
+        ))
+    })?;
+    entry.package_hash = Some(package.hash);
+    entry.package_files = package.files;
+    Ok(())
+}
+
+/// The tail every accepted transition shares: log the entry, move the phase,
+/// append the history, render the new `STATE.md`. The log is appended before
+/// the state file is replaced, so a failed append refuses the transition.
+fn commit_transition(
+    flow_dir: &Path,
+    mut state: JobState,
+    entry: HistoryEntry,
+    cleared_approvals: Vec<String>,
+) -> Result<(String, Value), CallToolResult> {
+    let leaving = entry.from.clone().unwrap_or_default();
+    let mut lines = vec![format!("design_hash: `{}`", entry.design_hash)];
     if !entry.records.is_empty() {
         lines.push(format!("records: {}", entry.records.join(", ")));
     }
@@ -2002,26 +2138,43 @@ fn advance_forward(
             entry.evidence_calls.join(", ")
         ));
     }
+    if let Some(check) = &entry.evidence_check {
+        lines.push(format!(
+            "evidence_check: confirmed [{}] · not_ok [{}] · absent [{}] · ring {} calls",
+            check.confirmed.join(", "),
+            check.not_ok.join(", "),
+            check.absent.join(", "),
+            check.ring_calls
+        ));
+    }
+    if !cleared_approvals.is_empty() {
+        lines.push(format!(
+            "cleared approvals: {}",
+            cleared_approvals.join(", ")
+        ));
+    }
     if let Some(reason) = &entry.reason {
         lines.push(format!("reason: {}", one_line(reason)));
     }
     let log = log_entry(
-        &at,
-        &format!("{} {leaving} → {}", kind.as_str(), request.to_phase),
+        &entry.at,
+        &format!("{} {leaving} → {}", entry.kind.as_str(), entry.to),
         &lines,
     );
 
     let response = json!({
         "job_id": state.job_id,
-        "transition": kind.as_str(),
+        "transition": entry.kind.as_str(),
         "from": leaving,
-        "phase": request.to_phase,
+        "phase": entry.to,
         "records_written": entry.records,
-        "design_hash": design_hash,
+        "design_hash": entry.design_hash,
         "package_hash": entry.package_hash,
+        "evidence_check": entry.evidence_check,
+        "cleared_approvals": cleared_approvals,
         "history_index": state.history.len(),
     });
-    state.phase = request.to_phase.clone();
+    state.phase = entry.to.clone();
     state.history.push(entry);
     append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
     Ok((render_state(&state), response))
@@ -3205,10 +3358,14 @@ mod advance_tests {
     use crate::mcp::protocol::CallToolResult;
     use serde_json::{json, Value};
 
-    const PASSING_ARCHITECTURE: &str = "# Architecture\n\nBlocks.\n\nReadiness: PASS\n";
+    pub(super) const PASSING_ARCHITECTURE: &str = "# Architecture\n\nBlocks.\n\nReadiness: PASS\n";
 
     /// Open a job through the real tool and return its job_id.
-    async fn open(dir: &tempfile::TempDir, lane: &str, phases: Option<&[&str]>) -> String {
+    pub(super) async fn open(
+        dir: &tempfile::TempDir,
+        lane: &str,
+        phases: Option<&[&str]>,
+    ) -> String {
         let mut args = json!({ "project_dir": arg(dir), "objective": "Demo board", "lane": lane });
         if let Some(phases) = phases {
             args["phases"] = json!(phases);
@@ -3218,7 +3375,7 @@ mod advance_tests {
         body(&result)["job_id"].as_str().unwrap().to_string()
     }
 
-    async fn advance(
+    pub(super) async fn advance(
         dir: &tempfile::TempDir,
         job_id: &str,
         to_phase: &str,
@@ -3241,21 +3398,37 @@ mod advance_tests {
         .unwrap()
     }
 
-    fn state_bytes(dir: &tempfile::TempDir) -> Vec<u8> {
+    /// `flow_advance` through `ctx` (whose observer the evidence check
+    /// reads), with `extra` overlaid on the three required arguments.
+    pub(super) async fn advance_with(
+        dir: &tempfile::TempDir,
+        ctx: &ToolContext,
+        job_id: &str,
+        to_phase: &str,
+        extra: Value,
+    ) -> CallToolResult {
+        let mut args = json!({ "project_dir": arg(dir), "job_id": job_id, "to_phase": to_phase });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_flow_advance(&args, ctx).await.unwrap()
+    }
+
+    pub(super) fn state_bytes(dir: &tempfile::TempDir) -> Vec<u8> {
         std::fs::read(flow_path(dir).join(STATE_FILE)).unwrap()
     }
 
-    fn state_on_disk(dir: &tempfile::TempDir) -> JobState {
+    pub(super) fn state_on_disk(dir: &tempfile::TempDir) -> JobState {
         parse_state(&String::from_utf8(state_bytes(dir)).unwrap()).unwrap()
     }
 
-    fn record_path(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    pub(super) fn record_path(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         flow_path(dir).join("records").join(name)
     }
 
     /// A new_board job standing at `gate:architecture`, entered by the real
     /// tool with a passing package.
-    async fn at_architecture_gate(dir: &tempfile::TempDir) -> String {
+    pub(super) async fn at_architecture_gate(dir: &tempfile::TempDir) -> String {
         let job_id = open(dir, "new_board", None).await;
         let left = advance(dir, &job_id, "architecture", &[("constraints.md", "# C\n")]).await;
         assert!(!left.is_error, "{}", text(&left));
@@ -3572,5 +3745,329 @@ mod advance_tests {
         assert_eq!(state_bytes(&dir), before);
         assert!(!record_path(&dir, "constraints.md").exists());
         assert_ne!(job_id, "another-20260101-000000");
+    }
+}
+
+// ─── Tests: flow_advance rewind, abandon, evidence (task 1.5) ─────────────────
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::advance_tests::*;
+    use super::test_support::*;
+    use super::*;
+    use crate::observability::{CallRecord, CallStatus};
+    use serde_json::json;
+
+    /// The photo lane's sequence (D3): it starts at `schematic`, so a job
+    /// reaches the review phases through the real tool in a few calls.
+    pub(super) const PHOTO_PHASES: [&str; 9] = [
+        "schematic",
+        "schematic_review",
+        "placement",
+        "gate:placement",
+        "routing",
+        "prefab_review",
+        "manufacturing",
+        "gate:purchase",
+        "learn",
+    ];
+
+    fn planted_approval(visit: usize) -> GateApproval {
+        GateApproval {
+            decision: GateDecision::Approve,
+            approved_by: ApprovedBy::User,
+            approved_at: "2026-09-21T15:00:00Z".into(),
+            design_hash_at_approval: "0000".into(),
+            package_hash_at_approval: "0000".into(),
+            visit,
+            summary: "shown".into(),
+            user_words: "pode seguir".into(),
+        }
+    }
+
+    pub(super) fn call(tool: &str, status: CallStatus) -> CallRecord {
+        CallRecord {
+            call_id: crate::observability::new_call_id(),
+            ts: crate::observability::unix_ms(),
+            tool: tool.to_string(),
+            toolset: Some("test".to_string()),
+            dur_ms: 1,
+            status,
+            error_kind: None,
+            args_bytes: 2,
+            result_bytes: 2,
+        }
+    }
+
+    /// Acceptance 1.5: a FIX round is a rewind that needs a reason, supplies
+    /// no records, clears the gates at or after its target and is counted.
+    #[tokio::test]
+    async fn a_fix_round_is_a_rewind_with_a_reason() {
+        let dir = project();
+        let mut state = job_at("schematic_review");
+        state
+            .gate_approvals
+            .insert("architecture".into(), planted_approval(0));
+        state
+            .gate_approvals
+            .insert("placement".into(), planted_approval(0));
+        plant_state(&dir, &state);
+        let before = state_bytes(&dir);
+
+        for extra in [json!({}), json!({ "reason": "  " })] {
+            let refused = advance_with(&dir, &ctx(), JOB_ID, "schematic", extra.clone()).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{extra}");
+            assert_eq!(body(&refused)["error"]["field"], "reason", "{extra}");
+            assert_eq!(state_bytes(&dir), before, "{extra}");
+        }
+        let with_records = advance_with(
+            &dir,
+            &ctx(),
+            JOB_ID,
+            "schematic",
+            json!({
+                "reason": "ERC finding",
+                "records": [{ "filename": "schematic-evidence.md", "content": "x" }]
+            }),
+        )
+        .await;
+        assert_eq!(error_kind(&with_records), "invalid_argument");
+        assert_eq!(body(&with_records)["error"]["field"], "records");
+        assert_eq!(state_bytes(&dir), before);
+        assert!(!record_path(&dir, "schematic-evidence.md").exists());
+
+        let moved = advance_with(
+            &dir,
+            &ctx(),
+            JOB_ID,
+            "schematic",
+            json!({ "reason": "R3 pull-up missing" }),
+        )
+        .await;
+        assert!(!moved.is_error, "{}", text(&moved));
+        assert_eq!(body(&moved)["transition"], "rewind");
+        assert_eq!(body(&moved)["cleared_approvals"], json!(["placement"]));
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, "schematic");
+        assert!(
+            state.gate_approvals.contains_key("architecture"),
+            "a gate before the target keeps its approval"
+        );
+        assert!(
+            !state.gate_approvals.contains_key("placement"),
+            "a gate after the target must be granted again"
+        );
+        let entry = state.history.last().unwrap();
+        assert_eq!(entry.kind, HistoryKind::Rewind);
+        assert_eq!(entry.from.as_deref(), Some("schematic_review"));
+        assert_eq!(entry.to, "schematic");
+        assert_eq!(entry.reason.as_deref(), Some("R3 pull-up missing"));
+        assert!(entry.records.is_empty() && entry.package_hash.is_none());
+
+        let status = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            body(&status)["fix_rounds"],
+            json!({ "schematic_review": 1, "prefab_review": 0 })
+        );
+    }
+
+    /// Predecessor note: a rewind INTO a gate is the entry the next approval
+    /// compares against, so it must carry the package keys — and the gate's
+    /// own approval (at the target) is cleared, so returning asks again.
+    #[tokio::test]
+    async fn a_rewind_into_a_gate_records_the_keys_its_next_approval_needs() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+        let mut state = state_on_disk(&dir);
+        let visit = state.history.len() - 1;
+        let entered = state.history[visit].clone();
+        let mut approval = planted_approval(visit);
+        approval.design_hash_at_approval = entered.design_hash.clone();
+        approval.package_hash_at_approval = entered.package_hash.clone().unwrap();
+        state.gate_approvals.insert("architecture".into(), approval);
+        plant_state(&dir, &state);
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
+
+        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins, fixed\n").unwrap();
+        let rewound = advance_with(
+            &dir,
+            &ctx(),
+            &job_id,
+            "gate:architecture",
+            json!({ "reason": "pin conflict on GPIO0" }),
+        )
+        .await;
+        assert!(!rewound.is_error, "{}", text(&rewound));
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, "gate:architecture");
+        assert!(
+            state.gate_approvals.is_empty(),
+            "the target gate's own approval is cleared"
+        );
+        let entry = state.history.last().unwrap();
+        assert_eq!(entry.kind, HistoryKind::Rewind);
+        let expected = package_hash(
+            &flow_path(&dir).join("records"),
+            &[
+                "constraints.md",
+                "architecture.md",
+                "worst-case.md",
+                "pin-plan.md",
+            ],
+        )
+        .unwrap();
+        assert_eq!(entry.package_hash.as_deref(), Some(expected.hash.as_str()));
+        assert_eq!(entry.package_files, expected.files);
+        assert_ne!(
+            entry.package_hash, entered.package_hash,
+            "the fixed pin plan"
+        );
+        assert_eq!(current_visit(&state), Some(state.history.len() - 1));
+
+        let again = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(
+            error_kind(&again),
+            "stale_target",
+            "a rewind and return asks again"
+        );
+    }
+
+    /// Acceptance 1.5: `closed` from a middle phase is an abandon — it needs
+    /// a reason, ends the job, and lets the next job start.
+    #[tokio::test]
+    async fn closing_from_a_middle_phase_needs_a_reason_and_ends_the_job() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let left = advance(
+            &dir,
+            &job_id,
+            "architecture",
+            &[("constraints.md", "# C\n")],
+        )
+        .await;
+        assert!(!left.is_error, "{}", text(&left));
+        let before = state_bytes(&dir);
+
+        let unexplained = advance_with(&dir, &ctx(), &job_id, "closed", json!({})).await;
+        assert_eq!(error_kind(&unexplained), "invalid_argument");
+        assert_eq!(body(&unexplained)["error"]["field"], "reason");
+        assert_eq!(state_bytes(&dir), before);
+
+        let abandoned = advance_with(
+            &dir,
+            &ctx(),
+            &job_id,
+            "closed",
+            json!({ "reason": "customer cancelled the board" }),
+        )
+        .await;
+        assert!(!abandoned.is_error, "{}", text(&abandoned));
+        assert_eq!(body(&abandoned)["transition"], "abandon");
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, CLOSED);
+        let entry = state.history.last().unwrap();
+        assert_eq!(entry.kind, HistoryKind::Abandon);
+        assert_eq!(entry.from.as_deref(), Some("architecture"));
+        assert_eq!(entry.to, CLOSED);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("customer cancelled the board")
+        );
+
+        let after = advance_with(
+            &dir,
+            &ctx(),
+            &job_id,
+            "closed",
+            json!({ "reason": "again" }),
+        )
+        .await;
+        assert_eq!(
+            error_kind(&after),
+            "stale_target",
+            "a closed job moves no more"
+        );
+        let next = handle_flow_start(
+            &json!({ "project_dir": arg(&dir), "objective": "Next board", "lane": "new_board" }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!next.is_error, "{}", text(&next));
+    }
+
+    /// Acceptance 1.5 / D6: the cited calls are checked against the observer
+    /// ring during the call, stored, and never used to refuse.
+    #[tokio::test]
+    async fn the_evidence_check_reports_what_the_ring_confirms_and_never_refuses() {
+        let dir = project();
+        let job_id = open(&dir, "photo_to_kicad", Some(&PHOTO_PHASES)).await;
+        let ctx = ctx();
+        ctx.observer
+            .record(call("run_erc", CallStatus::Error))
+            .await;
+        ctx.observer.record(call("run_erc", CallStatus::Ok)).await;
+        ctx.observer
+            .record(call("get_drc_violations", CallStatus::Error))
+            .await;
+
+        let result = advance_with(
+            &dir,
+            &ctx,
+            &job_id,
+            "schematic_review",
+            json!({
+                "records": [{ "filename": "schematic-evidence.md", "content": "ERC clean\n" }],
+                "evidence_calls": ["run_erc", "render_schematic_png"]
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let expected = EvidenceCheck {
+            confirmed: vec!["run_erc".into()],
+            not_ok: Vec::new(),
+            absent: vec!["render_schematic_png".into()],
+            ring_calls: 3,
+        };
+        let entry = state_on_disk(&dir).history.last().unwrap().clone();
+        assert_eq!(entry.evidence_check, Some(expected.clone()));
+        assert_eq!(entry.evidence_calls, ["run_erc", "render_schematic_png"]);
+        assert_eq!(body(&result)["evidence_check"], json!(expected));
+        let status = handle_flow_status(&json!({ "project_dir": arg(&dir) }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            body(&status)["last_transition"]["evidence_check"]["confirmed"],
+            json!(["run_erc"])
+        );
+
+        let second = advance_with(
+            &dir,
+            &ctx,
+            &job_id,
+            "placement",
+            json!({
+                "records": [{ "filename": "ledger-schematic.md", "content": "no findings\n" }],
+                "evidence_calls": ["get_drc_violations"]
+            }),
+        )
+        .await;
+        assert!(!second.is_error, "{}", text(&second));
+        let check = state_on_disk(&dir)
+            .history
+            .last()
+            .unwrap()
+            .evidence_check
+            .clone()
+            .unwrap();
+        assert_eq!(
+            check.not_ok,
+            ["get_drc_violations"],
+            "present only as an error"
+        );
+        assert!(check.confirmed.is_empty() && check.absent.is_empty());
     }
 }
