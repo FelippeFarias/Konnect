@@ -2082,10 +2082,10 @@ fn advance_forward(
 }
 
 /// A rewind (any earlier entry) or an abandon (`closed` before the last
-/// entry), D3: a non-empty `reason`, no `records`. A rewind removes the
-/// approval of every gate at or after its target — they are granted again on
-/// the way back — and a rewind into a gate records that gate's keys, since
-/// its entry is the one the next approval is compared against (D11).
+/// entry), D3: never into a gate, a non-empty `reason`, no `records`. A
+/// rewind removes the approval of every gate at or after its target — they
+/// are granted again on the way back, when the forward move into the gate
+/// records the keys the next approval is compared against (D11).
 fn move_back(
     project: &Path,
     flow_dir: &Path,
@@ -2093,6 +2093,23 @@ fn move_back(
     request: &AdvanceRequest,
     transition: Transition,
 ) -> Result<(String, Value), CallToolResult> {
+    // Fix round 1, DECISION B: a rewind into a gate would bind the next
+    // approval to the design as it is now, behind a package produced before.
+    if is_gate(&request.to_phase) {
+        let producer = GATED_PHASES
+            .iter()
+            .find(|(_, gate)| *gate == request.to_phase)
+            .map_or("the phase before it", |(phase, _)| *phase);
+        return Err(invalid_arg(
+            "to_phase",
+            &format!(
+                "a rewind cannot target the gate {:?}; rewind to {producer:?}, the phase that \
+                 produces its package, and advance into the gate again so its approval sees \
+                 a fresh package. Nothing was written.",
+                request.to_phase
+            ),
+        ));
+    }
     let leaving = state.phase.clone();
     let kind = if transition == Transition::Rewind {
         HistoryKind::Rewind
@@ -2145,7 +2162,6 @@ fn move_back(
     entry.evidence_calls = request.evidence_calls.clone();
     entry.evidence_check = request.evidence_check.clone();
     entry.reason = Some(reason);
-    record_gate_keys(flow_dir, &state.phases, &mut entry)?;
     commit_transition(flow_dir, state, entry, cleared)
 }
 
@@ -4892,11 +4908,14 @@ mod rewind_tests {
         );
     }
 
-    /// Predecessor note: a rewind INTO a gate is the entry the next approval
-    /// compares against, so it must carry the package keys — and the gate's
-    /// own approval (at the target) is cleared, so returning asks again.
+    /// A rewind to the phase that produces a gate's package clears that
+    /// gate's approval, and the forward move back into the gate is the entry
+    /// the next approval compares against, so it carries the fresh package
+    /// keys — returning asks again. (Before Fix round 1 this test rewound
+    /// INTO the gate; DECISION B, reviewer 11 minor 4, now refuses that —
+    /// see `a_rewind_cannot_target_a_gate`.)
     #[tokio::test]
-    async fn a_rewind_into_a_gate_records_the_keys_its_next_approval_needs() {
+    async fn a_rewind_to_a_gates_phase_re_enters_it_with_the_keys_its_next_approval_needs() {
         let dir = project();
         let job_id = at_architecture_gate(&dir).await;
         let mut state = state_on_disk(&dir);
@@ -4910,24 +4929,45 @@ mod rewind_tests {
         let left = advance(&dir, &job_id, "schematic", &[]).await;
         assert!(!left.is_error, "{}", text(&left));
 
-        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins, fixed\n").unwrap();
         let rewound = advance_with(
             &dir,
             &ctx(),
             &job_id,
-            "gate:architecture",
+            "architecture",
             json!({ "reason": "pin conflict on GPIO0" }),
         )
         .await;
         assert!(!rewound.is_error, "{}", text(&rewound));
+        assert_eq!(body(&rewound)["cleared_approvals"], json!(["architecture"]));
         let state = state_on_disk(&dir);
-        assert_eq!(state.phase, "gate:architecture");
+        assert_eq!(state.phase, "architecture");
         assert!(
             state.gate_approvals.is_empty(),
-            "the target gate's own approval is cleared"
+            "the gate after the target loses its approval"
         );
+        let rewind = state.history.last().unwrap();
+        assert_eq!(rewind.kind, HistoryKind::Rewind);
+        assert!(
+            rewind.package_hash.is_none(),
+            "a rewind never enters a gate"
+        );
+
+        let re_entered = advance(
+            &dir,
+            &job_id,
+            "gate:architecture",
+            &[
+                ("architecture.md", PASSING_ARCHITECTURE),
+                ("worst-case.md", "# WC\n"),
+                ("pin-plan.md", "# Pins, fixed\n"),
+            ],
+        )
+        .await;
+        assert!(!re_entered.is_error, "{}", text(&re_entered));
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, "gate:architecture");
         let entry = state.history.last().unwrap();
-        assert_eq!(entry.kind, HistoryKind::Rewind);
+        assert_eq!(entry.kind, HistoryKind::Advance);
         let expected = package_hash(
             &flow_path(&dir).join("records"),
             &[
@@ -4951,6 +4991,41 @@ mod rewind_tests {
             error_kind(&again),
             "stale_target",
             "a rewind and return asks again"
+        );
+    }
+
+    /// Fix round 1, DECISION B (reviewer 11 minor 4): a rewind into a gate
+    /// would bind the next approval to the design as it is at rewind time —
+    /// a routed board behind a placement package that predates the routing.
+    /// The refusal comes before every other check (even the missing reason)
+    /// and names the gate and the phase to rewind to instead.
+    #[tokio::test]
+    async fn a_rewind_cannot_target_a_gate() {
+        let dir = project();
+        let mut state = job_at("routing");
+        state
+            .gate_approvals
+            .insert("placement".into(), planted_approval(0));
+        plant_state(&dir, &state);
+        let before = state_bytes(&dir);
+
+        for extra in [
+            json!({ "reason": "the routing broke the placement" }),
+            json!({}),
+        ] {
+            let refused = advance_with(&dir, &ctx(), JOB_ID, "gate:placement", extra.clone()).await;
+            assert_eq!(error_kind(&refused), "invalid_argument", "{extra}");
+            assert_eq!(body(&refused)["error"]["field"], "to_phase", "{extra}");
+            let message = body(&refused)["message"].as_str().unwrap().to_string();
+            assert!(
+                message.contains("\"gate:placement\"") && message.contains("\"placement\""),
+                "{extra}: the refusal names the gate and its producing phase: {message}"
+            );
+            assert_eq!(state_bytes(&dir), before, "{extra}: nothing is written");
+        }
+        assert!(
+            !flow_path(&dir).join("log").exists(),
+            "a refused rewind appends no log entry"
         );
     }
 
@@ -5419,10 +5494,12 @@ mod gate_tests {
         assert_eq!(error_kind(&left), "stale_target");
     }
 
-    /// After a rewind into the gate, the approval binds to the REWIND entry's
-    /// keys (the package as fixed), and leaving works again.
+    /// After a rewind to the gate's phase and the forward move back into the
+    /// gate, the approval binds to the RE-ENTRY's keys (the package as fixed),
+    /// and leaving works again. (Before Fix round 1 this rewound INTO the
+    /// gate; DECISION B now refuses that.)
     #[tokio::test]
-    async fn an_approval_after_a_rewind_into_the_gate_binds_to_the_rewind_entry() {
+    async fn an_approval_after_a_rewind_and_re_entry_binds_to_the_re_entry() {
         let dir = project();
         let job_id = at_architecture_gate(&dir).await;
         assert!(
@@ -5431,16 +5508,27 @@ mod gate_tests {
                 .is_error
         );
         assert!(!advance(&dir, &job_id, "schematic", &[]).await.is_error);
-        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins, fixed\n").unwrap();
         let rewound = advance_with(
             &dir,
             &ctx(),
             &job_id,
-            "gate:architecture",
+            "architecture",
             json!({ "reason": "pin conflict" }),
         )
         .await;
         assert!(!rewound.is_error, "{}", text(&rewound));
+        let re_entered = advance(
+            &dir,
+            &job_id,
+            "gate:architecture",
+            &[
+                ("architecture.md", PASSING_ARCHITECTURE),
+                ("worst-case.md", "# WC\n"),
+                ("pin-plan.md", "# Pins, fixed\n"),
+            ],
+        )
+        .await;
+        assert!(!re_entered.is_error, "{}", text(&re_entered));
 
         let approved = gate(&dir, &job_id, "architecture", "approve", "agora sim").await;
         assert!(!approved.is_error, "{}", text(&approved));
