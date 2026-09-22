@@ -955,3 +955,69 @@ async fn the_journal_tools_answer_through_the_published_contract() {
     findings.sort();
     assert_eq!(findings, ["a finding", "racer one", "racer two"]);
 }
+
+// ─── Registration: through the meta-tools a client calls ──────────────────────
+
+/// Spec "the flow toolset is discoverable", through the two meta-tools a
+/// client actually calls: `list_toolboxes` lists `flow` (six tools, category
+/// `orchestration`), and `load_toolset("flow")` exposes exactly the six tools
+/// in their published order.
+#[tokio::test]
+async fn list_toolboxes_and_load_toolset_expose_the_six_flow_tools() {
+    use konnect_core::router::meta_tools::handle_meta_tool;
+    let ctx = Arc::new(ToolContext::new(
+        ServerConfig::default(),
+        Arc::new(ToolRouter::new()),
+    ));
+
+    let listed = handle_meta_tool("list_toolboxes", &json!({}), &ctx)
+        .await
+        .expect("list_toolboxes is a meta-tool");
+    let listing = payload(&listed);
+    let flow = listing["toolsets"]
+        .as_array()
+        .expect("toolsets")
+        .iter()
+        .find(|toolset| toolset["name"] == "flow")
+        .unwrap_or_else(|| panic!("list_toolboxes has no flow entry: {listing}"))
+        .clone();
+    assert_eq!(flow["tool_count"], 6, "{flow}");
+    assert_eq!(flow["category"], "orchestration", "{flow}");
+    assert_eq!(flow["loaded"], false, "{flow}");
+
+    let loaded = handle_meta_tool("load_toolset", &json!({ "name": "flow" }), &ctx)
+        .await
+        .expect("load_toolset is a meta-tool");
+    assert!(!loaded.is_error, "{}", text(&loaded));
+    let names: Vec<String> = payload(&loaded)["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("name").to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "flow_status",
+            "flow_start",
+            "flow_advance",
+            "flow_gate",
+            "flow_log",
+            "flow_defer",
+        ]
+    );
+
+    let relisted = payload(
+        &handle_meta_tool("list_toolboxes", &json!({}), &ctx)
+            .await
+            .expect("list_toolboxes"),
+    );
+    let flow = relisted["toolsets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|toolset| toolset["name"] == "flow")
+        .unwrap()
+        .clone();
+    assert_eq!(flow["loaded"], true, "{flow}");
+}
