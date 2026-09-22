@@ -177,7 +177,7 @@ fn agents_make_claimed_evidence_executable() {
     let cases = [
         (
             "kicad-schematic-build-agent.md",
-            &["sch_analysis", "sch_export", "photo_intake"][..],
+            &["sch_analysis", "sch_export", "photo_intake", "flow"][..],
             &[
                 "find_shorted_nets",
                 "run_erc",
@@ -187,20 +187,32 @@ fn agents_make_claimed_evidence_executable() {
                 // `approved` instead is the mistake this marker forbids.
                 "approval_valid",
                 "INCOMPLETE",
+                // Step 9 ends a job run in `schematic_review`.
+                "flow_advance",
             ][..],
         ),
         (
             "kicad-design-review-agent.md",
-            &["sch_export", "pcb_export"][..],
-            &["run_erc", "get_drc_violations", "INCOMPLETE"][..],
+            &["sch_export", "pcb_export", "flow"][..],
+            &[
+                "run_erc",
+                "get_drc_violations",
+                "INCOMPLETE",
+                "flow_advance",
+            ][..],
         ),
         (
             // Consumes a `design_brief` from `pcb-design-reconstruction-agent`;
             // `pcb_export` is already loaded for DRC and also carries
             // `get_drc_violations`, so no extra toolset is needed for the gate.
             "kicad-pcb-layout-agent.md",
-            &["photo_intake", "pcb_export"][..],
-            &["load_photo_review_map", "approval_valid", "INCOMPLETE"][..],
+            &["photo_intake", "pcb_export", "flow"][..],
+            &[
+                "load_photo_review_map",
+                "approval_valid",
+                "INCOMPLETE",
+                "flow_advance",
+            ][..],
         ),
         (
             "pcb-design-reconstruction-agent.md",
@@ -212,6 +224,31 @@ fn agents_make_claimed_evidence_executable() {
                 "search_footprints",
                 "INCOMPLETE",
             ][..],
+        ),
+        // The agents told to end a job run with `flow_advance`, which they
+        // can only call after loading `flow` (design D10 item 3). The
+        // schematic, layout and review cases above carry the same pair.
+        // `kicad-sourcing-agent` and `kicad-library-agent` load `flow` for
+        // status and handoffs but never advance, so they are not enrolled.
+        (
+            "kicad-requirements-agent.md",
+            &["flow"][..],
+            &["flow_advance"][..],
+        ),
+        (
+            "kicad-architecture-agent.md",
+            &["flow"][..],
+            &["flow_advance"][..],
+        ),
+        (
+            "kicad-manufacture-agent.md",
+            &["flow"][..],
+            &["flow_advance"][..],
+        ),
+        (
+            "kicad-curator-agent.md",
+            &["flow"][..],
+            &["flow_advance"][..],
         ),
     ];
     let mut missing = Vec::new();
