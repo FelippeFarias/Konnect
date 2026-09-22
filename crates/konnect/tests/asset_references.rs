@@ -1846,3 +1846,115 @@ fn every_agent_that_names_a_flow_tool_loads_flow() {
         missing.join(", ")
     );
 }
+
+/// Spec "the record rules an agent needs are preloaded": each flow record's
+/// required sections are stated in a SKILL.md body the writing agent
+/// preloads, or in the agent file itself — never only in a reference file,
+/// which an agent does not load by default.
+#[test]
+fn record_sections_are_stated_where_their_writer_loads_them() {
+    let architecture_skill = include_str!("../assets/skills/kicad-architecture/SKILL.md");
+    let agents = assets_root().join("agents");
+    let read = |filename: &str| std::fs::read_to_string(agents.join(filename)).unwrap();
+    let mut lost = Vec::new();
+
+    // Written by kicad-requirements-agent and kicad-architecture-agent, both
+    // of which preload kicad-architecture.
+    for filename in ["kicad-requirements-agent.md", "kicad-architecture-agent.md"] {
+        let text = read(filename).replace("\r\n", "\n");
+        let frontmatter = text
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map_or("", |(head, _)| head);
+        if !yaml_list(frontmatter, "skills").contains(&"kicad-architecture".to_string()) {
+            lost.push(format!("{filename} no longer preloads kicad-architecture"));
+        }
+    }
+    lost.extend(missing_markers(
+        "kicad-architecture/SKILL.md constraints.md",
+        section(
+            architecture_skill,
+            "### `constraints.md` — required sections",
+            "\n---",
+        ),
+        &[
+            "# Constraints — <objective>",
+            "## Scope",
+            "## Constraints",
+            "## Decisions",
+            "## Open questions",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-architecture/SKILL.md architecture records",
+        section(
+            architecture_skill,
+            "### Required sections",
+            "### The readiness line",
+        ),
+        &[
+            "# Architecture — <objective>",
+            "## Blocks",
+            "## Power tree and budget",
+            "## Interfaces",
+            "## Parts list",
+            "# Worst-case records — <objective>",
+            "# Pin plan — <objective>",
+            "| Pin | Function | Net | Constraint | Source |",
+        ],
+    ));
+
+    // Written by agents that state the sections in their own file.
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md manufacturing.md",
+        section(
+            &read("kicad-manufacture-agent.md"),
+            "### `manufacturing.md` — required sections",
+            "\n### ",
+        ),
+        &[
+            "# Manufacturing — <objective>",
+            "## Order contract",
+            "## BOM integrity",
+            "## Indicative cost",
+            "## Release notes",
+            "## Checks at the purchase gate",
+            "## Verdict",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-schematic-build-agent.md schematic-evidence.md",
+        &read("kicad-schematic-build-agent.md"),
+        &[
+            "`schematic-evidence.md` holds three sections: `## Validation Results`",
+            "`## Unresolved Concerns`",
+            "`## Layout Handoff`",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-pcb-layout-agent.md placement.md/routing.md",
+        &read("kicad-pcb-layout-agent.md"),
+        &[
+            "`placement.md` holds `## Constraint record`",
+            "`## Images`",
+            "`## Placement gate`",
+            "`routing.md` holds",
+            "`## Routing gate`",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-design-review-agent.md ledgers",
+        &read("kicad-design-review-agent.md"),
+        &[
+            "The ledger holds `## Findings`",
+            "`## Checked and correct`",
+            "`## Verdict`",
+        ],
+    ));
+
+    assert!(
+        lost.is_empty(),
+        "a flow record's required sections are not stated where its writer loads them:\n  {}",
+        lost.join("\n  ")
+    );
+}
