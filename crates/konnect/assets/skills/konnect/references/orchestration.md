@@ -138,9 +138,16 @@ decision in one message:
   and records each result with `flow_log(project_dir, job_id, kind, message)`,
   `kind` `evidence`. Only then does it ask for the `purchase` decision with
   `flow_gate`. A check that failed is a FIX (§5), not an approval.
+- Once `flow_gate` records the `purchase` approval — its `user_words`
+  confirming those checks were discharged — the session
+  records the package as `READY` in the skill's sense with
+  `flow_log(project_dir, job_id, kind, message)`, `kind` `evidence`, naming
+  that approval. Placing or uploading the order is the user's own action; no
+  agent, including `kicad-manufacture-agent`, ever uploads it.
 - A rejection records the decision; route its reason as a FIX (§5).
-- `flow_status` reports every approval's validity against the current files
-  in `gate_approvals`.
+- `flow_status`'s `gate_approvals` reports `valid`
+  only for the gate the job stands at now (§7); a passed gate reports
+  `status: passed` with no `valid` field.
 - **Autonomous mode** (chosen at `flow_start`, per job, only on the user's
   request): the session may approve `architecture` and `placement` with empty
   `user_words`, recorded as `approved_by: session`, with its reasoning in
