@@ -33,6 +33,26 @@ load_toolset("project")
 load_toolset("templates")
 ```
 
+**In a flow job** — only when the brief names a `job_id` and its
+`project_dir` — also load the flow toolset and read the approved architecture
+before Step 1:
+
+```
+load_toolset("flow")   # flow_status, flow_advance, flow_log
+```
+
+Call `flow_status(project_dir, read)` with `read` listing the records the
+brief names: `architecture.md`, `pin-plan.md` and `worst-case.md`, plus any
+library handoff (`handoffs/<NN>-library.md`). The response's `phase` must be
+`schematic`; any other phase means build nothing and report it. Those records
+passed `gate:architecture`, so Step 1's architecture brief is already
+approved: build to them, and report a needed departure (a pin moved, a part
+substituted) as an unresolved concern instead of making it silently. A
+requested record listed in `missing` is never rebuilt from the conversation;
+in a photo-lane job the approved map or brief below takes its place. Step 9
+records the phase. A run whose brief names no `job_id` calls no `flow_*` tool
+and skips Step 9.
+
 ### Building from an approved photo-intake map
 
 When the work arrives as a review map from `pcb-photo-intake-agent` — a
@@ -196,6 +216,31 @@ load_toolset("photo_intake")
 - State the operating environment and the firmware requirements the hardware
   relies on
 - Mark every value that is an assumption rather than a requirement
+
+**Step 9: Record the phase (flow job only)**
+- Applies only when the brief names a `job_id`; a job-less run skips this
+  step and calls no `flow_*` tool.
+- Only when the Quality Bars below hold. An `INCOMPLETE` build is not an
+  exit: do not advance, return the report.
+- With the flow toolset from Setup (`load_toolset("flow")`), call
+  `flow_advance(project_dir, job_id, to_phase, records, evidence_calls)`:
+  `to_phase` is `schematic_review`; `records` holds `schematic-evidence.md`
+  as `{filename, content}`; `evidence_calls` lists every tool its results
+  cite (`run_erc`, `find_shorted_nets`, `validate_wire_connections`,
+  `validate_component_connections`, `render_schematic_png`, …).
+- `schematic-evidence.md` holds three sections: `## Validation Results` —
+  the final Step 6/7 results after the last edit (ERC, shorted nets,
+  connection validators, rendered inspection, cross-sheet references,
+  worst-case values, overall evidence status); `## Unresolved Concerns`; and
+  `## Layout Handoff` — the Step 8 handoff. A record already on disk never
+  counts: supply it in this call.
+- A refusal wrote nothing: fix a record that is yours and call once more;
+  report any other refusal with its text quoted.
+- Then persist your report with
+  `flow_log(project_dir, job_id, kind, message, role)` — `kind` `handoff`,
+  `role` `schematic`, `message` the Output Format report below, headed by
+  `job_id`, `phase` (`schematic`), `role`, `verdict` (`DONE`, `FIX` or
+  `BLOCKED`) and, on `FIX`, `failing_layer` — and return the same text.
 
 ### Placement Rules
 
