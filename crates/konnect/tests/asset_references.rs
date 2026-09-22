@@ -1958,3 +1958,147 @@ fn record_sections_are_stated_where_their_writer_loads_them() {
         lost.join("\n  ")
     );
 }
+
+/// Fix round 1 of the konnect-orchestrator change (tasks 8.5 and 8.7,
+/// DECISIONs A, D, F, G): the session-facing reference states each tool rule
+/// the round added, in the section a session reads it from — the converse
+/// gate rule in §1, the manufacturing exception in §2's row, and in §7 the
+/// `passed` approval and the post-commit `warning` a session must not retry.
+#[test]
+fn orchestration_reference_states_the_fix_round_one_rules() {
+    let orchestration = include_str!("../assets/skills/konnect/references/orchestration.md");
+    let mut lost = Vec::new();
+    lost.extend(missing_markers(
+        "orchestration.md §1",
+        section(orchestration, "## 1. Lanes", "\n## 2."),
+        &[
+            "a gate's phase must be present too:",
+            "`gate:architecture` requires `architecture`",
+            "`gate:placement` requires `placement`",
+            "`gate:purchase` requires `manufacturing`",
+            "an approval bound to a record from a closed or earlier job",
+            "`flow_start` refuses a `phases` list that breaks either rule",
+        ],
+    ));
+    let manufacturing_row = section(orchestration, "| `manufacturing` |", "\n");
+    lost.extend(missing_markers(
+        "orchestration.md §2 manufacturing row",
+        manufacturing_row,
+        &[
+            "an `INCOMPLETE` package is not an exit, except when its only open items are the \
+             three `## Checks at the purchase gate` entries, which may exit to `gate:purchase`",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "orchestration.md §7",
+        section(orchestration, "## 7. Resume", "\n## 8."),
+        &[
+            "`valid` matters only while `phase == \"gate:<name>\"`",
+            "`status: current`",
+            "reports `status: passed` with the hashes it was approved at and no `valid` field",
+            "not a reason to re-ask or rewind",
+            "A successful `flow_gate`, `flow_advance` or `flow_defer` response always carries \
+             `warning`",
+            "the state change committed in `STATE.md`",
+            "never repeat the call",
+            "repair only what the warning names",
+        ],
+    ));
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
+
+/// Task 8.6 (DECISION E, reviewer 11 minor 4): `place_component` on the
+/// scratch board resolves only the scratch project's own tables and the
+/// global ones, so Step 6 must register the Step 4 libraries there BEFORE it
+/// places anything — with real parameter names, project scope and the scratch
+/// project's path.
+#[test]
+fn library_agent_registers_its_library_in_the_scratch_project() {
+    let agent = include_str!("../assets/agents/kicad-library-agent.md");
+    let step6 = section(agent, "**Step 6: Disposable placement**", "**Step 7:");
+    let lost = missing_markers(
+        "kicad-library-agent.md Step 6",
+        step6,
+        &[
+            "Before placing, register the Step 4 libraries in the scratch project's own tables",
+            "with the nickname and path Step 4 used",
+            "`scope: \"project\"`",
+            "`project` the scratch project's path",
+            "`register_symbol_library(nickname, library_path, scope, project)`",
+            "`register_footprint_library(nickname, library_path, scope, project)`",
+            "which the scratch project cannot see",
+        ],
+    );
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+    let flat_step6 = flat(step6);
+    let register = flat_step6
+        .find("register_symbol_library")
+        .expect("registration in Step 6");
+    let place = flat_step6
+        .find("Then place the symbol")
+        .expect("placement in Step 6");
+    assert!(
+        register < place,
+        "Step 6 registers the libraries before it places: {flat_step6}"
+    );
+}
+
+/// Task 8.7 (DECISION F, reviewer 11 minor 5): the manufacture agent's
+/// verdicts use the kicad-manufacture skill's vocabulary — a warning keeps
+/// `INCOMPLETE`, and `READY` no longer means "only the purchase-gate checks
+/// remain" — and the phase exits on `READY` or on an `INCOMPLETE` whose only
+/// open items are exactly the three purchase-gate checks, nothing else. The
+/// skill's side of the vocabulary is pinned too, since it is the reference.
+#[test]
+fn manufacture_agent_verdicts_match_the_skill() {
+    let agent = include_str!("../assets/agents/kicad-manufacture-agent.md");
+    let skill = include_str!("../assets/skills/kicad-manufacture/SKILL.md");
+    let mut lost = Vec::new();
+
+    let stale = "and only the purchase-gate checks remain";
+    if flat(agent).contains(stale) {
+        lost.push(format!("kicad-manufacture-agent.md again says `{stale}`"));
+    }
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md Verdict",
+        section(agent, "- **Verdict**:", "**Firmware-contract non-goal.**"),
+        &[
+            "`READY` when every check your tools can run passed with no warning and no \
+             purchase-gate check is still open",
+            "left an artifact missing, or passed with a warning",
+            "or when a purchase-gate check is still open",
+            "\"Only `READY` permits upload\"",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md Ending the run",
+        section(agent, "### Ending the run", "### Hard rules"),
+        &[
+            "In a job with a `READY` verdict, or an `INCOMPLETE` verdict whose only open items \
+             are exactly the three `## Checks at the purchase gate` entries",
+            "and nothing else open",
+            "`to_phase` is `gate:purchase`",
+            "A `NOT READY` package, or an `INCOMPLETE` one with any other open item",
+            "is not an exit: do not advance",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-manufacture-agent.md Record the phase",
+        section(agent, "- **Record the phase**", "- **Persist the handoff**"),
+        &[
+            "only on a `READY` verdict, or on an `INCOMPLETE` one whose only open items are the \
+             three purchase-gate checks",
+        ],
+    ));
+    lost.extend(missing_markers(
+        "kicad-manufacture/SKILL.md",
+        skill,
+        &[
+            "Any warning or missing requested artifact type keeps the result `INCOMPLETE`.",
+            "Only `READY` permits upload.",
+            "A required check or artifact that cannot be established makes the manufacturing \
+             verdict `INCOMPLETE`.",
+        ],
+    ));
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
