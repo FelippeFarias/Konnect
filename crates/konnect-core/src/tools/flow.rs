@@ -1868,9 +1868,10 @@ fn transact<T>(
     }
 }
 
-/// An accepted gate decision or transition: its response, and the derived
-/// side files that must FOLLOW the `STATE.md` commit (D2, Fix round 1,
-/// DECISION C) so neither can record a change `STATE.md` never held.
+/// An accepted gate decision, transition or deferred item: its response, and
+/// the derived side files that must FOLLOW the `STATE.md` commit (D2, Fix
+/// round 1, DECISIONs C and H) so neither can record a change `STATE.md`
+/// never held.
 struct Committed {
     response: Value,
     /// `records/gates/<gate>.md`'s file name and full text (`flow_gate` only).
@@ -1879,11 +1880,12 @@ struct Committed {
     log: (String, String),
 }
 
-/// `transact_state` for `flow_gate` and `flow_advance`: `STATE.md`'s
-/// successful write is the one commit point. The gate file and the log entry
-/// are written only after it, and a failure there is a `warning` on the
-/// success response (the `flow_start` `log_error` pattern) — never an error,
-/// which would invite a retry of a decision `STATE.md` already holds.
+/// `transact_state` for `flow_gate`, `flow_advance` and `flow_defer`:
+/// `STATE.md`'s successful write is the one commit point. The gate file and
+/// the log entry are written only after it, and a failure there is a
+/// `warning` on the success response (the `flow_start` `log_error` pattern) —
+/// never an error, which would invite a retry of a change `STATE.md` already
+/// holds.
 fn transact_then_record(
     project: &Path,
     apply: impl FnOnce(&Path, &Path, &str) -> Result<(String, Committed), CallToolResult>,
@@ -3037,8 +3039,8 @@ async fn handle_flow_defer(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         owner,
     };
     Ok(tokio::task::spawn_blocking(move || {
-        transact_state(&project, |flow_dir, state_path, current| {
-            apply_defer(flow_dir, state_path, current, &request)
+        transact_then_record(&project, |_, state_path, current| {
+            apply_defer(state_path, current, &request)
         })
     })
     .await?)
@@ -3046,12 +3048,13 @@ async fn handle_flow_defer(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
 
 /// Append the item to its list under the `STATE.md` lock, in any phase —
 /// `closed` included; lists are append-only (resolution is a `flow_log`).
+/// The log entry is returned, not written: it follows the commit (D2, Fix
+/// round 1, DECISION H).
 fn apply_defer(
-    flow_dir: &Path,
     state_path: &Path,
     current: &str,
     request: &DeferRequest,
-) -> Result<(String, Value), CallToolResult> {
+) -> Result<(String, Committed), CallToolResult> {
     let mut state = load_job(state_path, current, &request.job_id)?;
     let at = crate::tools::photo_intake::now_rfc3339_utc();
     let item = DeferredItem {
@@ -3076,15 +3079,18 @@ fn apply_defer(
         lines.push(format!("owner: {}", one_line(owner)));
     }
     let log = log_entry(&at, &format!("defer {}", request.kind), &lines);
-    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
-    let response = json!({
-        "job_id": state.job_id,
-        "kind": request.kind,
-        "list": list_name,
-        "count": count,
-        "item": item,
-    });
-    Ok((render_state(&state), response))
+    let committed = Committed {
+        response: json!({
+            "job_id": state.job_id,
+            "kind": request.kind,
+            "list": list_name,
+            "count": count,
+            "item": item,
+        }),
+        gate_file: None,
+        log: (log_file_name(&state), log),
+    };
+    Ok((render_state(&state), committed))
 }
 
 // ─── Tool definitions (design D1) ─────────────────────────────────────────────
@@ -6129,6 +6135,59 @@ mod journal_tests {
             .collect();
         descriptions.sort();
         assert_eq!(descriptions, ["finding one", "finding two"]);
+    }
+
+    /// Fix round 1, DECISION H: `flow_defer`'s log entry follows the
+    /// `STATE.md` commit, as it does for gates and transitions. With `log` a
+    /// plain file the append fails, yet the item stands in `STATE.md` and the
+    /// failure is a `warning` on a success; once the log can be written, the
+    /// next defer logs and reports `warning: null`.
+    #[tokio::test]
+    async fn a_defer_log_failure_after_state_commits_is_a_warning() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let log_dir = flow_path(&dir).join("log");
+        std::fs::remove_dir_all(&log_dir).unwrap();
+        std::fs::write(&log_dir, "not a directory\n").unwrap();
+
+        let deferred = defer(&dir, &job_id, "finding", json!({})).await;
+        assert!(!deferred.is_error, "{}", text(&deferred));
+        assert_eq!(body(&deferred)["list"], "deferred_findings");
+        let warning = body(&deferred)["warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a warning field: {}", text(&deferred)))
+            .to_string();
+        assert!(
+            warning.contains(&format!("flow{}log", std::path::MAIN_SEPARATOR)),
+            "the warning names the failed write: {warning}"
+        );
+        let state = state_on_disk(&dir);
+        assert_eq!(state.deferred_findings.len(), 1);
+        assert_eq!(
+            state.deferred_findings[0].description,
+            "silk R3 overlaps pad"
+        );
+        assert!(log_dir.is_file(), "the blocker is left as it was");
+
+        std::fs::remove_file(&log_dir).unwrap();
+        let logged = defer(
+            &dir,
+            &job_id,
+            "queue_item",
+            json!({ "description": "order the reel" }),
+        )
+        .await;
+        assert!(!logged.is_error, "{}", text(&logged));
+        assert!(
+            body(&logged).get("warning").is_some_and(Value::is_null),
+            "warning is present and null on a clean defer: {}",
+            text(&logged)
+        );
+        let text = std::fs::read_to_string(log_path(&dir, &job_id)).unwrap();
+        assert!(
+            text.contains("defer queue_item") && text.contains("order the reel"),
+            "{text}"
+        );
     }
 
     /// Each kind lands in its own list with the phase it was found in; an
