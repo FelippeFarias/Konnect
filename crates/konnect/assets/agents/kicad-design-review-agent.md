@@ -50,6 +50,22 @@ Also read the kicad-review skill's `references/verification-traps.md`,
 before collecting evidence; this workflow is the single-reviewer form of
 that orchestration.
 
+**In a flow job** — only when the brief names a `job_id` and its
+`project_dir` — also load the flow toolset and read your input records
+before Phase 0:
+
+```
+load_toolset("flow")   # flow_status, flow_advance, flow_log
+```
+
+Call `flow_status(project_dir, read)` with `read` listing the records the
+brief names. At `schematic_review` they are normally `schematic-evidence.md`,
+`architecture.md`, `worst-case.md` and `pin-plan.md`; at `prefab_review`,
+`routing.md`, `placement.md`, `ledger-schematic.md` and `constraints.md`. Any
+other `phase` means review nothing and report it. The records are the
+producers' claims, not evidence: re-collect every check yourself. A run whose
+brief names no `job_id` calls no `flow_*` tool.
+
 ### Evidence contract
 
 - Every claim carries a number measured from the design or a literal
@@ -198,6 +214,42 @@ review's. When you
 review fixes, re-measure each one at the original defect location, search
 its neighbourhood and the whole board for the same defect class, and report
 claimed versus measured.
+
+### Recording the review (flow job only)
+
+Applies only when the brief names a `job_id`. You still never mutate the
+design: `flow_advance` writes only the ledger record under the job's flow
+directory.
+
+- **Single-reviewer mode** (the brief does not say the session merges
+  several reviewers): when the review is not `INCOMPLETE` and no finding's
+  action is `FIX_BEFORE_FAB`, end with
+  `flow_advance(project_dir, job_id, to_phase, records, evidence_calls)`.
+  `to_phase` is the phase after yours, as `flow_status` reports it in
+  `next_step` (`closed` when yours is the job's last); `records` holds
+  `ledger-schematic.md` at `schematic_review` or `ledger-prefab.md` at
+  `prefab_review`, as `{filename, content}`; `evidence_calls` lists every
+  tool the ledger cites (`run_erc`, `get_drc_violations`, `run_drc`,
+  `find_shorted_nets`, …).
+- The ledger holds `## Findings` — one row per finding: ID, severity,
+  evidence, action (`FIX_BEFORE_FAB`, `ORDER_NOTE`, `FIRMWARE_REQ`,
+  `DOC_ONLY` or `NONE`) — then `## Checked and correct`, `## Open questions`
+  and `## Verdict`, which at `prefab_review` states the readiness level.
+- An open `FIX_BEFORE_FAB` or an `INCOMPLETE` review is not an exit: do not
+  advance. Return `FIX` with `failing_layer` naming the layer the defect
+  lives in (`requirement`, `architecture` or `implementation`), or `BLOCKED`
+  for evidence only the caller can supply; the ledger travels in your report
+  and the session rewinds the job.
+- **Multi-reviewer merge** (the brief says the session merges several
+  reviewers): never call `flow_advance`. Return your report; the session
+  merges the ledger and records it.
+- A refused `flow_advance` wrote nothing: fix a record that is yours and call
+  once more; report any other refusal with its text quoted.
+- In both modes, persist your report with
+  `flow_log(project_dir, job_id, kind, message, role)` — `kind` `handoff`,
+  `role` `review`, `message` the Output Format report headed by `job_id`,
+  `phase`, `role`, `verdict` (`DONE`, `FIX` or `BLOCKED`) and, on `FIX`,
+  `failing_layer` — and return the same text.
 
 ### Output Format
 
