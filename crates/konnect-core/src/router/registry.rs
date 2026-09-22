@@ -152,6 +152,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "manufacturing",
         tool_count: 3,
     },
+    ToolsetMeta {
+        name: "flow",
+        description: "Orchestration state of one project's design job: phases, hash-bound gate approvals, records, journal and deferred items in .konnect/flow/",
+        category: "orchestration",
+        tool_count: 6,
+    },
 ];
 
 static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
@@ -200,6 +206,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "design_review" => Some(design_review::tools()),
         "templates" => Some(templates::tools()),
         "manufacturing" => Some(manufacturing::tools()),
+        "flow" => Some(flow::tools()),
         _ => None,
     }
 }

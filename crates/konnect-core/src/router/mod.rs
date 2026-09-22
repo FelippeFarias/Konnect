@@ -409,6 +409,41 @@ mod tests {
         }
     }
 
+    /// The `flow` toolset's six tools, in the order an orchestrating session
+    /// meets them: read the state, open a job, move it, decide a gate, then
+    /// the two journal writers. Order is asserted, not just membership,
+    /// because `tools/list` is read top to bottom and `flow_status` is the
+    /// call every session makes first.
+    #[tokio::test]
+    async fn flow_exposes_exactly_its_six_tools_in_order() {
+        let expected = [
+            "flow_status",
+            "flow_start",
+            "flow_advance",
+            "flow_gate",
+            "flow_log",
+            "flow_defer",
+        ];
+
+        let registered = registry::tools_for("flow").expect("flow is registered");
+        let names: Vec<&str> = registered.iter().map(|def| def.name).collect();
+        assert_eq!(names, expected);
+
+        // And the same six arrive through the router the LLM actually uses.
+        let router = ToolRouter::new();
+        let loaded = router.load("flow").await.expect("flow loads");
+        let loaded_names: Vec<&str> = loaded.iter().map(|def| def.name).collect();
+        assert_eq!(loaded_names, expected);
+        for tool in expected {
+            assert_eq!(router.find_toolset_for_tool(tool), Some("flow"), "{tool}");
+        }
+        let meta = registry::ALL_TOOLSETS
+            .iter()
+            .find(|meta| meta.name == "flow")
+            .expect("flow has registry metadata");
+        assert_eq!(meta.category, "orchestration");
+    }
+
     #[test]
     fn no_toolset_has_duplicate_tool_names() {
         for meta in registry::ALL_TOOLSETS {
