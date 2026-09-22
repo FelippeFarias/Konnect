@@ -1021,3 +1021,123 @@ async fn list_toolboxes_and_load_toolset_expose_the_six_flow_tools() {
         .clone();
     assert_eq!(flow["loaded"], true, "{flow}");
 }
+
+// ─── Gates: the placement approval binds to the design ────────────────────────
+
+/// Spec "an approval binds to the design hash at that moment" (the gate file
+/// AND `STATE.md` carry the `design_state_hash` computed during the call) and
+/// "advancing past a gate whose approval hash is stale is refused" (a design
+/// file changes after `placement` was approved, and the move into `routing`
+/// is refused naming the gate), both at `gate:placement` as the spec states
+/// them — and the permitted state re-opens once the design is back.
+#[tokio::test]
+async fn a_placement_approval_binds_to_the_design_and_a_later_change_blocks_routing() {
+    let (ctx, defs) = loaded_toolset().await;
+    let (_dir, project_dir, project_arg) = project();
+    let job_id = start(
+        &ctx,
+        &defs,
+        &project_arg,
+        "photo_to_kicad",
+        &PHOTO_PHASES,
+        "guided",
+    )
+    .await;
+    advance(
+        &ctx,
+        &defs,
+        &project_arg,
+        &job_id,
+        "schematic_review",
+        &[("schematic-evidence.md", "# Evidence\n")],
+    )
+    .await;
+    advance(
+        &ctx,
+        &defs,
+        &project_arg,
+        &job_id,
+        "placement",
+        &[("ledger-schematic.md", "# Ledger\n")],
+    )
+    .await;
+    advance(
+        &ctx,
+        &defs,
+        &project_arg,
+        &job_id,
+        "gate:placement",
+        &[("placement.md", "# Placement\n")],
+    )
+    .await;
+
+    let approved = ok(
+        &ctx,
+        &defs,
+        "flow_gate",
+        gate_args(
+            &project_arg,
+            &job_id,
+            "placement",
+            "Placement looks good, route it.",
+        ),
+    )
+    .await;
+    let computed = status(&ctx, &defs, &project_arg).await;
+    let hash = computed["design_hash"]
+        .as_str()
+        .expect("design_hash")
+        .to_string();
+    assert_eq!(
+        approved["design_hash_at_approval"],
+        hash.as_str(),
+        "{approved}"
+    );
+    assert_eq!(
+        computed["gate_approvals"]["placement"]["design_hash_at_approval"],
+        hash.as_str(),
+        "STATE.md records the hash computed during the call: {computed}"
+    );
+    let gate_file = read(&ctx, &defs, &project_arg, &["gates/placement.md"]).await;
+    let gate_text = gate_file["contents"]["gates/placement.md"]
+        .as_str()
+        .expect("the gate file is written");
+    assert!(
+        gate_text.contains(&format!("- design_hash: `{hash}`")),
+        "{gate_text}"
+    );
+
+    // One byte of the board changes after the approval.
+    let board = project_dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "(kicad_pcb )\n").unwrap();
+    let body = refused(
+        &ctx,
+        &defs,
+        "flow_advance",
+        json!({ "project_dir": project_arg, "job_id": job_id, "to_phase": "routing" }),
+    )
+    .await;
+    assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+    assert_eq!(body["error"]["target"], "gate:placement", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gate \"placement\""),
+        "the refusal names the stale gate: {body}"
+    );
+    let stale = status(&ctx, &defs, &project_arg).await;
+    assert_eq!(stale["phase"], "gate:placement");
+    assert_eq!(
+        stale["gate_approvals"]["placement"]["valid"], false,
+        "{stale}"
+    );
+
+    // With the approved bytes back, the approval is valid again and routing opens.
+    std::fs::write(&board, "(kicad_pcb)\n").unwrap();
+    assert_eq!(
+        status(&ctx, &defs, &project_arg).await["gate_approvals"]["placement"]["valid"],
+        true
+    );
+    advance(&ctx, &defs, &project_arg, &job_id, "routing", &[]).await;
+}
