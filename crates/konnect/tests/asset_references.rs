@@ -2049,22 +2049,32 @@ fn library_agent_registers_its_library_in_the_scratch_project() {
 /// remain" — and the phase exits on `READY` or on an `INCOMPLETE` whose only
 /// open items are exactly the three purchase-gate checks, nothing else. The
 /// skill's side of the vocabulary is pinned too, since it is the reference.
+/// Task 9.4 (DECISION I, reviewer 16 SERIOUS 1): the warning rule covers
+/// artifact checks only — DRC warnings and preflight issues are adjudicated,
+/// as the skill's own DRC and preflight rules say — so "every check your
+/// tools can run passed with no warning" must never come back word-for-word.
 #[test]
 fn manufacture_agent_verdicts_match_the_skill() {
     let agent = include_str!("../assets/agents/kicad-manufacture-agent.md");
     let skill = include_str!("../assets/skills/kicad-manufacture/SKILL.md");
     let mut lost = Vec::new();
 
-    let stale = "and only the purchase-gate checks remain";
-    if flat(agent).contains(stale) {
-        lost.push(format!("kicad-manufacture-agent.md again says `{stale}`"));
+    for stale in [
+        "and only the purchase-gate checks remain",
+        "every check your tools can run passed with no warning",
+    ] {
+        if flat(agent).contains(stale) {
+            lost.push(format!("kicad-manufacture-agent.md again says `{stale}`"));
+        }
     }
     lost.extend(missing_markers(
         "kicad-manufacture-agent.md Verdict",
         section(agent, "- **Verdict**:", "**Firmware-contract non-goal.**"),
         &[
-            "`READY` when every check your tools can run passed with no warning and no \
+            "`READY` when every artifact check your tools can run passed with no warning and no \
              purchase-gate check is still open",
+            "every DRC warning and every preflight issue is adjudicated",
+            "An adjudicated DRC or preflight warning is not an open item",
             "left an artifact missing, or passed with a warning",
             "or when a purchase-gate check is still open",
             "\"Only `READY` permits upload\"",
@@ -2080,6 +2090,7 @@ fn manufacture_agent_verdicts_match_the_skill() {
             "`to_phase` is `gate:purchase`",
             "A `NOT READY` package, or an `INCOMPLETE` one with any other open item",
             "is not an exit: do not advance",
+            "the orchestrating session declares that",
         ],
     ));
     lost.extend(missing_markers(
@@ -2101,4 +2112,94 @@ fn manufacture_agent_verdicts_match_the_skill() {
         ],
     ));
     assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
+
+/// Task 9.4 (DECISION I): the prose-level stand-in for reviewer 16's
+/// reproduction — `kicad-cli 10.0.2 pcb drc --severity-all` on
+/// `crates/konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb` reports 0 DRC
+/// errors and 17 DRC warnings, and that board must be able to leave
+/// `manufacturing`. (a) An adjudicated DRC or preflight warning is not an
+/// open item: the `READY` clause adjudicates them, the `NOT READY` clause
+/// names DRC errors but no DRC warning, and the `INCOMPLETE` clause names
+/// neither DRC nor the preflight, so adjudicated DRC warnings never by
+/// themselves force `INCOMPLETE`. (b) The artifact-level warning clause stays
+/// with no adjudication escape: an entry in the export's `warnings` array
+/// keeps `INCOMPLETE` regardless.
+#[test]
+fn manufacture_verdict_permits_exit_with_adjudicated_drc_warnings() {
+    let agent = include_str!("../assets/agents/kicad-manufacture-agent.md");
+    let verdict = flat(section(
+        agent,
+        "- **Verdict**:",
+        "**Firmware-contract non-goal.**",
+    ));
+    // One verdict's clause: from its opening words to the next `; ` or `. `.
+    let clause = |start: &str| -> String {
+        let from = verdict
+            .find(start)
+            .unwrap_or_else(|| panic!("the Verdict bullet lost `{start}`: {verdict}"));
+        let rest = &verdict[from..];
+        let end = [rest.find("; "), rest.find(". ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    let mut broken = Vec::new();
+
+    // (a) 0 DRC errors plus adjudicated DRC warnings leave nothing open.
+    let adjudicated = "An adjudicated DRC or preflight warning is not an open item";
+    if !verdict.contains(adjudicated) {
+        broken.push(format!("the Verdict bullet no longer says `{adjudicated}`"));
+    }
+    let ready = clause("`READY` when");
+    for needed in [
+        "every DRC error is resolved or waived",
+        "every DRC warning and every preflight issue is adjudicated",
+    ] {
+        if !ready.contains(needed) {
+            broken.push(format!("the READY clause lost `{needed}`: {ready}"));
+        }
+    }
+    let not_ready = clause("`NOT READY` when");
+    if !not_ready.contains("an unwaived DRC error") || not_ready.contains("DRC warning") {
+        broken.push(format!(
+            "the NOT READY clause must block on an unwaived DRC error, never a DRC warning: \
+             {not_ready}"
+        ));
+    }
+    let incomplete = clause("`INCOMPLETE` when");
+    if !incomplete.starts_with("`INCOMPLETE` when an artifact check") {
+        broken.push(format!(
+            "the INCOMPLETE clause is no longer scoped to artifact checks: {incomplete}"
+        ));
+    }
+    for widening in ["DRC", "preflight"] {
+        if incomplete.contains(widening) {
+            broken.push(format!(
+                "the INCOMPLETE clause names `{widening}`, so a DRC warning could force \
+                 INCOMPLETE: {incomplete}"
+            ));
+        }
+    }
+
+    // (b) An artifact warning keeps INCOMPLETE, with no adjudication escape.
+    for kept in [
+        "left an artifact missing, or passed with a warning",
+        "\"Any warning or missing requested artifact type keeps the result `INCOMPLETE`\"",
+    ] {
+        if !incomplete.contains(kept) {
+            broken.push(format!("the INCOMPLETE clause lost `{kept}`: {incomplete}"));
+        }
+    }
+    for escape in ["adjudicat", "waive", "accepted with"] {
+        if incomplete.contains(escape) {
+            broken.push(format!(
+                "the INCOMPLETE clause offers an escape (`{escape}`) for an artifact warning: \
+                 {incomplete}"
+            ));
+        }
+    }
+    assert!(broken.is_empty(), "{}", broken.join("\n"));
 }

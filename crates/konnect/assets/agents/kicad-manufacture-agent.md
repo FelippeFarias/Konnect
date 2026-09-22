@@ -173,13 +173,20 @@ price re-check before payment. Never mark them done. List them under
   questions remain.
 - **Checks at the purchase gate**: the three checks above, each "not done —
   needs the user".
-- **Verdict**: `READY` when every check your tools can run passed with no
-  warning and no purchase-gate check is still open; `NOT READY` when a design
-  defect blocks the order; `INCOMPLETE` when a check your tools can run did
-  not run, failed to execute, left an artifact missing, or
-  passed with a warning (the skill's "Any warning … keeps the result
-  `INCOMPLETE`"), or when a purchase-gate check is still open. You never
-  mark those checks done, so a package whose own checks all passed reads
+- **Verdict**: `READY` when
+  every artifact check your tools can run passed with no warning and no
+  purchase-gate check is still open, every DRC error is resolved or waived,
+  and every DRC warning and every preflight issue is adjudicated (fixed, or
+  accepted with its reason recorded in this file's Design evidence section);
+  `NOT READY` when a design defect, an unwaived DRC error, or an
+  unadjudicated preflight issue blocks the order; `INCOMPLETE` when an
+  artifact check your tools can run did not run, failed to execute,
+  left an artifact missing, or passed with a warning (the skill's
+  "Any warning or missing requested artifact type keeps the result `INCOMPLETE`"),
+  or when a purchase-gate check is still open.
+  An adjudicated DRC or preflight warning is not an open item and does not
+  by itself keep the verdict `INCOMPLETE`. You never mark the three
+  purchase-gate checks done, so a package whose own checks all passed reads
   `INCOMPLETE` and names the three — with or without a job, since
   "Only `READY` permits upload". `READY` means the package matches the
   board — never that the product is proven.
@@ -200,7 +207,11 @@ in the record, and nothing else open — the run ends with
 the record cites (`run_drc`, `get_drc_violations`,
 `validate_for_manufacturing`, `export_manufacturing_package`,
 `estimate_cost`, …). After it is accepted, change nothing — the user's
-approval binds to this design and this record.
+approval binds to this design and this record. This agent's own record
+never itself becomes `READY` in the skill's global sense: once `flow_gate`
+approves `purchase`,
+the orchestrating session declares that and records it with
+`flow_log(kind: evidence)` (orchestration.md §4) — this agent never uploads.
 
 A `NOT READY` package, or an `INCOMPLETE` one with any other open item (a
 warning, a check that did not run or failed, a missing artifact), is not an
