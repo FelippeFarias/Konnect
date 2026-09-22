@@ -6,8 +6,10 @@
 # the KiCAD PCM zip built by packaging/build-pcm.sh. Steps:
 #
 #   1. build     cargo build --release -p konnect, when target/release/konnect[.exe]
-#                is missing, older than the newest git-tracked file under crates/
-#                or Cargo.lock, or --rebuild is given
+#                ($CARGO_TARGET_DIR/release when set) is missing, older than the
+#                newest git-tracked build input (crates/, Cargo.lock, Cargo.toml,
+#                rust-toolchain.toml, docs/RELIABILITY_CONTRACT.md), or --rebuild
+#                is given
 #   2. target    --target, else mcpServers.konnect.command in the Claude config
 #                (top level first, then a single distinct project-level entry),
 #                else ~/.konnect/bin/konnect[.exe]; JSON read with jq, else
@@ -69,7 +71,19 @@ photo-intake Python.
 EOF
 }
 
-fail() { echo "install: ERROR: $*" >&2; exit 1; }
+# ---- state the rollback is computed from (set only once a change happened)
+changes=""
+target_u=""
+backup=""          # set only after the old binary was really renamed (or would be)
+parked=""          # where the rollback moves the new binary aside
+fresh_install=0    # a new binary was (or would be) placed where none existed
+init_clients=""    # clients whose init ran (or would run)
+retrace_changed=0
+retrace_previous=""
+recovery_shown=0
+failing=0
+
+fail() { failing=1; echo "install: ERROR: $*" >&2; exit 1; }
 warn() { echo "install: WARNING: $*" >&2; }
 step() { printf '\n== %s\n' "$1"; }
 say() { printf '  %s\n' "$*"; }
@@ -160,12 +174,84 @@ file_hash() {
 same_file_content() {
     if command -v cmp >/dev/null 2>&1; then cmp -s -- "$1" "$2"; else [ "$(file_hash "$1")" = "$(file_hash "$2")" ]; fi
 }
+target_exists() { [ -e "$target_u" ] || [ -L "$target_u" ]; }
+
+# A shell single-quoted word; a ' in the text becomes '\''.
+sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Commands that undo what this run changed, in paste order. The file moves are
+# guarded so pasting them twice never overwrites anything.
+rollback_lines() {
+    local t c
+    t="$(sh_quote "$target_u")"
+    if [ -n "$backup" ]; then
+        if [ "$dry_run" = 1 ] || target_exists; then
+            printf '%s\n' "[ ! -e $(sh_quote "$parked") ] && [ -e $(sh_quote "$backup") ] && mv -- $t $(sh_quote "$parked") && mv -- $(sh_quote "$backup") $t || echo 'rollback stopped: already done, or the files were moved - check the folder'"
+        else
+            printf '%s\n' "[ ! -e $t ] && [ -e $(sh_quote "$backup") ] && mv -- $(sh_quote "$backup") $t || echo 'rollback stopped: already done, or the files were moved - check the folder'"
+        fi
+        for c in $init_clients; do
+            if [ "$c" = codex ]; then printf '%s\n' "$t init --client codex"; else printf '%s\n' "$t init"; fi
+        done
+    elif [ "$fresh_install" = 1 ]; then
+        for c in $init_clients; do
+            if [ "$c" = codex ]; then printf '%s\n' "$t uninstall --client codex"; else printf '%s\n' "$t uninstall"; fi
+        done
+        printf '%s\n' "[ ! -e $(sh_quote "$parked") ] && [ -e $t ] && mv -- $t $(sh_quote "$parked") || echo 'undo stopped: already done, or the file was moved - check the folder'"
+    fi
+    if [ "$retrace_changed" = 1 ]; then
+        if [ -n "$retrace_previous" ]; then printf '%s\n' "setx RETRACE_PYTHON $(sh_quote "$retrace_previous")"
+        else printf '%s\n' "powershell -NoProfile -Command '[Environment]::SetEnvironmentVariable(\"RETRACE_PYTHON\", \$null, \"User\")'"
+        fi
+    fi
+}
+
+# On any non-zero exit after a change (fail, or an unexpected error under
+# set -e): say what already changed and how to undo it.
+on_exit() {
+    local rc=$? lines
+    [ "$rc" != 0 ] && [ "$recovery_shown" = 0 ] || return 0
+    recovery_shown=1
+    [ "$failing" = 1 ] || echo "install: ERROR: stopped unexpectedly (exit $rc); see the message above." >&2
+    lines="$(rollback_lines)"
+    [ -n "$lines" ] || return 0
+    printf '\n== Stopped - changes made before the error\n'
+    while IFS= read -r line; do [ -z "$line" ] || say "- $line"; done <<<"$changes"
+    [ -z "$backup" ] || say "previous binary: $(to_native "$backup")"
+    say "to undo, paste these lines into this shell (safe to paste twice):"
+    while IFS= read -r line; do say "    $line"; done <<<"$lines"
+}
+trap on_exit EXIT
+
+json_reader=""
+if command -v jq >/dev/null 2>&1; then
+    json_reader="jq"
+else
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import json' >/dev/null 2>&1; then
+            json_reader="$candidate"; break
+        fi
+    done
+fi
+# Exit 0 when the file is valid JSON (an empty file counts as an empty config).
+config_is_valid_json() {
+    if [ "$json_reader" = jq ]; then
+        jq empty <"$1" >/dev/null 2>&1
+    else
+        "$json_reader" -c '
+import json, sys
+text = sys.stdin.buffer.read().decode("utf-8")
+if text.strip():
+    json.loads(text)
+' <"$1" >/dev/null 2>&1
+    fi
+}
 
 # Prints "top<TAB>command" and "project<TAB>name<TAB>command" lines for every
-# mcpServers.konnect.command in the config. Exit 2 = no JSON reader available.
+# mcpServers.konnect.command in the config (validated JSON, $json_reader set).
 read_config_commands() {
     local config="$1"
-    if command -v jq >/dev/null 2>&1; then
+    if [ "$json_reader" = jq ]; then
         jq -r '
           def cmd: objects | .mcpServers | objects | .konnect | objects | .command | strings
                    | sub("^\\s+"; "") | sub("\\s+$"; "") | select(length > 0);
@@ -176,16 +262,10 @@ read_config_commands() {
         ' <"$config" | tr -d '\r'
         return "${PIPESTATUS[0]}"
     fi
-    local py=""
-    for candidate in python3 python; do
-        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import json' >/dev/null 2>&1; then
-            py="$candidate"; break
-        fi
-    done
-    [ -n "$py" ] || return 2
-    "$py" -c '
+    "$json_reader" -c '
 import json, sys
-data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+text = sys.stdin.buffer.read().decode("utf-8")
+data = json.loads(text) if text.strip() else None
 def cmd(node):
     servers = node.get("mcpServers") if isinstance(node, dict) else None
     konnect = servers.get("konnect") if isinstance(servers, dict) else None
@@ -207,10 +287,7 @@ sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8"))
     return "${PIPESTATUS[0]}"
 }
 
-changes=""
-rollback=""
 add_change() { changes="${changes}$1"$'\n'; }
-add_rollback() { rollback="${rollback}$1"$'\n'; }
 
 # ---------------------------------------------------------------------------
 echo "Konnect local installer ($repo_root)"
@@ -229,16 +306,26 @@ fi
 
 # ---- 1. build --------------------------------------------------------------
 step "Build"
-source_bin="$repo_root/target/release/konnect$exe"
+# cargo puts the build under CARGO_TARGET_DIR when it is set (relative to the
+# directory cargo runs in, which is the repo root here).
+cargo_target_dir="$repo_root/target"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    cargo_target_dir="$(to_unix "$CARGO_TARGET_DIR")"
+    case "$cargo_target_dir" in /*) ;; *) cargo_target_dir="$repo_root/$cargo_target_dir";; esac
+    say "CARGO_TARGET_DIR = $(to_native "$cargo_target_dir")"
+fi
+source_bin="$cargo_target_dir/release/konnect$exe"
 build_reason=""
 stale_reason=""
+# Build inputs: the workspace sources plus the files outside crates/ that the
+# binary depends on (manifest.rs embeds docs/RELIABILITY_CONTRACT.md).
 if [ -f "$source_bin" ]; then
     newest=""
     while IFS= read -r -d '' rel; do
         f="$repo_root/$rel"
         [ -f "$f" ] || continue
         if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
-    done < <(git -C "$repo_root" ls-files -z -- crates Cargo.lock 2>/dev/null || true)
+    done < <(git -C "$repo_root" ls-files -z -- crates Cargo.lock Cargo.toml rust-toolchain.toml docs/RELIABILITY_CONTRACT.md 2>/dev/null || true)
     if [ -z "$newest" ]; then
         warn "could not list git-tracked sources; treating the existing build as current."
     elif [ "$newest" -nt "$source_bin" ]; then
@@ -269,7 +356,9 @@ else
     elif command -v protoc >/dev/null 2>&1; then
         protoc="$(command -v protoc)"
     else
-        problems="${problems}protoc not found: export PROTOC=/path/to/protoc or put protoc on PATH (macOS: brew install protobuf; Linux: apt install protobuf-compiler; Windows: https://github.com/protocolbuffers/protobuf/releases)"$'\n'
+        keep="add the export line to your shell profile"
+        [ "$windows" = 0 ] || keep="run in PowerShell: [Environment]::SetEnvironmentVariable('PROTOC','<path to protoc.exe>','User')"
+        problems="${problems}protoc not found: export PROTOC=/path/to/protoc or put protoc on PATH (macOS: brew install protobuf; Linux: apt install protobuf-compiler; Windows: https://github.com/protocolbuffers/protobuf/releases). To keep PROTOC for every new terminal, $keep"$'\n'
     fi
 
     cmake_dir=""
@@ -331,14 +420,16 @@ else
     found_where=""
     unreadable=0
     if [ -f "$claude_config" ]; then
-        rc=0
-        entries="$(read_config_commands "$claude_config")" || rc=$?
-        if [ "$rc" = 2 ]; then
+        entries=""
+        if [ -z "$json_reader" ]; then
             warn "neither jq nor python is available to read $claude_config; falling back to the default target."
-            entries=""
             unreadable=1
-        elif [ "$rc" != 0 ]; then
-            fail "cannot parse $claude_config; pass --target."
+        elif ! config_is_valid_json "$claude_config"; then
+            fail "$claude_config is not valid JSON (checked with $json_reader); fix the file or pass --target."
+        else
+            rc=0
+            entries="$(read_config_commands "$claude_config")" || rc=$?
+            [ "$rc" = 0 ] || fail "cannot read $claude_config ($json_reader exited $rc); pass --target."
         fi
         top=""
         while IFS=$'\t' read -r kind cmd _; do
@@ -348,6 +439,22 @@ else
             is_konnect_path "$top" || fail "the top-level mcpServers.konnect.command in $claude_config is '$top', not a path to a konnect executable (a wrapper or a command with arguments). Pass --target <path to konnect$exe>."
             found="$(abs_path "$top")"
             found_where="top-level mcpServers.konnect.command in $claude_config"
+            # Inside a project, Claude Code runs that project's own konnect entry.
+            shadowed=""
+            top_key="$(path_key "$found")"
+            while IFS=$'\t' read -r kind name cmd; do
+                [ "$kind" = "project" ] || continue
+                shown="$cmd"
+                if is_konnect_path "$cmd"; then
+                    p="$(abs_path "$cmd")"
+                    [ "$(path_key "$p")" != "$top_key" ] || continue
+                    shown="$(to_native "$p")"
+                fi
+                shadowed="${shadowed}  - project $name -> $shown"$'\n'
+            done <<<"$entries"
+            if [ -n "$shadowed" ]; then
+                warn "Claude Code gives a project's own konnect entry precedence inside that project, so these projects keep running a different konnect than the top-level one ($(to_native "$found")):"$'\n'"${shadowed}This installer still installs to $(to_native "$found"); update those project entries, or pass --target to install elsewhere."
+            fi
         else
             keys=""
             listing=""
@@ -390,10 +497,15 @@ else
     fi
 fi
 target_shown="$(to_native "$target_u")"
+if [ -d "$target_u" ]; then
+    fail "the install target $target_shown is a folder. Pass the full path to the konnect$exe file, e.g. --target '$(to_native "${target_u%/}/konnect$exe")'."
+fi
+case "$target_u" in
+    */) fail "the install target $target_shown ends with a separator. Pass the full path to the konnect$exe file, e.g. --target '$(to_native "${target_u%/}/konnect$exe")'.";;
+esac
 
 # ---- 3. backup + copy ------------------------------------------------------
 step "Install binary"
-backup=""
 old_version=""
 new_tag="$source_version"
 if [ "$pending" = 1 ]; then
@@ -412,41 +524,52 @@ else
     base="$(basename "$target_u")"
     base="${base%.[eE][xX][eE]}"
     stamp="$(date +%Y%m%d-%H%M%S)"
-    if [ -f "$target_u" ]; then
+    parked="$target_dir/$base-$new_tag-$stamp-rolledback$exe.bak"
+    if target_exists; then
         old_version="$(konnect_version "$target_u")"
         say "existing binary: version $old_version, sha256 $(file_hash "$target_u")"
-        backup="$target_dir/$base-$old_version-$stamp$exe.bak"
+        backup_name="$target_dir/$base-$old_version-$stamp$exe.bak"
         n=2
-        while [ -e "$backup" ]; do
-            backup="$target_dir/$base-$old_version-$stamp-$n$exe.bak"
+        while [ -e "$backup_name" ] || [ -L "$backup_name" ]; do
+            backup_name="$target_dir/$base-$old_version-$stamp-$n$exe.bak"
             n=$((n + 1))
         done
         if [ "$dry_run" = 1 ]; then
-            say "would rename $target_u -> $backup"
+            say "would rename $target_u -> $backup_name"
         else
-            mv -- "$target_u" "$backup" || fail "could not rename $target_u to $backup; nothing was changed."
-            say "renamed $target_u -> $backup"
+            mv -- "$target_u" "$backup_name" || fail "could not rename $target_u to $backup_name; nothing was changed."
+            say "renamed $target_u -> $backup_name"
         fi
+        backup="$backup_name"
     fi
     if [ "$dry_run" = 1 ]; then
         say "would copy $source_bin -> $target_u"
+        [ -n "$backup" ] || fresh_install=1
     else
+        # Never overwrite: whatever sits at the target now has no backup.
+        if target_exists; then
+            [ -z "$backup" ] || fail "$target_shown still exists after renaming it to $(to_native "$backup"); stopping before the copy so nothing is overwritten."
+            fail "$target_shown appeared while the installer was running; stopping before the copy so nothing is overwritten."
+        fi
         if ! { mkdir -p -- "$target_dir" && cp -- "$source_bin" "$target_u"; }; then
             if [ -n "$backup" ]; then
-                mv -- "$backup" "$target_u" || true
-                fail "copy to $target_u failed; the previous binary was renamed back."
+                if ! target_exists && mv -- "$backup" "$target_u"; then
+                    backup=""
+                    fail "copy to $target_shown failed; the previous binary was renamed back - nothing changed."
+                fi
+                fail "copy to $target_shown failed, and putting the previous binary back failed too. The previous binary is safe at $(to_native "$backup"); the lines below restore it."
             fi
-            fail "copy to $target_u failed."
+            if target_exists; then fresh_install=1; fi
+            fail "copy to $target_shown failed."
         fi
-        same_file_content "$source_bin" "$target_u" || fail "$target_u does not match the build after copying; previous binary kept at ${backup:-(none)}."
+        [ -n "$backup" ] || fresh_install=1
+        same_file_content "$source_bin" "$target_u" || fail "$target_shown does not match the build after copying."
         say "copied $source_bin -> $target_u"
     fi
     if [ -n "$backup" ]; then
         add_change "$verb $target_shown (old binary $old_version renamed to $(to_native "$backup"))"
-        add_rollback "mv -- '$target_u' '$target_dir/$base-$new_tag-$stamp-rolledback$exe.bak'"
-        add_rollback "mv -- '$backup' '$target_u'"
     else
-        add_change "$verb $target_shown (new file, no previous binary)"
+        add_change "$verb $target_shown (fresh install: there was no konnect there before)"
     fi
 fi
 
@@ -459,6 +582,7 @@ if [ "$skip_init" = 1 ]; then
 else
     for c in $clients; do
         if [ "$c" = codex ]; then init_args=(init --client codex); else init_args=(init); fi
+        init_clients="$init_clients $c"
         if [ "$dry_run" = 1 ]; then
             say "would run: \"$target_shown\" ${init_args[*]}"
             say "would run: \"$target_shown\" status --client $c"
@@ -538,10 +662,9 @@ else
                     setx RETRACE_PYTHON "$py_native" >/dev/null || fail "setx RETRACE_PYTHON failed."
                     say "set RETRACE_PYTHON (user): $shown -> $py_native"
                 fi
+                retrace_changed=1
+                retrace_previous="$current"
                 add_change "$verb RETRACE_PYTHON (user): $shown -> $py_native"
-                if [ -n "$current" ]; then add_rollback "setx RETRACE_PYTHON '$current'"
-                else add_rollback "powershell -NoProfile -Command '[Environment]::SetEnvironmentVariable(\"RETRACE_PYTHON\", \$null, \"User\")'"
-                fi
             fi
         else
             current="${RETRACE_PYTHON:-}"
@@ -550,8 +673,8 @@ else
             else
                 say "RETRACE_PYTHON: ${current:-(unset)} -> $py"
                 say "add this line to your shell profile (this script never edits rc files):"
-                say "    export RETRACE_PYTHON='$py'"
-                retrace_note="RETRACE_PYTHON is not set to $py; add: export RETRACE_PYTHON='$py'"
+                say "    export RETRACE_PYTHON=$(sh_quote "$py")"
+                retrace_note="RETRACE_PYTHON is not set to $py; add: export RETRACE_PYTHON=$(sh_quote "$py") - then close Claude Code completely and start it again from a new terminal."
             fi
         fi
     fi
@@ -563,19 +686,25 @@ step "Summary"
 [ -n "$changes" ] || say "nothing changed."
 while IFS= read -r line; do [ -z "$line" ] || say "- $line"; done <<<"$changes"
 say "target:  $target_shown (new build version $source_version)"
-if [ -n "$backup" ]; then say "backup:  $(to_native "$backup")"; else say "backup:  (none)"; fi
+if [ -n "$backup" ]; then say "backup:  $(to_native "$backup")"
+elif [ "$fresh_install" = 1 ]; then say "backup:  (none - fresh install: there was no konnect at $target_shown before)"
+else say "backup:  (none)"
+fi
 [ -z "$target_note" ] || say "NOTE: $target_note"
 [ -z "$retrace_note" ] || say "NOTE: $retrace_note"
+rollback="$(rollback_lines)"
 if [ -n "$rollback" ]; then
-    say "rollback (this shell):"
-    while IFS= read -r line; do [ -z "$line" ] || say "    $line"; done <<<"$rollback"
-    if [ -n "$backup" ]; then
-        for c in $clients; do
-            if [ "$c" = codex ]; then say "    '$target_u' init --client codex"; else say "    '$target_u' init"; fi
-        done
+    if [ "$fresh_install" = 1 ]; then say "undo (this shell; safe to paste twice) - this was a fresh install, so undoing it moves the new file aside:"
+    else say "rollback (this shell; safe to paste twice):"
     fi
+    while IFS= read -r line; do [ -z "$line" ] || say "    $line"; done <<<"$rollback"
 else
     say "rollback: nothing to roll back."
 fi
-say "Restart Claude Code (all windows) so the MCP server and the skills reload."
+if [ "$retrace_changed" = 1 ]; then
+    say "RETRACE_PYTHON only reaches programs started after it is set: close Claude Code completely"
+    say "(every window, and any terminal running it) and start it again from a new terminal or the Start menu."
+else
+    say "Restart Claude Code (all windows) so the MCP server and the skills reload."
+fi
 exit 0

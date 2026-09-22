@@ -4,8 +4,10 @@
 # path stays the KiCAD PCM zip built by packaging/build-pcm.ps1. Steps:
 #
 #   1. build     cargo build --release -p konnect, when target/release/konnect.exe
-#                is missing, older than the newest git-tracked file under crates/
-#                or Cargo.lock, or -Rebuild is given
+#                ($env:CARGO_TARGET_DIR\release when set) is missing, older than
+#                the newest git-tracked build input (crates/, Cargo.lock,
+#                Cargo.toml, rust-toolchain.toml, docs/RELIABILITY_CONTRACT.md),
+#                or -Rebuild is given
 #   2. target    -Target, else mcpServers.konnect.command in the Claude config
 #                (top level first, then a single distinct project-level entry),
 #                else ~/.konnect/bin/konnect.exe
@@ -27,7 +29,9 @@
 #
 # -DryRun prints every action and changes nothing. Runs on Windows PowerShell
 # 5.1 and later; use scripts/install.sh on macOS/Linux or from Git Bash.
+# Unknown or misspelled options are rejected before anything runs.
 
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [ValidateSet("claude", "codex", "both")][string]$Client = "claude",
     [string]$Target = "",
@@ -65,24 +69,88 @@ photo-intake Python.
   -RetracePython  Python to use for RETRACE_PYTHON (default <repo>/.venv-retrace)
   -NoRetrace      leave RETRACE_PYTHON alone
   -DryRun         print every action, change nothing
+
+Run it from an open PowerShell window, for example:
+  powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DryRun
+not with Explorer's "Run with PowerShell": that window closes when the script
+ends and takes the summary and the rollback commands with it.
 "@
+}
+
+# ---- state the rollback is computed from (set only once a change happened)
+$changes = New-Object System.Collections.ArrayList
+$initClients = New-Object System.Collections.ArrayList   # clients whose init ran (or would run)
+$targetPath = $null
+$backupPath = $null      # set only after the old binary was really renamed (or would be)
+$parkedPath = $null      # where the rollback moves the new binary aside
+$freshInstall = $false   # a new binary was (or would be) placed where none existed
+$retraceChanged = $false
+$retracePrevious = $null
+$recoveryShown = $false
+
+# A PowerShell single-quoted literal; a ' in the text doubles.
+function Format-PsLiteral([string]$text) { return "'" + $text.Replace("'", "''") + "'" }
+
+# Commands that undo what this run changed, in paste order. Each is safe to
+# paste twice: Move-Item without -Force never overwrites.
+function Get-RollbackLines {
+    $lines = @()
+    if ($targetPath) { $t = Format-PsLiteral $targetPath }
+    if ($backupPath) {
+        if ($DryRun -or (Test-Path -LiteralPath $targetPath)) {
+            $lines += "Move-Item -LiteralPath $t -Destination $(Format-PsLiteral $parkedPath)"
+        }
+        $lines += "Move-Item -LiteralPath $(Format-PsLiteral $backupPath) -Destination $t"
+        foreach ($c in $initClients) {
+            if ($c -eq "codex") { $lines += "& $t init --client codex" } else { $lines += "& $t init" }
+        }
+    } elseif ($freshInstall) {
+        foreach ($c in $initClients) {
+            if ($c -eq "codex") { $lines += "& $t uninstall --client codex" } else { $lines += "& $t uninstall" }
+        }
+        $lines += "Move-Item -LiteralPath $t -Destination $(Format-PsLiteral $parkedPath)"
+    }
+    if ($retraceChanged) {
+        if ($retracePrevious) { $lines += "[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', $(Format-PsLiteral $retracePrevious), 'User')" }
+        else { $lines += "[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', `$null, 'User')" }
+    }
+    return $lines
+}
+
+# After a failure: say what already changed and how to undo it.
+function Show-FailureRecovery {
+    if ($script:recoveryShown) { return }
+    $script:recoveryShown = $true
+    $lines = @(Get-RollbackLines)
+    if ($lines.Count -eq 0) { return }
+    Write-Host ""
+    Write-Host "== Stopped - changes made before the error" -ForegroundColor Cyan
+    foreach ($line in $changes) { Write-Host "  - $line" }
+    if ($backupPath) { Write-Host "  previous binary: $backupPath" }
+    Write-Host "  to undo, paste these lines into PowerShell (safe to paste twice):"
+    foreach ($line in $lines) { Write-Host "      $line" }
 }
 
 function Fail([string]$message) {
     Write-Host "install: ERROR: $message" -ForegroundColor Red
+    Show-FailureRecovery
     exit 1
 }
 function Warn([string]$message) { Write-Host "install: WARNING: $message" -ForegroundColor Yellow }
 function Step([string]$title) { Write-Host ""; Write-Host "== $title" -ForegroundColor Cyan }
 function Say([string]$message) { Write-Host "  $message" }
 
+# Any unexpected error after a change still prints the rollback.
+trap {
+    Write-Host "install: ERROR: unexpected error: $($_.Exception.Message) (at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red
+    Show-FailureRecovery
+    exit 1
+}
+
 if ($Help) { Show-Usage; exit 0 }
 if ($SkipBuild -and $Rebuild) { Fail "-SkipBuild and -Rebuild contradict each other; pass one." }
 if ($NoRetrace -and $RetracePython) { Fail "-RetracePython and -NoRetrace contradict each other; pass one." }
-if (-not $ClaudeConfig) { $ClaudeConfig = Join-Path $userHome ".claude.json" }
 
-$changes = New-Object System.Collections.ArrayList
-$rollback = New-Object System.Collections.ArrayList
 $verb = "Changed"
 if ($DryRun) { $verb = "Would change" }
 
@@ -121,9 +189,19 @@ function Get-KonnectVersion([string]$exe) {
 
 function Get-Sha256([string]$path) { return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower() }
 
+# A POSIX drive path from Git Bash/MSYS/Cygwin (/c/Users/..., /cygdrive/c/...)
+# as its Windows form (C:\Users\...); any other text comes back unchanged.
+function ConvertFrom-PosixDrivePath([string]$path) {
+    if ($path -match '^/(?:cygdrive/)?([A-Za-z])/(.*)$') {
+        return $Matches[1].ToUpperInvariant() + ":\" + $Matches[2].Replace('/', '\')
+    }
+    return $path
+}
+
 # Absolute, backslashed path; relative paths and ~ resolve against the current
 # PowerShell location (not the process directory, which may differ).
 function Get-NormalizedPath([string]$path) {
+    $path = ConvertFrom-PosixDrivePath $path
     try {
         $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
         return [System.IO.Path]::GetFullPath($resolved.Replace('/', '\'))
@@ -133,7 +211,8 @@ function Get-NormalizedPath([string]$path) {
 }
 
 # ---- JSON access that works for both ConvertFrom-Json objects and the
-# ---- dictionaries JavaScriptSerializer returns (fallback parser).
+# ---- dictionaries JavaScriptSerializer returns (fallback parser). Names match
+# ---- exactly, case included, as JSON keys do for Claude Code.
 function Get-JsonMember($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
     if ($obj -is [System.Collections.IDictionary]) {
@@ -141,8 +220,9 @@ function Get-JsonMember($obj, [string]$name) {
         return $null
     }
     if ($obj -is [System.Management.Automation.PSCustomObject]) {
-        $prop = $obj.PSObject.Properties[$name]
-        if ($prop) { return $prop.Value }
+        foreach ($prop in $obj.PSObject.Properties) {
+            if ($prop.Name -ceq $name) { return $prop.Value }
+        }
     }
     return $null
 }
@@ -179,6 +259,24 @@ function Test-KonnectExecutablePath([string]$command) {
         return $false  # characters no path can hold: a shell command line
     }
 }
+# True for a path with no drive letter and no \\server (\tools\x, /usr/bin/x).
+function Test-DrivelessPath([string]$path) { return ($path -match '^[\\/](?![\\/])') }
+
+# The install path a config command names; stops when it is not one.
+function Get-ConfigTargetPath([string]$command, [string]$where) {
+    $converted = ConvertFrom-PosixDrivePath $command
+    if (Test-DrivelessPath $converted) {
+        Fail "$where is '$command', a path without a drive letter; Windows cannot tell where it points. Pass -Target <path to konnect.exe>."
+    }
+    if (-not (Test-KonnectExecutablePath $converted)) {
+        Fail "$where is '$command', not a path to a konnect executable (a wrapper or a command with arguments). Pass -Target <path to konnect.exe>."
+    }
+    if ($converted -ne $command) { Say "NOTE: read the POSIX-style path '$command' as '$converted'" }
+    return (Get-NormalizedPath $converted)
+}
+
+if (-not $ClaudeConfig) { $ClaudeConfig = Join-Path $userHome ".claude.json" }
+$ClaudeConfig = Get-NormalizedPath $ClaudeConfig
 
 # ---------------------------------------------------------------------------
 Write-Host "Konnect local installer ($repoRoot)"
@@ -194,13 +292,25 @@ if (Test-Path -LiteralPath $manifestPath) {
 
 # ---- 1. build --------------------------------------------------------------
 Step "Build"
-$source = Join-Path $repoRoot "target\release\konnect.exe"
+# cargo puts the build under CARGO_TARGET_DIR when it is set (relative to the
+# directory cargo runs in, which is the repo root here).
+$cargoTargetDir = Join-Path $repoRoot "target"
+if ($env:CARGO_TARGET_DIR) {
+    $cargoTargetDir = $env:CARGO_TARGET_DIR
+    if (-not [System.IO.Path]::IsPathRooted($cargoTargetDir)) { $cargoTargetDir = Join-Path $repoRoot $cargoTargetDir }
+    $cargoTargetDir = [System.IO.Path]::GetFullPath($cargoTargetDir)
+    Say "CARGO_TARGET_DIR = $cargoTargetDir"
+}
+$source = Join-Path $cargoTargetDir "release\konnect.exe"
 $buildReason = $null
 $staleReason = $null
+# Build inputs: the workspace sources plus the files outside crates/ that the
+# binary depends on (manifest.rs embeds docs/RELIABILITY_CONTRACT.md).
+$buildInputs = @("crates", "Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "docs/RELIABILITY_CONTRACT.md")
 if (Test-Path -LiteralPath $source) {
     $builtAt = [System.IO.File]::GetLastWriteTimeUtc($source)
     $tracked = @()
-    try { $tracked = @(& git -C $repoRoot ls-files -- crates Cargo.lock 2>$null) } catch { $tracked = @() }
+    try { $tracked = @(& git -C $repoRoot ls-files -- @buildInputs 2>$null) } catch { $tracked = @() }
     if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) {
         Warn "could not list git-tracked sources; treating the existing build as current."
     } else {
@@ -240,7 +350,7 @@ if ($SkipBuild) {
     } else {
         $protocCmd = Get-Command protoc -ErrorAction SilentlyContinue
         if ($protocCmd) { $protoc = $protocCmd.Path }
-        else { [void]$problems.Add("protoc not found: set PROTOC to protoc.exe (e.g. `$env:PROTOC = 'C:\path\to\protoc\bin\protoc.exe') or put protoc on PATH - https://github.com/protocolbuffers/protobuf/releases") }
+        else { [void]$problems.Add("protoc not found: set PROTOC to protoc.exe (e.g. `$env:PROTOC = 'C:\path\to\protoc\bin\protoc.exe') or put protoc on PATH - https://github.com/protocolbuffers/protobuf/releases. To keep PROTOC for every new window: [Environment]::SetEnvironmentVariable('PROTOC','<path to protoc.exe>','User')") }
     }
 
     $cmakeDir = $null
@@ -303,23 +413,34 @@ if ($Target) {
     if (Test-Path -LiteralPath $ClaudeConfig) {
         try { $config = Read-JsonFile $ClaudeConfig } catch { Fail "cannot parse $ClaudeConfig ($($_.Exception.Message)); pass -Target." }
         $top = Get-KonnectCommand $config
+        $projects = Get-JsonMember $config "projects"
         if ($top) {
-            if (-not (Test-KonnectExecutablePath $top)) {
-                Fail "the top-level mcpServers.konnect.command in $ClaudeConfig is '$top', not a path to a konnect executable (a wrapper or a command with arguments). Pass -Target <path to konnect.exe>."
-            }
-            $found = Get-NormalizedPath $top
+            $found = Get-ConfigTargetPath $top "the top-level mcpServers.konnect.command in $ClaudeConfig"
             $foundWhere = "top-level mcpServers.konnect.command in $ClaudeConfig"
+            # Inside a project, Claude Code runs that project's own konnect entry.
+            $shadowed = New-Object System.Collections.ArrayList
+            foreach ($name in (Get-JsonNames $projects)) {
+                $cmd = Get-KonnectCommand (Get-JsonMember $projects $name)
+                if (-not $cmd) { continue }
+                $shown = $cmd
+                $converted = ConvertFrom-PosixDrivePath $cmd
+                if ((Test-KonnectExecutablePath $converted) -and -not (Test-DrivelessPath $converted)) {
+                    $norm = Get-NormalizedPath $converted
+                    if ($norm.ToLowerInvariant() -eq $found.ToLowerInvariant()) { continue }
+                    $shown = $norm
+                }
+                [void]$shadowed.Add("project $name -> $shown")
+            }
+            if ($shadowed.Count -gt 0) {
+                Warn ("Claude Code gives a project's own konnect entry precedence inside that project, so these projects keep running a different konnect than the top-level one ($found):`n  - " + ($shadowed -join "`n  - ") + "`nThis installer still installs to $found; update those project entries, or pass -Target to install elsewhere.")
+            }
         } else {
-            $projects = Get-JsonMember $config "projects"
             $distinct = [ordered]@{}
             $projectOf = @{}
             foreach ($name in (Get-JsonNames $projects)) {
                 $cmd = Get-KonnectCommand (Get-JsonMember $projects $name)
                 if (-not $cmd) { continue }
-                if (-not (Test-KonnectExecutablePath $cmd)) {
-                    Fail "project '$name' in $ClaudeConfig registers konnect as '$cmd', not a path to a konnect executable (a wrapper or a command with arguments). Pass -Target <path to konnect.exe>."
-                }
-                $norm = Get-NormalizedPath $cmd
+                $norm = Get-ConfigTargetPath $cmd "the mcpServers.konnect.command of project '$name' in $ClaudeConfig"
                 $key = $norm.ToLowerInvariant()
                 if (-not $distinct.Contains($key)) { $distinct[$key] = $norm; $projectOf[$key] = $name }
             }
@@ -346,10 +467,15 @@ if ($Target) {
         Say "NOTE: $targetNote"
     }
 }
+if (Test-Path -LiteralPath $targetPath -PathType Container) {
+    Fail "the install target $targetPath is a folder. Pass the full path to the .exe, e.g. -Target '$(Join-Path $targetPath 'konnect.exe')'."
+}
+if (-not [System.IO.Path]::GetFileName($targetPath)) {
+    Fail "the install target $targetPath ends with a separator. Pass the full path to the .exe, e.g. -Target '$($targetPath.TrimEnd('\'))\konnect.exe'."
+}
 
 # ---- 3. backup + copy ------------------------------------------------------
 Step "Install binary"
-$backupPath = $null
 $targetExisted = Test-Path -LiteralPath $targetPath
 $oldVersion = $null
 # Only a dry run can reach here without a current build (a real run built it or
@@ -367,49 +493,61 @@ if ($identical) {
     Say "identical binary already at $targetPath - skipping backup and copy"
 } else {
     $targetDir = Split-Path -Parent $targetPath
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($targetPath)
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $parkedPath = Join-Path $targetDir "$base-$newTag-$stamp-rolledback.exe.bak"
     if ($targetExisted) {
         $oldVersion = Get-KonnectVersion $targetPath
         Say "existing binary: version $oldVersion, sha256 $(Get-Sha256 $targetPath)"
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($targetPath)
-        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $backupPath = Join-Path $targetDir "$base-$oldVersion-$stamp.exe.bak"
+        $backupName = Join-Path $targetDir "$base-$oldVersion-$stamp.exe.bak"
         $n = 2
-        while (Test-Path -LiteralPath $backupPath) {
-            $backupPath = Join-Path $targetDir "$base-$oldVersion-$stamp-$n.exe.bak"
+        while (Test-Path -LiteralPath $backupName) {
+            $backupName = Join-Path $targetDir "$base-$oldVersion-$stamp-$n.exe.bak"
             $n++
         }
         if ($DryRun) {
-            Say "would rename $targetPath -> $backupPath"
+            Say "would rename $targetPath -> $backupName"
         } else {
-            try { Move-Item -LiteralPath $targetPath -Destination $backupPath }
-            catch { Fail "could not rename $targetPath to $backupPath ($($_.Exception.Message)); nothing was changed." }
-            Say "renamed $targetPath -> $backupPath"
+            try { Move-Item -LiteralPath $targetPath -Destination $backupName }
+            catch { Fail "could not rename $targetPath to $backupName ($($_.Exception.Message)); nothing was changed." }
+            Say "renamed $targetPath -> $backupName"
         }
+        $backupPath = $backupName
     }
     if ($DryRun) {
         Say "would copy $source -> $targetPath"
+        if (-not $backupPath) { $freshInstall = $true }
     } else {
+        # Never overwrite: whatever sits at the target now has no backup.
+        if (Test-Path -LiteralPath $targetPath) {
+            if ($backupPath) { Fail "$targetPath still exists after renaming it to $backupPath; stopping before the copy so nothing is overwritten." }
+            Fail "$targetPath appeared while the installer was running; stopping before the copy so nothing is overwritten."
+        }
         try {
             if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
             Copy-Item -LiteralPath $source -Destination $targetPath
         } catch {
             $why = $_.Exception.Message
             if ($backupPath) {
-                try { Move-Item -LiteralPath $backupPath -Destination $targetPath } catch { }
-                Fail "copy to $targetPath failed ($why); the previous binary was renamed back."
+                $restoreError = $null
+                try { Move-Item -LiteralPath $backupPath -Destination $targetPath } catch { $restoreError = $_.Exception.Message }
+                if (-not $restoreError) {
+                    $backupPath = $null
+                    Fail "copy to $targetPath failed ($why); the previous binary was renamed back - nothing changed."
+                }
+                Fail "copy to $targetPath failed ($why), and putting the previous binary back failed too ($restoreError). The previous binary is safe at $backupPath; the lines below restore it."
             }
+            if (Test-Path -LiteralPath $targetPath) { $freshInstall = $true }
             Fail "copy to $targetPath failed ($why)."
         }
-        if ((Get-Sha256 $targetPath) -ne $srcHash) { Fail "$targetPath does not match the build after copying; previous binary kept at $backupPath." }
+        if (-not $backupPath) { $freshInstall = $true }
+        if ((Get-Sha256 $targetPath) -ne $srcHash) { Fail "$targetPath does not match the build after copying." }
         Say "copied $source -> $targetPath"
     }
     if ($backupPath) {
         [void]$changes.Add("$verb $targetPath (old binary $oldVersion renamed to $backupPath)")
-        $parked = Join-Path $targetDir "$base-$newTag-$stamp-rolledback.exe.bak"
-        [void]$rollback.Add("Move-Item -LiteralPath '$targetPath' -Destination '$parked'")
-        [void]$rollback.Add("Move-Item -LiteralPath '$backupPath' -Destination '$targetPath'")
     } else {
-        [void]$changes.Add("$verb $targetPath (new file, no previous binary)")
+        [void]$changes.Add("$verb $targetPath (fresh install: there was no konnect there before)")
     }
 }
 
@@ -423,6 +561,7 @@ if ($SkipInit) {
     foreach ($c in $clients) {
         $initArgs = @("init")
         if ($c -eq "codex") { $initArgs = @("init", "--client", "codex") }
+        [void]$initClients.Add($c)
         if ($DryRun) {
             Say "would run: `"$targetPath`" $($initArgs -join ' ')"
             Say "would run: `"$targetPath`" status --client $c"
@@ -495,9 +634,9 @@ if ($NoRetrace) {
                 [Environment]::SetEnvironmentVariable("RETRACE_PYTHON", $py, "User")
                 Say "set RETRACE_PYTHON (user): $shown -> $py"
             }
+            $retraceChanged = $true
+            $retracePrevious = $current
             [void]$changes.Add("$verb RETRACE_PYTHON (user): $shown -> $py")
-            if ($current) { [void]$rollback.Add("[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', '$current', 'User')") }
-            else { [void]$rollback.Add("[Environment]::SetEnvironmentVariable('RETRACE_PYTHON', `$null, 'User')") }
         }
     }
 }
@@ -508,19 +647,23 @@ if ($DryRun) { Say "DRY RUN - nothing was changed." }
 if ($changes.Count -eq 0) { Say "nothing changed." }
 foreach ($line in $changes) { Say "- $line" }
 Say "target:  $targetPath (new build version $sourceVersion)"
-if ($backupPath) { Say "backup:  $backupPath" } else { Say "backup:  (none)" }
+if ($backupPath) { Say "backup:  $backupPath" }
+elseif ($freshInstall) { Say "backup:  (none - fresh install: there was no konnect at $targetPath before)" }
+else { Say "backup:  (none)" }
 if ($targetNote) { Say "NOTE: $targetNote" }
 if ($retraceNote) { Say "NOTE: $retraceNote" }
-if ($rollback.Count -gt 0) {
-    Say "rollback (PowerShell):"
-    foreach ($line in $rollback) { Say "    $line" }
-    if ($backupPath) {
-        foreach ($c in $clients) {
-            if ($c -eq "codex") { Say "    & '$targetPath' init --client codex" } else { Say "    & '$targetPath' init" }
-        }
-    }
+$rollbackLines = @(Get-RollbackLines)
+if ($rollbackLines.Count -gt 0) {
+    if ($freshInstall) { Say "undo (PowerShell; safe to paste twice) - this was a fresh install, so undoing it moves the new file aside:" }
+    else { Say "rollback (PowerShell; safe to paste twice):" }
+    foreach ($line in $rollbackLines) { Say "    $line" }
 } else {
     Say "rollback: nothing to roll back."
 }
-Say "Restart Claude Code (all windows) so the MCP server and the skills reload."
+if ($retraceChanged) {
+    Say "RETRACE_PYTHON only reaches programs started after it is set: close Claude Code completely"
+    Say "(every window, and any terminal running it) and start it again from a new terminal or the Start menu."
+} else {
+    Say "Restart Claude Code (all windows) so the MCP server and the skills reload."
+}
 exit 0
