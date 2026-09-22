@@ -49,6 +49,29 @@ load_toolset("project")
 load_toolset("pcb_export")
 ```
 
+**In a flow job** — only when the brief names a `job_id` and its
+`project_dir` — also load the flow toolset and read your input records
+before Phase 0:
+
+```
+load_toolset("flow")   # flow_status, flow_advance, flow_log
+```
+
+Call `flow_status(project_dir, read)` with `read` listing the records the
+brief names. The response's `phase` decides the run:
+
+- `placement` — this run ends at the placement gate (end of Phase 3). Read
+  `constraints.md` and `schematic-evidence.md`: the first is your Phase 1
+  baseline, the second's layout handoff is the Phase 0 record.
+- `routing` — the placement was approved at `gate:placement`; this run
+  routes (Phases 4–7). Read `constraints.md` and `placement.md`.
+- anything else, `gate:placement` included — change nothing and report it.
+
+A requested record listed in `missing` is never rebuilt from the
+conversation; a load-bearing row `constraints.md` lacks is a question for the
+caller, as Phase 1 says. A run whose brief names no `job_id` calls no
+`flow_*` tool.
+
 ### Building from an approved design brief
 
 When the layout arrives as a `design_brief` from
@@ -155,6 +178,24 @@ the rest.
 - Close the placement gate (`references/placement-gate.md`), including the
   silkscreen and assembly-data section, with a written verdict. On `FAIL`,
   move parts; never proceed to routing.
+- **In a flow job, Phase 3 ends the run.** Once the placement gate passes on
+  the saved board, write the per-layer images — `export_svg`, one file per
+  board side with that side's copper, silkscreen and courtyard layers plus
+  `Edge.Cuts`, to files outside `.konnect/` — then call
+  `flow_advance(project_dir, job_id, to_phase, records, evidence_calls)`:
+  `to_phase` is `gate:placement`; `records` holds `placement.md` as
+  `{filename, content}`; `evidence_calls` lists every tool its results cite
+  (`get_component_pads`, `score_placement`, `get_board_2d_view`,
+  `export_svg`, …). `placement.md` holds `## Constraint record`,
+  `## Placement` (the Output Format table), `## Images` (each file and what
+  was seen in it) and `## Placement gate` (the verdict with its evidence).
+- After that call, change nothing on the board — the approval binds to the
+  files as they are — persist your report (see Phase 7) and return. **Never
+  route in the same run**: in a job the stop is unconditional, even when the
+  brief says the user need not review placement, because the review is the
+  job's `gate:placement` and an autonomous approval is the session's. The
+  routing run is a new brief. A gate `FAIL` or `INCOMPLETE` does not
+  advance.
 
 ### Phase 4: Return-path plan and netclasses
 
@@ -232,6 +273,25 @@ Address every failure, re-run each invalidated check after the last edit,
 and save. A required check that could not run makes the result `INCOMPLETE`;
 name the blocked evidence instead of softening the verdict.
 
+**In a flow job, the routing run ends here**, only when the routing gate
+passes with overall evidence `COMPLETE`: call
+`flow_advance(project_dir, job_id, to_phase, records, evidence_calls)` with
+`to_phase` `prefab_review`, `records` holding `routing.md` as
+`{filename, content}`, and `evidence_calls` listing every tool its results
+cite (`run_drc`, `get_drc_violations`, `query_traces`, `get_netclasses`,
+`get_board_2d_view`, …). `routing.md` holds
+`## Return-path plan, layer plan, and netclasses`, `## Routing`,
+`## Evidence` (DRC with schematic parity, the per-net width audit, ground
+robustness, rendered inspection) and `## Routing gate`. A record already on
+disk never counts; a refusal wrote nothing — fix a record that is yours and
+call once more, and report any other refusal with its text quoted.
+
+After either run's `flow_advance` — or when a run ends without one — persist
+your report with `flow_log(project_dir, job_id, kind, message, role)`:
+`kind` `handoff`, `role` `layout`, `message` the Output Format report headed
+by `job_id`, `phase` (`placement` or `routing`), `role`, `verdict` (`DONE`,
+`FIX` or `BLOCKED`) and, on `FIX`, `failing_layer`. Return the same text.
+
 ### Hard rules
 
 1. Never route around a placement mistake; go back to placement.
@@ -251,6 +311,8 @@ name the blocked evidence instead of softening the verdict.
     return to the caller with the missing capability, the objects, and the
     intended change. The caller chooses between the KiCad GUI action and the
     konnect skill's scripted board fallback; never work around the gap.
+11. In a flow job, never route in the run that recorded `placement.md`, and
+    never change the board after a `flow_advance` into `gate:placement`.
 
 ### Output Format
 
