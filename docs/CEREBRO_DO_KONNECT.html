@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cérebro do Konnect</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Saira+Semi+Condensed:wght@500;600;700&display=swap">
+<style>
+:root{
+  --ground:#F3F5F4; --surface:#FFFFFF; --sunk:#E9EDEB;
+  --ink:#16201C; --muted:#56635E; --line:#CDD5D1;
+  --green:#1D6A4F; --green-soft:#DCEDE5;
+  --copper:#B15C24; --copper-soft:#F5E4D6;
+  --warn:#8C6400;
+  --display:"Saira Semi Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1412; --surface:#151D1A; --sunk:#1B2521;
+    --ink:#E2E9E6; --muted:#98A5A0; --line:#2C3833;
+    --green:#5EC29B; --green-soft:#15302A;
+    --copper:#E88F53; --copper-soft:#3A2517;
+    --warn:#E0B24A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1412; --surface:#151D1A; --sunk:#1B2521;
+  --ink:#E2E9E6; --muted:#98A5A0; --line:#2C3833;
+  --green:#5EC29B; --green-soft:#15302A;
+  --copper:#E88F53; --copper-soft:#3A2517;
+  --warn:#E0B24A;
+}
+body{background:var(--ground);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.6}
+.wrap{max-width:1140px;margin:0 auto;padding-inline:20px;padding-block:40px 80px}
+.prose{max-width:70ch}
+header .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(2.2rem,5vw,3.4rem);line-height:1.05;margin:.3em 0 .35em;letter-spacing:-.01em;text-wrap:balance}
+h2{font-family:var(--display);font-weight:600;font-size:clamp(1.5rem,3vw,2rem);line-height:1.15;margin:0 0 .5em;text-wrap:balance}
+h3{font-family:var(--display);font-weight:600;font-size:1.2rem;margin:1.6em 0 .4em}
+p{margin:0 0 1em}
+.lead{font-size:1.15rem;color:var(--ink)}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:var(--sunk);padding:.08em .35em;border-radius:4px}
+a{color:var(--green)}
+section{padding-block:48px 8px;border-top:1px solid var(--line);margin-top:40px}
+.legend{display:flex;flex-wrap:wrap;gap:10px 22px;margin:18px 0 0;font-size:14px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:8px}
+.sw{width:14px;height:14px;border-radius:3px;border:2px solid}
+.sw.now{border-color:var(--green);background:var(--green-soft)}
+.sw.new{border-color:var(--copper);background:var(--copper-soft)}
+.sw.gap{border-color:var(--copper);border-style:dashed;background:transparent}
+nav.toc{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+nav.toc a{font-size:14px;text-decoration:none;color:var(--ink);background:var(--surface);border:1px solid var(--line);padding:5px 12px;border-radius:999px}
+nav.toc a:hover,nav.toc a:focus-visible{border-color:var(--green);outline:none}
+figure{margin:28px 0 8px}
+.dia{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px}
+.dia svg{display:block;width:100%;min-width:760px;height:auto;color:var(--ink)}
+figcaption{font-size:14px;color:var(--muted);margin-top:10px;max-width:80ch}
+/* diagram vocabulary, styled from the page */
+.dia text{font-family:var(--body);font-size:13px;fill:currentColor}
+.dia .t-sm{font-size:11.5px;fill:var(--muted)}
+.dia .t-hd{font-family:var(--display);font-weight:600;font-size:15px}
+.dia .t-mono{font-family:var(--mono);font-size:11.5px}
+.dia .grp{fill:none;stroke:var(--line);stroke-width:1.5;stroke-dasharray:5 4}
+.dia .b{fill:var(--surface);stroke:var(--line);stroke-width:1.3}
+.dia .b-now{fill:var(--green-soft);stroke:var(--green);stroke-width:1.5}
+.dia .b-new{fill:var(--copper-soft);stroke:var(--copper);stroke-width:1.8}
+.dia .b-gap{fill:none;stroke:var(--copper);stroke-width:1.8;stroke-dasharray:6 4}
+.dia .ln{stroke:currentColor;stroke-width:1.4;fill:none}
+.dia .ln-new{stroke:var(--copper);stroke-width:1.8;fill:none}
+.dia .ln-dash{stroke:var(--muted);stroke-width:1.4;fill:none;stroke-dasharray:5 4}
+.dia .ln-gap{stroke:var(--copper);stroke-width:1.6;fill:none;stroke-dasharray:6 4}
+.dia .ah{fill:currentColor}
+.dia .ah-new{fill:var(--copper)}
+.dia .ah-dash{fill:var(--muted)}
+.dia .num{fill:var(--ink)}
+.dia .num-t{fill:var(--surface);font-family:var(--mono);font-size:12px;font-weight:500}
+.dia .c-new{fill:var(--copper)}
+.dia .c-now{fill:var(--green)}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--surface)}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:18px 0}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;background:var(--sunk);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td .mono{white-space:nowrap}
+.yes{color:var(--green);font-weight:600}
+.no{color:var(--muted)}
+.miss{color:var(--warn);font-weight:600}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin:18px 0}
+.cols.three{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.card h4{font-family:var(--display);font-weight:600;font-size:1.08rem;margin:0 0 6px}
+.card p{margin:0;font-size:14.5px;color:var(--muted)}
+.card.pick{border-color:var(--copper);box-shadow:inset 3px 0 0 var(--copper)}
+.tag{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:1px 7px;border-radius:4px;background:var(--sunk);color:var(--muted);margin-left:6px;vertical-align:1px}
+.tag.pick{background:var(--copper-soft);color:var(--copper)}
+ol.decide{padding-left:1.3em}
+ol.decide li{margin:0 0 .9em}
+ol.decide b{font-weight:600}
+.note{border-left:3px solid var(--warn);padding:8px 14px;background:var(--surface);border-radius:0 8px 8px 0;font-size:14.5px;color:var(--muted);margin:16px 0}
+@media (max-width:560px){ .wrap{padding-inline:16px} body{font-size:15.5px} }
+@media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto} }
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">Konnect · arquitetura · 21 set 2026</div>
+  <h1>Cérebro do Konnect</h1>
+  <p class="lead prose">Hoje o Konnect tem mãos excelentes — 226 ferramentas que editam esquemático, placa e fabricação com segurança — e um manual fixo, as skills. O que falta é memória: consultar placas que já funcionaram, montar os blocos de apoio de um chip sem ser lembrado, e ficar mais preciso a cada projeto. Este documento mostra como o sistema funciona hoje, onde o conhecimento está espalhado, e propõe o cérebro — portátil, consultável pelos agentes e que aprende com revisão sua.</p>
+  <p class="prose" style="font-size:14.5px;color:var(--muted)">Complementa <code>docs/ARCHITECTURE.md</code> e os diagramas de <code>docs/ARCHITECTURE_DIAGRAMS.md</code>, que descrevem as fronteiras de segurança; aqui o foco é o conhecimento.</p>
+  <div class="legend" aria-label="Legenda das cores">
+    <span><i class="sw now"></i>existe hoje</span>
+    <span><i class="sw new"></i>proposto</span>
+    <span><i class="sw gap"></i>lacuna</span>
+  </div>
+  <nav class="toc" aria-label="Seções">
+    <a href="#hoje">Arquitetura atual</a>
+    <a href="#fluxo">Um pedido hoje</a>
+    <a href="#conhecimento">Onde o conhecimento vive</a>
+    <a href="#cerebro">O cérebro proposto</a>
+    <a href="#receita">Exemplo: ESP32</a>
+    <a href="#ciclo">Autoaperfeiçoamento</a>
+    <a href="#portabilidade">Portabilidade</a>
+    <a href="#memvid">memvid</a>
+    <a href="#mudancas">O que muda</a>
+    <a href="#decisoes">Decisões</a>
+  </nav>
+</header>
+
+<!-- ─────────────────────────── 1. ARQUITETURA ATUAL ─────────────────────────── -->
+<section id="hoje">
+  <h2>Arquitetura atual</h2>
+  <div class="prose">
+    <p>O Konnect é um único executável Rust (<code>konnect.exe</code>) que o Claude Code — ou o Codex — inicia como servidor MCP, por stdio (também atende por HTTP local, e o plugin do KiCad pode iniciá-lo). O protocolo é implementado no próprio Konnect, sem biblioteca externa. O modelo não vê as 226 ferramentas de uma vez: um roteador expõe meta-ferramentas (<code>list_toolboxes</code>, <code>load_toolset</code>) e carrega grupos sob demanda. Cada ferramenta escolhe o caminho mais seguro até o KiCad: a API IPC com o editor de PCB aberto, o motor de arquivos S-expression com diário de transações, ou o <code>kicad-cli</code>. As skills, os agentes e os hooks viajam embutidos no próprio binário e são copiados para <code>~/.claude</code> pelo <code>konnect init</code>.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 540" role="img" aria-label="Blocos do Konnect hoje: o Claude Code com skills, agentes e hooks conversa por MCP com o konnect.exe, cujo roteador carrega 21 toolsets que usam IPC do KiCad, o motor de arquivos S-expression, o kicad-cli, o Freerouting, o catálogo JLCPCB e os templates.">
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="a1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-dash"/></marker>
+  </defs>
+  <!-- Você -->
+  <rect x="16" y="196" width="88" height="56" rx="8" class="b"/>
+  <text x="60" y="229" text-anchor="middle" class="t-hd">Você</text>
+  <line x1="104" y1="224" x2="140" y2="224" class="ln" marker-end="url(#a1)"/>
+  <!-- Claude Code -->
+  <rect x="142" y="30" width="236" height="410" rx="12" class="grp"/>
+  <text x="160" y="56" class="t-hd">Claude Code / Codex</text>
+  <rect x="160" y="72" width="200" height="44" rx="7" class="b"/>
+  <text x="260" y="99" text-anchor="middle">LLM</text>
+  <rect x="160" y="128" width="200" height="54" rx="7" class="b-now"/>
+  <text x="260" y="151" text-anchor="middle">Skills · 6</text>
+  <text x="260" y="170" text-anchor="middle" class="t-sm">regras, métodos, referências</text>
+  <rect x="160" y="194" width="200" height="54" rx="7" class="b-now"/>
+  <text x="260" y="217" text-anchor="middle">Agentes · 3</text>
+  <text x="260" y="236" text-anchor="middle" class="t-sm">esquemático, layout, revisão</text>
+  <rect x="160" y="260" width="200" height="54" rx="7" class="b-now"/>
+  <text x="260" y="283" text-anchor="middle">Hooks PreToolUse</text>
+  <text x="260" y="302" text-anchor="middle" class="t-sm">avisos antes das ferramentas de PCB</text>
+  <rect x="160" y="326" width="200" height="54" rx="7" class="b"/>
+  <text x="260" y="349" text-anchor="middle">Auto-memória</text>
+  <text x="260" y="368" text-anchor="middle" class="t-sm">só nesta máquina, do assistente</text>
+  <!-- MCP arrow -->
+  <line x1="378" y1="224" x2="416" y2="224" class="ln" marker-end="url(#a1)"/>
+  <text x="397" y="212" text-anchor="middle" class="t-sm">MCP</text>
+  <text x="397" y="244" text-anchor="middle" class="t-sm">stdio/HTTP</text>
+  <!-- konnect.exe -->
+  <rect x="418" y="30" width="250" height="410" rx="12" class="grp"/>
+  <text x="436" y="56" class="t-hd">konnect.exe</text>
+  <rect x="436" y="72" width="214" height="54" rx="7" class="b-now"/>
+  <text x="543" y="95" text-anchor="middle">Roteador</text>
+  <text x="543" y="114" text-anchor="middle" class="t-sm">list_toolboxes · load_toolset</text>
+  <rect x="436" y="138" width="214" height="54" rx="7" class="b-now"/>
+  <text x="543" y="161" text-anchor="middle">21 toolsets · 226 ferramentas</text>
+  <text x="543" y="180" text-anchor="middle" class="t-sm">esquemático, PCB, biblioteca, fab</text>
+  <rect x="436" y="204" width="214" height="54" rx="7" class="b-now"/>
+  <text x="543" y="227" text-anchor="middle">Validação e erros tipados</text>
+  <text x="543" y="246" text-anchor="middle" class="t-sm">schema estrito, 18 tipos de erro</text>
+  <rect x="436" y="270" width="214" height="54" rx="7" class="b"/>
+  <text x="543" y="293" text-anchor="middle">Observabilidade</text>
+  <text x="543" y="312" text-anchor="middle" class="t-sm">chamadas recentes, estatísticas</text>
+  <rect x="436" y="336" width="214" height="54" rx="7" class="b"/>
+  <text x="543" y="359" text-anchor="middle">Configuração</text>
+  <text x="543" y="378" text-anchor="middle" class="t-sm">%APPDATA%\konnect · &lt;projeto&gt;/.konnect</text>
+  <!-- backends -->
+  <text x="700" y="56" class="t-hd">Caminhos até o KiCad e dados</text>
+  <line x1="668" y1="99" x2="700" y2="99" class="ln" marker-end="url(#a1)"/>
+  <line x1="668" y1="165" x2="700" y2="165" class="ln" marker-end="url(#a1)"/>
+  <line x1="684" y1="99" x2="684" y2="405" class="ln"/>
+  <line x1="684" y1="221" x2="700" y2="221" class="ln" marker-end="url(#a1)"/>
+  <line x1="684" y1="277" x2="700" y2="277" class="ln" marker-end="url(#a1)"/>
+  <line x1="684" y1="333" x2="700" y2="333" class="ln" marker-end="url(#a1)"/>
+  <line x1="684" y1="389" x2="700" y2="389" class="ln" marker-end="url(#a1)"/>
+  <rect x="702" y="72" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="93" text-anchor="middle">IPC do KiCad</text>
+  <text x="817" y="110" text-anchor="middle" class="t-sm">NNG + protobuf, placa aberta</text>
+  <rect x="702" y="138" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="159" text-anchor="middle">Motor de arquivos S-expression</text>
+  <text x="817" y="176" text-anchor="middle" class="t-sm">escrita atômica, diário, revisão</text>
+  <rect x="702" y="198" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="219" text-anchor="middle">kicad-cli</text>
+  <text x="817" y="236" text-anchor="middle" class="t-sm">ERC, DRC, Gerber, BOM, render</text>
+  <rect x="702" y="254" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="275" text-anchor="middle">Freerouting</text>
+  <text x="817" y="292" text-anchor="middle" class="t-sm">Specctra DSN/SES, Java do PATH</text>
+  <rect x="702" y="310" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="331" text-anchor="middle">Catálogo JLCPCB</text>
+  <text x="817" y="348" text-anchor="middle" class="t-sm">SQLite FTS5, 2,5 milhões de peças</text>
+  <rect x="702" y="366" width="230" height="46" rx="7" class="b-now"/>
+  <text x="817" y="387" text-anchor="middle">Templates de circuito</text>
+  <text x="817" y="404" text-anchor="middle" class="t-sm">JSON: USB-C, LDO, buck, STM32…</text>
+  <!-- KiCad -->
+  <rect x="966" y="72" width="138" height="112" rx="8" class="b"/>
+  <text x="1035" y="100" text-anchor="middle" class="t-hd">KiCad 10</text>
+  <text x="1035" y="124" text-anchor="middle" class="t-sm">editor de PCB</text>
+  <text x="1035" y="142" text-anchor="middle" class="t-sm">.kicad_sch</text>
+  <text x="1035" y="160" text-anchor="middle" class="t-sm">.kicad_pcb</text>
+  <line x1="932" y1="95" x2="964" y2="95" class="ln" marker-end="url(#a1)"/>
+  <line x1="932" y1="161" x2="964" y2="161" class="ln" marker-end="url(#a1)"/>
+  <line x1="932" y1="221" x2="998" y2="221" class="ln"/>
+  <line x1="998" y1="221" x2="998" y2="186" class="ln" marker-end="url(#a1)"/>
+  <rect x="966" y="254" width="138" height="56" rx="8" class="b"/>
+  <text x="1035" y="278" text-anchor="middle">Visualizador</text>
+  <text x="1035" y="296" text-anchor="middle" class="t-sm">esquemático ao vivo</text>
+  <line x1="1072" y1="184" x2="1072" y2="252" class="ln-dash" marker-end="url(#a1d)"/>
+  <text x="1066" y="226" text-anchor="end" class="t-sm">ao gravar</text>
+  <!-- install path -->
+  <path d="M543,440 L543,486 L260,486 L260,442" class="ln-dash" marker-end="url(#a1d)"/>
+  <text x="402" y="506" text-anchor="middle" class="t-sm">konnect init: copia skills, agentes e hooks embutidos no binário para ~/.claude</text>
+</svg>
+    </div>
+    <figcaption>Tudo o que o Konnect sabe fazer está no bloco verde: ferramentas determinísticas com guardas. O conhecimento de engenharia chega só pelo lado esquerdo — o modelo e as seis skills fixas.</figcaption>
+  </figure>
+</section>
+
+<!-- ─────────────────────────── 2. FLUXO ─────────────────────────── -->
+<section id="fluxo">
+  <h2>Um pedido hoje</h2>
+  <div class="prose">
+    <p>Pedido de exemplo: <em>“crie um conversor USB-serial com ESP32”</em>. A ordem importa, então os passos estão numerados. O ponto fraco está no passo 4: as peças e os valores saem da memória do modelo e de seis templates; nenhuma placa real é consultada.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 300" role="img" aria-label="Fluxo de um pedido hoje em oito passos; o passo 4, escolher peças e valores, depende só da memória do modelo e é a lacuna.">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+  </defs>
+  <!-- row 1 -->
+  <g>
+    <rect x="16" y="30" width="240" height="84" rx="8" class="b"/>
+    <circle cx="40" cy="54" r="12" class="num"/><text x="40" y="58" text-anchor="middle" class="num-t">1</text>
+    <text x="60" y="58">Você faz o pedido</text>
+    <text x="36" y="86" class="t-sm">“conversor USB-serial com ESP32”</text>
+  </g>
+  <line x1="256" y1="72" x2="290" y2="72" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="292" y="30" width="240" height="84" rx="8" class="b-now"/>
+    <circle cx="316" cy="54" r="12" class="num"/><text x="316" y="58" text-anchor="middle" class="num-t">2</text>
+    <text x="336" y="58">Lê as skills</text>
+    <text x="312" y="86" class="t-sm">regras do konnect + esquemático</text>
+  </g>
+  <line x1="532" y1="72" x2="566" y2="72" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="568" y="30" width="240" height="84" rx="8" class="b-now"/>
+    <circle cx="592" cy="54" r="12" class="num"/><text x="592" y="58" text-anchor="middle" class="num-t">3</text>
+    <text x="612" y="58">Carrega toolsets</text>
+    <text x="588" y="86" class="t-sm">sch_components, sch_wiring…</text>
+  </g>
+  <line x1="808" y1="72" x2="842" y2="72" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="844" y="30" width="260" height="84" rx="8" class="b-gap"/>
+    <circle cx="868" cy="54" r="12" class="c-new"/><text x="868" y="58" text-anchor="middle" class="num-t">4</text>
+    <text x="888" y="58">Escolhe peças e valores</text>
+    <text x="864" y="80" class="t-sm">memória do modelo + 6 templates</text>
+    <text x="864" y="98" class="t-sm">nenhuma referência consultada</text>
+  </g>
+  <!-- turn -->
+  <path d="M974,114 L974,150 L136,150 L136,184" class="ln" marker-end="url(#a2)"/>
+  <!-- row 2 -->
+  <g>
+    <rect x="16" y="186" width="240" height="84" rx="8" class="b-now"/>
+    <circle cx="40" cy="210" r="12" class="num"/><text x="40" y="214" text-anchor="middle" class="num-t">5</text>
+    <text x="60" y="214">Escreve o esquemático</text>
+    <text x="36" y="242" class="t-sm">motor S-expression, diário</text>
+  </g>
+  <line x1="256" y1="228" x2="290" y2="228" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="292" y="186" width="240" height="84" rx="8" class="b-now"/>
+    <circle cx="316" cy="210" r="12" class="num"/><text x="316" y="214" text-anchor="middle" class="num-t">6</text>
+    <text x="336" y="214">ERC e imagem</text>
+    <text x="312" y="242" class="t-sm">kicad-cli, inspeção do render</text>
+  </g>
+  <line x1="532" y1="228" x2="566" y2="228" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="568" y="186" width="240" height="84" rx="8" class="b-now"/>
+    <circle cx="592" cy="210" r="12" class="num"/><text x="592" y="214" text-anchor="middle" class="num-t">7</text>
+    <text x="612" y="214">Layout e DRC</text>
+    <text x="588" y="242" class="t-sm">agente de layout, IPC, gates</text>
+  </g>
+  <line x1="808" y1="228" x2="842" y2="228" class="ln" marker-end="url(#a2)"/>
+  <g>
+    <rect x="844" y="186" width="260" height="84" rx="8" class="b-now"/>
+    <circle cx="868" cy="210" r="12" class="num"/><text x="868" y="214" text-anchor="middle" class="num-t">8</text>
+    <text x="888" y="214">Fabricação</text>
+    <text x="864" y="242" class="t-sm">Gerber, BOM, posições</text>
+  </g>
+</svg>
+    </div>
+    <figcaption>Os passos 5 a 8 já são fortes e verificados. O passo 4 decide se a placa funciona e é o único sem evidência externa.</figcaption>
+  </figure>
+</section>
+
+<!-- ─────────────────────────── 3. CONHECIMENTO ─────────────────────────── -->
+<section id="conhecimento">
+  <h2>Onde o conhecimento vive hoje</h2>
+  <div class="prose">
+    <p>O conhecimento existe, mas espalhado em cinco lugares desta máquina, e só o que está no git viaja. Dois deles já são embriões de memória: as regras de projeto em linguagem natural que o agente grava com <code>add_design_rule</code>, e um log de todas as chamadas de ferramenta (<code>calls.jsonl</code>) que é escrito a cada uso e nunca é lido. O aprendizado de projetos reais, como o display-remoto, voltou para as skills numa sessão manual — funcionou, mas depende de alguém lembrar de fazer.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 392" role="img" aria-label="Mapa do conhecimento hoje: skills instaladas, auto-memória, configuração e catálogo, acervo ESP32 e projetos ficam presos nesta máquina; só o código e as skills no GitHub viajam; o aprendizado volta ao repositório de forma manual.">
+  <defs>
+    <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="a3n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-new"/></marker>
+  </defs>
+  <rect x="16" y="24" width="770" height="340" rx="12" class="grp"/>
+  <text x="34" y="50" class="t-hd">Este computador</text>
+  <rect x="34" y="68" width="236" height="76" rx="8" class="b"/>
+  <text x="152" y="94" text-anchor="middle">~/.claude</text>
+  <text x="152" y="114" text-anchor="middle" class="t-sm">skills e agentes instalados</text>
+  <text x="152" y="130" text-anchor="middle" class="t-sm">auto-memória do assistente</text>
+  <rect x="290" y="68" width="236" height="76" rx="8" class="b"/>
+  <text x="408" y="94" text-anchor="middle">%APPDATA%\konnect</text>
+  <text x="408" y="114" text-anchor="middle" class="t-sm">config, regras de projeto, templates</text>
+  <text x="408" y="130" text-anchor="middle" class="t-sm">catálogo JLCPCB, log de chamadas</text>
+  <rect x="546" y="68" width="222" height="76" rx="8" class="b"/>
+  <text x="657" y="94" text-anchor="middle">~/.orc e .orchestrator</text>
+  <text x="657" y="114" text-anchor="middle" class="t-sm">memória e estado do orquestrador</text>
+  <text x="657" y="130" text-anchor="middle" class="t-sm">decisões e aprovações</text>
+  <rect x="34" y="198" width="360" height="76" rx="8" class="b"/>
+  <text x="214" y="224" text-anchor="middle">Downloads · acervo ESP32</text>
+  <text x="214" y="244" text-anchor="middle" class="t-sm">850 MB de PDF e CAD; piloto em .kb-pilot</text>
+  <text x="214" y="260" text-anchor="middle" class="t-sm">ainda não consultado pelos agentes</text>
+  <rect x="414" y="198" width="354" height="76" rx="8" class="b"/>
+  <text x="591" y="224" text-anchor="middle">OneDrive · projetos KiCad</text>
+  <text x="591" y="244" text-anchor="middle" class="t-sm">cada placa terminada, com suas lições</text>
+  <text x="591" y="260" text-anchor="middle" class="t-sm">nas transcrições das sessões</text>
+  <text x="300" y="330" text-anchor="middle" class="t-sm">nada aqui é visto por outra máquina</text>
+  <!-- GitHub -->
+  <rect x="846" y="110" width="258" height="96" rx="10" class="b-now"/>
+  <text x="975" y="140" text-anchor="middle" class="t-hd">GitHub</text>
+  <text x="975" y="164" text-anchor="middle" class="t-sm">código do Konnect</text>
+  <text x="975" y="182" text-anchor="middle" class="t-sm">skills embutidas no binário</text>
+  <path d="M846,166 L152,166 L152,147" class="ln" marker-end="url(#a3)"/>
+  <text x="500" y="186" text-anchor="middle" class="t-sm">build + konnect init</text>
+  <path d="M591,274 L591,304 L975,304 L975,208" class="ln-gap" marker-end="url(#a3n)"/>
+  <text x="975" y="328" text-anchor="middle" class="t-sm">lições: volta manual, por sessão</text>
+</svg>
+    </div>
+    <figcaption>As setas mostram tudo o que circula hoje: o código desce do GitHub para a máquina; as lições só sobem quando alguém faz uma sessão de aprendizado. O acervo e a auto-memória não circulam.</figcaption>
+  </figure>
+</section>
+
+<!-- ─────────────────────────── 4. CÉREBRO ─────────────────────────── -->
+<section id="cerebro">
+  <h2>O cérebro proposto</h2>
+  <div class="prose">
+    <p>O cérebro é uma camada nova do Konnect com cinco tipos de conhecimento, consultada pelos agentes através de ferramentas MCP, como já fazem com o esquemático. A fonte da verdade é um repositório Git privado, em texto; cada máquina mantém só um índice local, reconstruído a partir dele. Assim o Konnect vai para outra máquina com um <code>konnect brain sync</code>.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 470" role="img" aria-label="Arquitetura proposta: os agentes consultam o cérebro por ferramentas; o cérebro tem procedimentos, referências, receitas, experiência e peças; lê de um índice local sincronizado com um repositório Git privado e propõe novas memórias por pull request.">
+  <defs>
+    <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="a4n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-new"/></marker>
+  </defs>
+  <!-- agents -->
+  <rect x="16" y="130" width="200" height="150" rx="10" class="b-now"/>
+  <text x="116" y="160" text-anchor="middle" class="t-hd">Agentes e sessão</text>
+  <text x="116" y="186" text-anchor="middle" class="t-sm">esquemático</text>
+  <text x="116" y="204" text-anchor="middle" class="t-sm">layout</text>
+  <text x="116" y="222" text-anchor="middle" class="t-sm">revisão</text>
+  <text x="116" y="240" text-anchor="middle" class="t-sm">você, no chat</text>
+  <line x1="216" y1="180" x2="286" y2="180" class="ln-new" marker-end="url(#a4n)"/>
+  <text x="251" y="170" text-anchor="middle" class="t-sm">consulta</text>
+  <line x1="286" y1="236" x2="216" y2="236" class="ln-new" marker-end="url(#a4n)"/>
+  <text x="251" y="256" text-anchor="middle" class="t-sm">evidência</text>
+  <!-- brain -->
+  <rect x="288" y="40" width="470" height="330" rx="14" class="b-new"/>
+  <text x="310" y="70" class="t-hd">Cérebro do Konnect</text>
+  <text x="310" y="90" class="t-sm">ferramentas: buscar · receita · conexões · lembrar · propor lição</text>
+  <rect x="310" y="108" width="206" height="72" rx="8" class="b"/>
+  <text x="413" y="134" text-anchor="middle">Procedimentos</text>
+  <text x="413" y="154" text-anchor="middle" class="t-sm">skills: como trabalhar</text>
+  <text x="413" y="170" text-anchor="middle" class="t-sm">(já existe)</text>
+  <rect x="530" y="108" width="206" height="72" rx="8" class="b"/>
+  <text x="633" y="134" text-anchor="middle">Referências</text>
+  <text x="633" y="154" text-anchor="middle" class="t-sm">fichas por bloco, conexões,</text>
+  <text x="633" y="170" text-anchor="middle" class="t-sm">páginas originais</text>
+  <rect x="310" y="194" width="206" height="72" rx="8" class="b"/>
+  <text x="413" y="220" text-anchor="middle">Receitas</text>
+  <text x="413" y="240" text-anchor="middle" class="t-sm">ESP32 mínimo, USB-serial,</text>
+  <text x="413" y="256" text-anchor="middle" class="t-sm">NAU7802 + célula de carga</text>
+  <rect x="530" y="194" width="206" height="72" rx="8" class="b"/>
+  <text x="633" y="220" text-anchor="middle">Experiência</text>
+  <text x="633" y="240" text-anchor="middle" class="t-sm">lições de cada projeto,</text>
+  <text x="633" y="256" text-anchor="middle" class="t-sm">erros e correções medidas</text>
+  <rect x="310" y="280" width="426" height="68" rx="8" class="b"/>
+  <text x="523" y="306" text-anchor="middle">Peças</text>
+  <text x="523" y="326" text-anchor="middle" class="t-sm">catálogo JLCPCB, datasheets, footprints conferidos</text>
+  <!-- storage -->
+  <rect x="846" y="40" width="258" height="96" rx="10" class="b-new"/>
+  <text x="975" y="68" text-anchor="middle" class="t-hd">Repositório Git privado</text>
+  <text x="975" y="92" text-anchor="middle" class="t-sm">fonte da verdade, em texto:</text>
+  <text x="975" y="110" text-anchor="middle" class="t-sm">fichas, receitas, lições</text>
+  <rect x="846" y="190" width="258" height="80" rx="10" class="b-new"/>
+  <text x="975" y="218" text-anchor="middle" class="t-hd">Índice local</text>
+  <text x="975" y="242" text-anchor="middle" class="t-sm">SQLite, reconstruído do Git</text>
+  <text x="975" y="258" text-anchor="middle" class="t-sm">busca offline em ~150 tokens</text>
+  <rect x="846" y="320" width="258" height="80" rx="10" class="b"/>
+  <text x="975" y="348" text-anchor="middle">Originais</text>
+  <text x="975" y="370" text-anchor="middle" class="t-sm">PDF e CAD: LFS, release</text>
+  <text x="975" y="386" text-anchor="middle" class="t-sm">ou só os derivados</text>
+  <line x1="975" y1="136" x2="975" y2="188" class="ln-new" marker-end="url(#a4n)"/>
+  <text x="985" y="167" class="t-sm">sync</text>
+  <line x1="846" y1="230" x2="760" y2="230" class="ln-new" marker-end="url(#a4n)"/>
+  <text x="803" y="222" text-anchor="middle" class="t-sm">lê</text>
+  <path d="M758,120 L800,120 L800,74 L844,74" class="ln-new" marker-end="url(#a4n)"/>
+  <text x="800" y="64" text-anchor="middle" class="t-sm">propõe (PR)</text>
+  <line x1="975" y1="320" x2="975" y2="272" class="ln-dash"/>
+  <text x="985" y="300" class="t-sm">páginas sob demanda</text>
+  <!-- ingest -->
+  <rect x="288" y="400" width="470" height="54" rx="10" class="b-new"/>
+  <text x="523" y="424" text-anchor="middle">Ingestão de acervos</text>
+  <text x="523" y="442" text-anchor="middle" class="t-sm">ESP32 agora · breakouts Adafruit (NAU7802…) depois</text>
+  <line x1="523" y1="400" x2="523" y2="372" class="ln-new" marker-end="url(#a4n)"/>
+</svg>
+    </div>
+    <figcaption>Tudo em cobre é novo. Os agentes continuam com as mesmas mãos (as 226 ferramentas); o que muda é que, antes de escolher um bloco, eles consultam o cérebro e recebem evidência citável.</figcaption>
+  </figure>
+
+  <div class="cols">
+    <div class="card"><h4>Referências</h4><p>O que o piloto já provou: cada placa vira fichas por bloco funcional, com as conexões exatas do CAD, a revisão e a origem. 58 projetos, 721 fichas, conexões conferidas contra a placa.</p></div>
+    <div class="card"><h4>Receitas</h4><p>O “próximo nível” que você descreveu: “ESP32 mínimo” já traz LDO, EN com reset, BOOT, USB e auto-programação, com valores tirados das placas de referência e dos datasheets, e as fontes citadas.</p></div>
+    <div class="card"><h4>Experiência</h4><p>Cada projeto deixa lições candidatas — o que deu errado, a correção medida, a regra nova. Só viram memória depois da sua aprovação.</p></div>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 5. RECEITA ESP32 ─────────────────────────── -->
+<section id="receita">
+  <h2>Exemplo: o que o acervo já sabe sobre o ESP32</h2>
+  <div class="prose">
+    <p>Testei a ideia de receita com os dados do piloto: para as 13 placas com ESP32 (última revisão de cada), o script leu o que está ligado ao EN e ao GPIO0 do módulo, qual regulador o alimenta e como ele é programado. A regra que você quer que o Konnect aplique sozinho aparece nos números: nas 12 placas em que o EN foi localizado, <b>10 usam pull-up de 10 kΩ, 10 usam capacitor de 1 µF e 11 têm botão de reset</b>.</p>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Placa</th><th>Programação USB</th><th>Regulador 3V3</th><th>EN: pull-up</th><th>EN: capacitor</th><th>Botão reset</th></tr></thead>
+      <tbody>
+        <tr><td>Olimex ESP32-EVB Rev L</td><td class="mono">CH340X</td><td class="mono">TPS62A02 (buck)</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-POE Rev M2</td><td class="mono">CH340X</td><td class="mono">TX4138 + TPS62A02</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-POE-ISO Rev N1</td><td class="mono">CH340X</td><td class="mono">TX4138 + TPS62A02</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-DevKit-LiPo Rev D</td><td class="mono">CH340X</td><td class="mono">HX6211 (LDO)</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-C5-EVB Rev A</td><td class="mono">CH340X</td><td class="mono">TPS62A02</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-SBC-FabGL Rev B</td><td class="mono">CH340X</td><td class="mono">SY8089 (buck)</td><td class="mono">10k</td><td class="mono">1µF</td><td class="miss">não visto</td></tr>
+        <tr><td>Makerfabs ESP32-UWB</td><td class="mono">CP2104</td><td class="mono">LD1117 (LDO)</td><td class="mono">10k</td><td class="mono">0,1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Makerfabs ESP32-UWB-DW3000</td><td class="mono">CP2104</td><td class="mono">ME6217 + LD1117</td><td class="mono">10k</td><td class="mono">100nF</td><td class="yes">sim</td></tr>
+        <tr><td>Adafruit ESP32-S2 TFT Feather</td><td>USB nativo</td><td class="mono">AP2112 (LDO)</td><td class="mono">5,1k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Adafruit ESP32-C6 Feather</td><td>USB nativo</td><td class="mono">AP2112 / RT9080</td><td class="mono">5,1k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Adafruit Metro ESP32-S3</td><td>USB nativo</td><td class="mono">AP2112</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Adafruit QT Py ESP32-C3</td><td>USB nativo</td><td class="mono">AP2112K</td><td class="mono">10k</td><td class="mono">1µF</td><td class="yes">sim</td></tr>
+        <tr><td>Olimex ESP32-PRO Rev B1</td><td class="miss">sem ponte identificada</td><td class="mono">SY8089</td><td class="miss" colspan="3">EN não localizado pelo script</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="prose">
+    <p>Três coisas aparecem sem ninguém dizer: os chips com USB nativo (S2, S3, C3, C6) dispensam a ponte USB-serial; as placas com ESP32 clássico usam CH340X ou CP2104; e o regulador varia com a carga (LDO nas placas simples, buck nas placas com Ethernet ou PoE).</p>
+  </div>
+  <div class="note">O script ainda não enxerga tudo, e isso é informação útil. O botão de BOOT e a auto-programação da Olimex passam por um diodo duplo (BAT54C) antes de chegar ao GPIO0, e ficaram de fora. O cérebro precisa reconhecer papéis de pino (EN, CHIP_EN, EN_3 são o mesmo) e subcircuitos em mais de um salto — é o trabalho das receitas, e cada receita passa pela sua revisão antes de valer.</div>
+</section>
+
+<!-- ─────────────────────────── 6. CICLO ─────────────────────────── -->
+<section id="ciclo">
+  <h2>O ciclo de autoaperfeiçoamento</h2>
+  <div class="prose">
+    <p>Hoje o aprendizado depende de uma sessão como a do display-remoto. No cérebro, ele vira rotina: cada projeto gera candidatas, você aprova, a memória é promovida, e um conjunto de perguntas de teste garante que nada que já funcionava piorou.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 330" role="img" aria-label="Ciclo: projeto, captura, candidatas, sua revisão, promoção, avaliação, e de volta ao próximo projeto.">
+  <defs>
+    <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="a5n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-new"/></marker>
+  </defs>
+  <rect x="16" y="40" width="150" height="86" rx="10" class="b-now"/>
+  <text x="91" y="72" text-anchor="middle" class="t-hd">Projeto</text>
+  <text x="91" y="94" text-anchor="middle" class="t-sm">placa real,</text>
+  <text x="91" y="110" text-anchor="middle" class="t-sm">com o Konnect</text>
+  <line x1="166" y1="83" x2="206" y2="83" class="ln-new" marker-end="url(#a5n)"/>
+  <rect x="208" y="40" width="170" height="86" rx="10" class="b-new"/>
+  <text x="293" y="72" text-anchor="middle" class="t-hd">Captura</text>
+  <text x="293" y="94" text-anchor="middle" class="t-sm">decisões, erros,</text>
+  <text x="293" y="110" text-anchor="middle" class="t-sm">correções medidas</text>
+  <line x1="378" y1="83" x2="418" y2="83" class="ln-new" marker-end="url(#a5n)"/>
+  <rect x="420" y="40" width="170" height="86" rx="10" class="b-new"/>
+  <text x="505" y="72" text-anchor="middle" class="t-hd">Candidatas</text>
+  <text x="505" y="94" text-anchor="middle" class="t-sm">memória pendente,</text>
+  <text x="505" y="110" text-anchor="middle" class="t-sm">com evidência</text>
+  <line x1="590" y1="83" x2="630" y2="83" class="ln-new" marker-end="url(#a5n)"/>
+  <rect x="632" y="40" width="170" height="86" rx="10" class="b-new"/>
+  <text x="717" y="72" text-anchor="middle" class="t-hd">Sua revisão</text>
+  <text x="717" y="94" text-anchor="middle" class="t-sm">pull request:</text>
+  <text x="717" y="110" text-anchor="middle" class="t-sm">aprova ou recusa</text>
+  <line x1="802" y1="83" x2="842" y2="83" class="ln-new" marker-end="url(#a5n)"/>
+  <rect x="844" y="40" width="170" height="86" rx="10" class="b-new"/>
+  <text x="929" y="72" text-anchor="middle" class="t-hd">Promoção</text>
+  <text x="929" y="94" text-anchor="middle" class="t-sm">vira ficha, receita</text>
+  <text x="929" y="110" text-anchor="middle" class="t-sm">ou regra de skill</text>
+  <path d="M929,126 L929,196" class="ln-new" marker-end="url(#a5n)"/>
+  <rect x="780" y="198" width="298" height="86" rx="10" class="b-new"/>
+  <text x="929" y="230" text-anchor="middle" class="t-hd">Avaliação</text>
+  <text x="929" y="252" text-anchor="middle" class="t-sm">perguntas de teste; nenhuma regressão</text>
+  <text x="929" y="268" text-anchor="middle" class="t-sm">(hoje: 39/39 e 15/15 no piloto)</text>
+  <path d="M780,241 L91,241 L91,128" class="ln-new" marker-end="url(#a5n)"/>
+  <text x="435" y="232" text-anchor="middle" class="t-sm">o próximo projeto começa mais preciso</text>
+  <path d="M717,126 L717,170 L505,170 L505,128" class="ln-dash"/>
+  <text x="611" y="188" text-anchor="middle" class="t-sm">recusada: fica registrada, não vira regra</text>
+</svg>
+    </div>
+    <figcaption>A revisão é o único passo humano, de propósito: foi a regra que fez o display-remoto dar certo — confiança só depois de evidência. Uma memória recusada fica registrada, para o cérebro não propor a mesma coisa de novo.</figcaption>
+  </figure>
+</section>
+
+<!-- ─────────────────────────── 7. PORTABILIDADE ─────────────────────────── -->
+<section id="portabilidade">
+  <h2>Portabilidade: onde o cérebro mora</h2>
+  <div class="prose">
+    <p>Você quer levar o Konnect para outra máquina sem copiar dados à mão. A diferença entre as duas opções mais sérias está numa única caixa: o índice local.</p>
+  </div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 330" role="img" aria-label="Comparação: na opção A, cada máquina tem um índice local sincronizado com um repositório Git e busca offline; na opção B, cada busca consulta um banco na nuvem e sem rede não há cérebro.">
+  <defs>
+    <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="a6n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-new"/></marker>
+  </defs>
+  <!-- A -->
+  <rect x="16" y="20" width="528" height="294" rx="12" class="b-new" style="fill:none"/>
+  <text x="36" y="48" class="t-hd">A · Git + índice local</text>
+  <text x="36" y="68" class="t-sm">recomendada</text>
+  <rect x="190" y="84" width="180" height="56" rx="8" class="b"/>
+  <text x="280" y="108" text-anchor="middle">GitHub privado</text>
+  <text x="280" y="126" text-anchor="middle" class="t-sm">texto versionado</text>
+  <rect x="44" y="196" width="200" height="98" rx="8" class="b"/>
+  <text x="144" y="220" text-anchor="middle">Máquina 1</text>
+  <rect x="62" y="232" width="164" height="46" rx="6" class="b-new"/>
+  <text x="144" y="260" text-anchor="middle">índice local</text>
+  <rect x="316" y="196" width="200" height="98" rx="8" class="b"/>
+  <text x="416" y="220" text-anchor="middle">Máquina 2</text>
+  <rect x="334" y="232" width="164" height="46" rx="6" class="b-new"/>
+  <text x="416" y="260" text-anchor="middle">índice local</text>
+  <line x1="236" y1="142" x2="170" y2="194" class="ln-new" marker-start="url(#a6n)" marker-end="url(#a6n)"/>
+  <line x1="324" y1="142" x2="390" y2="194" class="ln-new" marker-start="url(#a6n)" marker-end="url(#a6n)"/>
+  <text x="170" y="164" text-anchor="end" class="t-sm">pull / PR</text>
+  <text x="392" y="164" class="t-sm">pull / PR</text>
+  <!-- B -->
+  <rect x="576" y="20" width="528" height="294" rx="12" class="grp"/>
+  <text x="596" y="48" class="t-hd">B · Banco na nuvem (Supabase)</text>
+  <text x="596" y="68" class="t-sm">Postgres + vetores + armazenamento</text>
+  <rect x="750" y="84" width="180" height="56" rx="8" class="b"/>
+  <text x="840" y="108" text-anchor="middle">Banco na nuvem</text>
+  <text x="840" y="126" text-anchor="middle" class="t-sm">única cópia</text>
+  <rect x="604" y="196" width="200" height="98" rx="8" class="b"/>
+  <text x="704" y="228" text-anchor="middle">Máquina 1</text>
+  <text x="704" y="252" text-anchor="middle" class="t-sm">sem cópia local</text>
+  <rect x="876" y="196" width="200" height="98" rx="8" class="b"/>
+  <text x="976" y="228" text-anchor="middle">Máquina 2</text>
+  <text x="976" y="252" text-anchor="middle" class="t-sm">sem cópia local</text>
+  <line x1="704" y1="194" x2="796" y2="142" class="ln" marker-end="url(#a6)"/>
+  <line x1="976" y1="194" x2="884" y2="142" class="ln" marker-end="url(#a6)"/>
+  <text x="730" y="164" text-anchor="end" class="t-sm">rede, a cada busca</text>
+  <text x="950" y="164" class="t-sm">rede, a cada busca</text>
+</svg>
+    </div>
+    <figcaption>Em A, a máquina busca no próprio índice e só usa a rede para sincronizar; em B, toda consulta atravessa a rede. A também dá de graça o que um cérebro revisado precisa: histórico, diff e pull request.</figcaption>
+  </figure>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Critério</th><th>A · Git + índice local</th><th>B · Banco na nuvem</th><th>C · Arquivo único (memvid/SQLite) no OneDrive</th></tr></thead>
+      <tbody>
+        <tr><td>Outra máquina</td><td><code>konnect brain sync</code></td><td>só a credencial</td><td>esperar a sincronização do arquivo</td></tr>
+        <tr><td>Sem internet</td><td class="yes">busca funciona</td><td class="no">para</td><td class="yes">funciona</td></tr>
+        <tr><td>Revisar uma memória nova</td><td class="yes">pull request com diff</td><td class="no">precisa de tela própria</td><td class="no">arquivo binário, sem diff</td></tr>
+        <tr><td>Duas máquinas aprendendo ao mesmo tempo</td><td class="yes">merge de texto</td><td class="yes">o banco resolve</td><td class="no">conflito no arquivo inteiro</td></tr>
+        <tr><td>Consultas de conexão (pino, rede)</td><td class="yes">SQL local</td><td class="yes">SQL remoto</td><td>SQLite sim; memvid não é relacional</td></tr>
+        <tr><td>Originais (850 MB)</td><td>fora do Git: release ou LFS</td><td>armazenamento do Supabase</td><td>dentro do arquivo</td></tr>
+        <tr><td>Custo e manutenção</td><td class="yes">nenhum serviço novo</td><td>um serviço a manter</td><td class="yes">nenhum</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 8. MEMVID ─────────────────────────── -->
+<section id="memvid">
+  <h2>memvid: ajuda ou só pesa?</h2>
+  <div class="prose">
+    <p>O <a href="https://github.com/memvid/memvid">memvid</a> é uma biblioteca Rust (licença Apache-2.0, versão 2.0.140, ativa em 2026, 16,5 mil estrelas) que guarda a memória de um agente num arquivo único <code>.mv2</code>: quadros comprimidos e imutáveis, um índice de texto (Tantivy, BM25), um índice de vetores opcional (HNSW com embeddings locais via ONNX) e uma linha do tempo que permite voltar a estados antigos. Resolve bem o problema para o qual foi feito: memória de conversa portátil, sem servidor.</p>
+    <p><b>Minha avaliação: não entra agora.</b> Ele duplicaria o que o SQLite já faz no Konnect sem resolver nenhuma lacuna que o piloto mostrou:</p>
+  </div>
+  <div class="cols">
+    <div class="card"><h4>A busca por texto já existe</h4><p>O SQLite FTS5, que já é dependência do Konnect, acertou 39/39 e 15/15 com códigos exatos de peça. O Tantivy do memvid faria o mesmo trabalho com outra dependência grande.</p></div>
+    <div class="card"><h4>Conexões pedem tabelas</h4><p>“O que está ligado ao EN do U3?” é uma consulta relacional sobre pinos e redes. O memvid guarda documentos com etiquetas, não relações.</p></div>
+    <div class="card"><h4>Arquivo binário não revisa</h4><p>Um <code>.mv2</code> não tem diff nem merge: duas máquinas aprendendo geram conflito, e você não consegue revisar uma memória nova antes de ela valer.</p></div>
+    <div class="card"><h4>Vetores custam caro</h4><p>A busca semântica dele exige o runtime ONNX e um modelo de ~120 MB a 530 MB. Só compensa se a avaliação mostrar buscas por conceito que palavras-chave não resolvem.</p></div>
+  </div>
+  <div class="prose">
+    <p>Vale guardar duas ideias dele: memória só de acréscimo com histórico (o Git já dá) e a busca visual por imagem de página (o recurso CLIP), que pode ser útil mais adiante para achar esquemáticos pelo desenho. Se a avaliação um dia pedir busca semântica, comparo três caminhos: memvid, a extensão <code>sqlite-vec</code> e vetores no Postgres.</p>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 9. MUDANÇAS ─────────────────────────── -->
+<section id="mudancas">
+  <h2>O que muda na arquitetura</h2>
+  <div class="prose">
+    <p>Nada do que já funciona é refeito. O cérebro entra como um módulo novo, com ferramentas próprias, e três ajustes nas partes existentes.</p>
+  </div>
+  <div class="cols three">
+    <div class="card pick"><h4>Novo módulo <code>konnect-brain</code></h4><p>Armazenamento (Git + índice SQLite), ingestão de acervos, recuperação, escrita de memórias candidatas e a avaliação. Reaproveita o leitor S-expression, o SQLite e o esqueleto <code>konnect-vcs</code> (Git via gix), que já existe no repositório e não está ligado a nada.</p></div>
+    <div class="card pick"><h4>Dois toolsets novos</h4><p><b>knowledge</b>: buscar referências, abrir ficha, consultar conexões, comparar revisões, ver página. <b>memory</b>: pedir uma receita, lembrar lições, propor uma lição nova.</p></div>
+    <div class="card pick"><h4>Comando <code>konnect brain</code></h4><p><code>sync</code> (baixa e reconstrói o índice), <code>ingest</code> (importa um acervo), <code>eval</code> (roda as perguntas de teste), <code>review</code> (lista candidatas).</p></div>
+    <div class="card"><h4>Skills e agentes</h4><p>A skill de esquemático ganha o passo “consultar o cérebro por bloco”; o agente de esquemático cita a receita usada; a revisão compara o projeto com as receitas.</p></div>
+    <div class="card"><h4>Aprendizado automático</h4><p>O que hoje fiz à mão com o display-remoto (ler as sessões, extrair lições) vira um passo no fim de cada projeto. O log de chamadas, que hoje ninguém lê, entra como matéria-prima, junto com as regras gravadas por <code>add_design_rule</code>.</p></div>
+    <div class="card"><h4>Licenças fora do caminho</h4><p>Projeto pessoal, sem comercialização: a restrição de reuso por licença sai. A licença de cada projeto continua registrada só como informação.</p></div>
+  </div>
+  <h3>Ordem proposta</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Fase</th><th>Entrega</th><th>Pronto quando</th></tr></thead>
+      <tbody>
+        <tr><td>1 · Base portátil</td><td>Repositório do cérebro, <code>brain sync</code>, acervo ESP32 importado, toolset knowledge</td><td>outra máquina busca o acervo após um sync; 39/39 e 15/15 pelas ferramentas MCP</td></tr>
+        <tr><td>2 · Receitas</td><td>ESP32 mínimo, USB-serial, regulador 3V3, carregador Li-ion; papéis de pino e subcircuitos em vários saltos</td><td>“placa com ESP32” gera o circuito de apoio completo, com fontes, e você aprova cada receita</td></tr>
+        <tr><td>3 · Ciclo de aprendizagem</td><td>Captura no fim do projeto, candidatas, revisão por PR, avaliação sem regressão</td><td>o próximo projeto real deixa lições aprovadas no cérebro</td></tr>
+        <tr><td>4 · Novos acervos</td><td>Breakouts Adafruit (NAU7802 para célula de carga, sensores), outros fabricantes</td><td>“medir peso” encontra o NAU7802 com o circuito de referência</td></tr>
+        <tr><td>5 · Busca por conceito</td><td>Vetores ou busca visual, só se a avaliação mostrar falhas que palavras-chave não resolvem</td><td>a avaliação melhora sem piorar os códigos exatos</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 10. DECISÕES ─────────────────────────── -->
+<section id="decisoes">
+  <h2>Decisões para fecharmos</h2>
+  <div class="prose">
+    <p>Tenho uma recomendação para cada uma; basta responder no chat com o número e “ok” ou a alternativa.</p>
+    <ol class="decide">
+      <li><b>Onde o cérebro mora.</b> Recomendo a opção A: um repositório Git privado no seu GitHub como fonte da verdade, com índice local em cada máquina.</li>
+      <li><b>O que fazer com os 850 MB de originais.</b> Recomendo guardar no Git só os derivados (fichas, conexões, texto — poucas dezenas de MB) e publicar os PDFs e CADs como anexo de release, baixados sob demanda para ver páginas.</li>
+      <li><b>O que passa pela sua revisão.</b> Recomendo: receitas e lições sempre; fichas geradas automaticamente de CAD entram direto, porque o cruzamento com a placa já as confere.</li>
+      <li><b>Primeiras receitas.</b> Recomendo começar por ESP32 mínimo e conversor USB-serial — exatamente o seu exemplo — e usar a próxima placa real como teste do ciclo.</li>
+      <li><b>Próximo acervo.</b> Recomendo os breakouts da Adafruit logo depois da fase 2, começando pelo NAU7802.</li>
+      <li><b>memvid.</b> Recomendo não adotar agora e reavaliar só se a fase 5 for necessária.</li>
+    </ol>
+  </div>
+</section>
+</div>
+
+</body>
+</html>

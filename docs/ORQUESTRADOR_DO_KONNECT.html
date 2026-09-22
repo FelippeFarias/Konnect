@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orquestrador do Konnect</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Saira+Semi+Condensed:wght@500;600;700&display=swap">
+<style>
+:root{
+  --ground:#F3F5F4; --surface:#FFFFFF; --sunk:#E9EDEB;
+  --ink:#16201C; --muted:#56635E; --line:#CDD5D1;
+  --green:#1D6A4F; --green-soft:#DCEDE5;
+  --copper:#B15C24; --copper-soft:#F5E4D6;
+  --warn:#8C6400;
+  --display:"Saira Semi Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1412; --surface:#151D1A; --sunk:#1B2521;
+    --ink:#E2E9E6; --muted:#98A5A0; --line:#2C3833;
+    --green:#5EC29B; --green-soft:#15302A;
+    --copper:#E88F53; --copper-soft:#3A2517;
+    --warn:#E0B24A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1412; --surface:#151D1A; --sunk:#1B2521;
+  --ink:#E2E9E6; --muted:#98A5A0; --line:#2C3833;
+  --green:#5EC29B; --green-soft:#15302A;
+  --copper:#E88F53; --copper-soft:#3A2517;
+  --warn:#E0B24A;
+}
+body{background:var(--ground);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.6}
+.wrap{max-width:1140px;margin:0 auto;padding-inline:20px;padding-block:40px 80px}
+.prose{max-width:70ch}
+header .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(2.2rem,5vw,3.4rem);line-height:1.05;margin:.3em 0 .35em;letter-spacing:-.01em;text-wrap:balance}
+h2{font-family:var(--display);font-weight:600;font-size:clamp(1.5rem,3vw,2rem);line-height:1.15;margin:0 0 .5em;text-wrap:balance}
+h3{font-family:var(--display);font-weight:600;font-size:1.2rem;margin:1.6em 0 .4em}
+p{margin:0 0 1em}
+.lead{font-size:1.15rem;color:var(--ink)}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:var(--sunk);padding:.08em .35em;border-radius:4px}
+a{color:var(--green)}
+section{padding-block:48px 8px;border-top:1px solid var(--line);margin-top:40px}
+.legend{display:flex;flex-wrap:wrap;gap:10px 22px;margin:18px 0 0;font-size:14px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:8px}
+.sw{width:14px;height:14px;border-radius:3px;border:2px solid}
+.sw.now{border-color:var(--green);background:var(--green-soft)}
+.sw.new{border-color:var(--copper);background:var(--copper-soft)}
+.sw.gap{border-color:var(--copper);border-style:dashed;background:transparent}
+nav.toc{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+nav.toc a{font-size:14px;text-decoration:none;color:var(--ink);background:var(--surface);border:1px solid var(--line);padding:5px 12px;border-radius:999px}
+nav.toc a:hover,nav.toc a:focus-visible{border-color:var(--green);outline:none}
+figure{margin:28px 0 8px}
+.dia{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px}
+.dia svg{display:block;width:100%;min-width:760px;height:auto;color:var(--ink)}
+figcaption{font-size:14px;color:var(--muted);margin-top:10px;max-width:80ch}
+/* diagram vocabulary, styled from the page */
+.dia text{font-family:var(--body);font-size:13px;fill:currentColor}
+.dia .t-sm{font-size:11.5px;fill:var(--muted)}
+.dia .t-hd{font-family:var(--display);font-weight:600;font-size:15px}
+.dia .t-mono{font-family:var(--mono);font-size:11.5px}
+.dia .grp{fill:none;stroke:var(--line);stroke-width:1.5;stroke-dasharray:5 4}
+.dia .b{fill:var(--surface);stroke:var(--line);stroke-width:1.3}
+.dia .b-now{fill:var(--green-soft);stroke:var(--green);stroke-width:1.5}
+.dia .b-new{fill:var(--copper-soft);stroke:var(--copper);stroke-width:1.8}
+.dia .b-gap{fill:none;stroke:var(--copper);stroke-width:1.8;stroke-dasharray:6 4}
+.dia .ln{stroke:currentColor;stroke-width:1.4;fill:none}
+.dia .ln-new{stroke:var(--copper);stroke-width:1.8;fill:none}
+.dia .ln-dash{stroke:var(--muted);stroke-width:1.4;fill:none;stroke-dasharray:5 4}
+.dia .ln-gap{stroke:var(--copper);stroke-width:1.6;fill:none;stroke-dasharray:6 4}
+.dia .ah{fill:currentColor}
+.dia .ah-new{fill:var(--copper)}
+.dia .ah-dash{fill:var(--muted)}
+.dia .num{fill:var(--ink)}
+.dia .num-t{fill:var(--surface);font-family:var(--mono);font-size:12px;font-weight:500}
+.dia .c-new{fill:var(--copper)}
+.dia .c-now{fill:var(--green)}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--surface)}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:18px 0}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;background:var(--sunk);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td .mono{white-space:nowrap}
+.yes{color:var(--green);font-weight:600}
+.no{color:var(--muted)}
+.miss{color:var(--warn);font-weight:600}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin:18px 0}
+.cols.three{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.card h4{font-family:var(--display);font-weight:600;font-size:1.08rem;margin:0 0 6px}
+.card p{margin:0;font-size:14.5px;color:var(--muted)}
+.card.pick{border-color:var(--copper);box-shadow:inset 3px 0 0 var(--copper)}
+.tag{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:1px 7px;border-radius:4px;background:var(--sunk);color:var(--muted);margin-left:6px;vertical-align:1px}
+.tag.pick{background:var(--copper-soft);color:var(--copper)}
+ol.decide{padding-left:1.3em}
+ol.decide li{margin:0 0 .9em}
+ol.decide b{font-weight:600}
+.note{border-left:3px solid var(--warn);padding:8px 14px;background:var(--surface);border-radius:0 8px 8px 0;font-size:14.5px;color:var(--muted);margin:16px 0}
+@media (max-width:560px){ .wrap{padding-inline:16px} body{font-size:15.5px} }
+@media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto} }
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">Konnect · arquitetura · 21 set 2026</div>
+  <h1>Orquestrador do Konnect</h1>
+  <p class="lead prose">Você perguntou se o Konnect pode ter um orquestrador como o orc: um agente mestre que conduz um fluxo definido, do pedido até a placa pronta para fabricar, e que também chama um agente sozinho quando a tarefa pede só isso. Dá, e a maior parte das peças já existe. Este documento analisa o orc por dentro, mostra o que se traduz para hardware e o que não se traduz, e propõe o orquestrador: um fluxo com portões, estado guardado no próprio projeto KiCad e aprendizado no fim de cada placa.</p>
+  <p class="prose" style="font-size:14.5px;color:var(--muted)">Complementa <code>docs/CEREBRO_DO_KONNECT.html</code>. O cérebro é o que o Konnect sabe; o orquestrador é como ele trabalha. Os dois se encontram na fase de aprendizado.</p>
+  <div class="legend" aria-label="Legenda das cores">
+    <span><i class="sw now"></i>existe hoje</span>
+    <span><i class="sw new"></i>proposto</span>
+    <span><i class="sw gap"></i>lacuna</span>
+  </div>
+  <nav class="toc" aria-label="Seções">
+    <a href="#resposta">Resposta curta</a>
+    <a href="#orc">O orc por dentro</a>
+    <a href="#noconnect">O orc construindo o Konnect</a>
+    <a href="#base">O que já existe</a>
+    <a href="#diferencas">O que não se traduz</a>
+    <a href="#camadas">Três camadas</a>
+    <a href="#fluxo">O fluxo</a>
+    <a href="#agentes">Os agentes</a>
+    <a href="#estado">Estado e memória</a>
+    <a href="#motor">O motor</a>
+    <a href="#exemplo">Um pedido</a>
+    <a href="#custo">Custo</a>
+    <a href="#ordem">Ordem</a>
+    <a href="#decisoes">Decisões</a>
+  </nav>
+</header>
+
+<!-- ─────────────────────────── 1. RESPOSTA CURTA ─────────────────────────── -->
+<section id="resposta">
+  <h2>Resposta curta</h2>
+  <div class="cols three">
+    <div class="card pick"><h4>Sim, e sem Node</h4><p>O orquestrador vive dentro do <code>konnect.exe</code> e numa skill. Quem usa o Konnect não precisa instalar o orc. Os conceitos vêm do orc; o código, não.</p></div>
+    <div class="card"><h4>Mesmo desenho, outro ofício</h4><p>Vêm do orc: roteador, fluxo com fases, entregas em arquivo, verificação com limite de rodadas, memória em camadas e decisões registradas. Ficam de fora os worktrees, o merge e o “nunca pergunte”.</p></div>
+    <div class="card"><h4>O que é seu continua seu</h4><p>Três portões fixos (arquitetura, posicionamento e pedido de compra) e as trocas de custo e produto. O resto o orquestrador decide com dados e deixa registrado.</p></div>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 2. O ORC POR DENTRO ─────────────────────────── -->
+<section id="orc">
+  <h2>O orc por dentro</h2>
+  <div class="prose">
+    <p>O orc é um fork do OpenSpec com uma camada de orquestração. A sessão do Claude vira o orquestrador pela skill <code>orc</code>, que não implementa nada: escolhe o agente, escreve o pedido de trabalho, confere o resultado e mantém o estado. O CLI <code>orc</code> é o motor. Oito mecanismos fazem o conjunto funcionar:</p>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>Mecanismo</th><th>Como funciona no orc</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td>Roteador-raiz</td><td>A skill tem no máximo 120 linhas, só com regras “se precisa de X, leia Y”; nenhum arquivo fica a mais de dois saltos.</td><td>O contexto fica enxuto e nenhum agente procura às cegas.</td></tr>
+      <tr><td>Elenco com contrato</td><td>14 papéis. Cada <code>AGENT.md</code> declara executor, modelo, ferramentas liberadas e bloqueadas, gatilhos e anti-gatilhos, listados num índice de uma linha por agente.</td><td>O mestre escolhe pelo índice, não por palpite.</td></tr>
+      <tr><td>Ciclo com estados</td><td>Pedido → proposta → design → portão de prontidão → implementação → verificação → portão → arquivo → aprendizado, com uma via rápida para trabalho pequeno.</td><td>Cada fase tem entrada e saída que dá para conferir.</td></tr>
+      <tr><td>Pedido e entrega</td><td>Todo pedido segue o molde O/CT/OF/TG/TB/BU/FS/SC: objetivo, contexto, formato, ferramentas, orçamento, arquivos que pode escrever, critérios. Cada agente grava <code>handoffs/&lt;mudança&gt;/NN-&lt;papel&gt;.md</code> com veredito DONE, FIX ou BLOCKED, evidência e achados adiados.</td><td>Os agentes trocam documentos, não conversa. O mestre confere a evidência antes de avançar.</td></tr>
+      <tr><td>Verificação com limite</td><td>Um FIX diz qual camada falhou (intenção, especificação ou implementação) e volta ao ponto certo. O teto é de três rodadas por mudança.</td><td>O ciclo não entra em laço infinito.</td></tr>
+      <tr><td>Estado com um escritor</td><td><code>STATE.md</code> guarda fase, mudança ativa, próximo passo, fila, aprovações pendentes, achados adiados e histórico. Só é escrito por <code>orc state &lt;verbo&gt;</code>, com trava.</td><td>Uma sessão nova retoma o trabalho sem perguntar nada.</td></tr>
+      <tr><td>Memória em camadas</td><td>Global por papel (no máximo 60 linhas), por tecnologia e por projeto. Cada lição tem um único destino. O curador destila o log em fato, lição e nota de papel, e transforma fluxos que deram certo em playbooks.</td><td>O próximo projeto começa mais preciso.</td></tr>
+      <tr><td>Segurança em níveis</td><td>Nível 1 proibido; nível 2 registrado e adiado (push, merge, gastos); nível 3 autônomo. Toda decisão vira uma linha <code>DECISION / WHY / ROLLBACK</code>.</td><td>Autonomia sem ação irreversível.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">Há ainda uma camada inteira de coordenação entre sessões — leases, worktrees, travas pelo kernel e fila de merge — que existe porque vários orquestradores podem mexer no mesmo repositório de código ao mesmo tempo.</p>
+</section>
+
+<!-- ─────────────────────────── 3. O ORC NO KONNECT ─────────────────────────── -->
+<section id="noconnect">
+  <h2>O orc construindo o Konnect</h2>
+  <div class="prose">
+    <p>A pasta <code>.orchestrator/</code> deste repositório mostra o orc em uso. Em 18 de setembro ele arquivou duas mudanças no Konnect:</p>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>Mudança</th><th>Entregas</th><th>Rodadas de correção</th></tr></thead>
+    <tbody>
+      <tr><td><code>photo-to-kicad-reverse</code></td><td>17</td><td>2</td></tr>
+      <tr><td><code>board-dossier-reconstruction</code></td><td>13</td><td>1</td></tr>
+    </tbody>
+  </table></div>
+  <div class="prose">
+    <p>Três coisas ali interessam diretamente ao orquestrador de hardware:</p>
+    <ol>
+      <li><b>O verificador independente achou o que os testes não viam.</b> O QA descobriu que <code>save_photo_review_map</code> não podia ser chamado pelo MCP: o esquema publicado aceitava só um objeto vazio, e todos os testes unitários passavam porque chamavam a função direto.</li>
+      <li><b>Achado incidental não vira desvio.</b> Ficaram registrados 24 achados adiados e 5 aprovações pendentes. Nada foi corrigido fora do escopo, e nenhum merge, push ou instalação global foi executado sem você.</li>
+      <li><b>Falha de executor tem saída registrada.</b> Quando o Codex falhou (CLI mais antigo que o modelo), o orquestrador passou o papel para um agente Claude com o mesmo <code>AGENT.md</code> e registrou a decisão, o motivo e como desfazer.</li>
+    </ol>
+    <p>O display-remoto foi o mesmo padrão, feito à mão: 81 subagentes, revisão por dimensão com verificador e crítico de cobertura, lições colhidas no fim. O orquestrador transforma isso em rotina.</p>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 4. O QUE JÁ EXISTE ─────────────────────────── -->
+<section id="base">
+  <h2>O que o Konnect já tem</h2>
+  <div class="prose"><p>Cada mecanismo do orc tem um ponto de partida no Konnect. Algumas peças estão prontas, outras existem sem uso e poucas faltam.</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>No orc</th><th>No Konnect hoje</th><th>Situação</th></tr></thead>
+    <tbody>
+      <tr><td>Roteador-raiz</td><td>Skill <code>konnect</code>: regras, árvore de decisão, roteamento para agentes. Já carrega em toda tarefa de KiCad.</td><td class="miss">parcial: não conduz um fluxo</td></tr>
+      <tr><td>Métodos por papel</td><td>Skills e referências: gates de posicionamento e roteamento, orquestração de revisão, armadilhas de verificação, cálculos de pior caso, projeto de interfaces.</td><td class="yes">existe</td></tr>
+      <tr><td>Elenco</td><td>Três agentes: esquemático, layout e revisão (limites de 200, 300 e 300 turnos). O de foto → KiCad está no branch <code>orc/photo-to-kicad-reverse</code>.</td><td class="miss">parcial</td></tr>
+      <tr><td>Motor</td><td><code>konnect.exe</code>: servidor MCP com ferramentas tipadas e o CLI <code>konnect init</code>, que instala skills, agentes e hooks para Claude e Codex.</td><td class="miss">falta o toolset de fluxo</td></tr>
+      <tr><td>Estado por projeto</td><td><code>&lt;projeto&gt;/.konnect/</code> com <code>project.json</code>, baselines e templates. Fica fora do hash do projeto por construção.</td><td class="miss">a pasta existe; falta o estado</td></tr>
+      <tr><td>Aprovação ligada à revisão</td><td><code>design_hash.rs</code> calcula o hash canônico do projeto; o mapa de foto tem <code>approval_valid</code> por hash de conteúdo.</td><td class="miss">existe, sem ferramenta que use</td></tr>
+      <tr><td>Checkpoint e restauração</td><td>Crate <code>konnect-vcs</code> (git em Rust puro), com restauração por branch de recuperação no desenho.</td><td class="miss">esqueleto, não ligado</td></tr>
+      <tr><td>Conferir o que o agente fez</td><td><code>get_recent_calls</code> e o log <code>calls.jsonl</code>, escrito a cada chamada.</td><td class="miss">existe, ninguém lê</td></tr>
+      <tr><td>Memória e aprendizado</td><td>O cérebro: referências, receitas e lições revisadas por você (<code>CEREBRO_DO_KONNECT.html</code>).</td><td class="miss">proposto</td></tr>
+      <tr><td>Portões</td><td>Gates de posicionamento e de roteamento nas skills; o agente de layout para depois do posicionamento.</td><td class="yes">existe, por agente</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ─────────────────────────── 5. O QUE NÃO SE TRADUZ ─────────────────────────── -->
+<section id="diferencas">
+  <h2>O que não se traduz</h2>
+  <div class="cols">
+    <div class="card"><h4>Worktrees, merge e sessões paralelas</h4><p>Um projeto KiCad não se mescla como código, e a regra do Konnect já é um dono por projeto. Leases, travas e fila de merge ficam fora.</p></div>
+    <div class="card"><h4>“Nunca pergunte”</h4><p>O orc decide tudo e adia só push e gastos. Em hardware, produto, custo, aparência e dinheiro são seus, e você pediu para ver o posicionamento antes de rotear. O Konnect precisa de portões que param — poucos e agrupados.</p></div>
+    <div class="card"><h4>Especificações OpenSpec</h4><p>O artefato de hardware é outro: registro de restrições, brief de arquitetura, registros de pior caso, plano de pinos, ledger da revisão. Uma revisão de placa vira uma ordem de mudança (ECO) com esses registros.</p></div>
+    <div class="card"><h4>Dependência do orc</h4><p>O orc exige Node e o próprio orc instalado. O orquestrador do Konnect roda no binário que o usuário já tem, para Claude e, depois, para Codex.</p></div>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 6. TRÊS CAMADAS ─────────────────────────── -->
+<section id="camadas">
+  <h2>Três camadas: mãos, conhecimento e processo</h2>
+  <div class="prose"><p>As ferramentas são as mãos, e continuam as mesmas. O cérebro é o conhecimento. O orquestrador é o processo: a sessão principal passa a conduzir, e os agentes trabalham como executores com contrato.</p></div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 490" role="img" aria-label="Você conversa com o orquestrador, que é a sessão principal com a skill konnect em modo mestre. O orquestrador manda um brief aos agentes e recebe a entrega em arquivo. Os agentes usam as ferramentas do konnect.exe, que inclui o toolset flow proposto, e consultam o cérebro. O estado fica em .konnect/flow no projeto, e o curador envia lições candidatas ao cérebro.">
+  <defs>
+    <marker id="o1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="o1n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-new"/></marker>
+    <marker id="o1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-dash"/></marker>
+  </defs>
+  <!-- Você -->
+  <rect x="20" y="34" width="120" height="60" rx="8" class="b"/>
+  <text x="80" y="60" text-anchor="middle" class="t-hd">Você</text>
+  <text x="80" y="80" text-anchor="middle" class="t-sm">pedido · portões</text>
+  <line x1="142" y1="64" x2="186" y2="64" class="ln" marker-start="url(#o1)" marker-end="url(#o1)"/>
+  <!-- Orquestrador -->
+  <rect x="190" y="24" width="630" height="80" rx="10" class="b-new"/>
+  <text x="505" y="51" text-anchor="middle" class="t-hd">Orquestrador</text>
+  <text x="505" y="71" text-anchor="middle">a própria sessão, com a skill konnect em modo mestre</text>
+  <text x="505" y="90" text-anchor="middle" class="t-sm">escolhe a via · escreve o brief · confere a entrega · registra a decisão</text>
+  <!-- brief / entrega -->
+  <line x1="400" y1="106" x2="400" y2="137" class="ln-new" marker-end="url(#o1n)"/>
+  <text x="410" y="126" class="t-sm">brief</text>
+  <line x1="610" y1="137" x2="610" y2="108" class="ln-dash" marker-end="url(#o1d)"/>
+  <text x="620" y="126" class="t-sm">entrega em arquivo</text>
+  <!-- Agentes -->
+  <rect x="20" y="140" width="800" height="160" rx="10" class="grp"/>
+  <text x="32" y="158" class="t-sm">agentes — executores com contrato</text>
+  <rect x="32" y="166" width="148" height="56" rx="8" class="b-new"/>
+  <text x="106" y="190" text-anchor="middle" class="t-hd">Requisitos</text>
+  <text x="106" y="209" text-anchor="middle" class="t-sm">registro de restrições</text>
+  <rect x="190" y="166" width="148" height="56" rx="8" class="b-new"/>
+  <text x="264" y="190" text-anchor="middle" class="t-hd">Arquitetura</text>
+  <text x="264" y="209" text-anchor="middle" class="t-sm">blocos, energia, pinos</text>
+  <rect x="348" y="166" width="148" height="56" rx="8" class="b-new"/>
+  <text x="422" y="190" text-anchor="middle" class="t-hd" style="font-size:13.5px">Pesquisa e compras</text>
+  <text x="422" y="209" text-anchor="middle" class="t-sm">peças, estoque, fontes</text>
+  <rect x="506" y="166" width="148" height="56" rx="8" class="b-now"/>
+  <text x="580" y="190" text-anchor="middle" class="t-hd">Esquemático</text>
+  <text x="580" y="209" text-anchor="middle" class="t-sm">folhas por bloco</text>
+  <rect x="664" y="166" width="148" height="56" rx="8" class="b-new"/>
+  <text x="738" y="190" text-anchor="middle" class="t-hd">Biblioteca</text>
+  <text x="738" y="209" text-anchor="middle" class="t-sm">símbolos, footprints</text>
+  <rect x="32" y="232" width="148" height="56" rx="8" class="b-now"/>
+  <text x="106" y="256" text-anchor="middle" class="t-hd">Layout</text>
+  <text x="106" y="275" text-anchor="middle" class="t-sm">posicionar, rotear</text>
+  <rect x="190" y="232" width="148" height="56" rx="8" class="b-now"/>
+  <text x="264" y="256" text-anchor="middle" class="t-hd">Revisão</text>
+  <text x="264" y="275" text-anchor="middle" class="t-sm">dimensões, verificador</text>
+  <rect x="348" y="232" width="148" height="56" rx="8" class="b-new"/>
+  <text x="422" y="256" text-anchor="middle" class="t-hd">Fabricação</text>
+  <text x="422" y="275" text-anchor="middle" class="t-sm">pacote, pedido</text>
+  <rect x="506" y="232" width="148" height="56" rx="8" class="b-now"/>
+  <text x="580" y="256" text-anchor="middle" class="t-hd">Foto → KiCad</text>
+  <text x="580" y="275" text-anchor="middle" class="t-sm">no branch, não mesclado</text>
+  <rect x="664" y="232" width="148" height="56" rx="8" class="b-new"/>
+  <text x="738" y="256" text-anchor="middle" class="t-hd">Curador</text>
+  <text x="738" y="275" text-anchor="middle" class="t-sm">lições candidatas</text>
+  <!-- agentes → konnect.exe -->
+  <line x1="420" y1="302" x2="420" y2="327" class="ln" marker-end="url(#o1)"/>
+  <text x="430" y="319" class="t-sm">ferramentas MCP</text>
+  <!-- konnect.exe -->
+  <rect x="20" y="330" width="800" height="140" rx="10" class="b-now"/>
+  <text x="36" y="354" class="t-hd">konnect.exe — as mãos</text>
+  <rect x="36" y="368" width="186" height="86" rx="8" class="b"/>
+  <text x="129" y="396" text-anchor="middle" class="t-hd">Ferramentas de hoje</text>
+  <text x="129" y="418" text-anchor="middle" class="t-sm">esquemático · PCB</text>
+  <text x="129" y="436" text-anchor="middle" class="t-sm">biblioteca · fabricação</text>
+  <rect x="232" y="368" width="186" height="86" rx="8" class="b"/>
+  <text x="325" y="396" text-anchor="middle" class="t-hd">Caminhos até o KiCad</text>
+  <text x="325" y="418" text-anchor="middle" class="t-sm">IPC · motor S-expression</text>
+  <text x="325" y="436" text-anchor="middle" class="t-sm">kicad-cli</text>
+  <rect x="428" y="368" width="186" height="86" rx="8" class="b-new"/>
+  <text x="521" y="396" text-anchor="middle" class="t-hd">Toolset flow</text>
+  <text x="521" y="418" text-anchor="middle" class="t-sm">estado · portões</text>
+  <text x="521" y="436" text-anchor="middle" class="t-sm">decisões · achados</text>
+  <rect x="624" y="368" width="186" height="86" rx="8" class="b-gap"/>
+  <text x="717" y="396" text-anchor="middle" class="t-hd">Garantias</text>
+  <text x="717" y="418" text-anchor="middle" class="t-sm">hash do projeto (existe)</text>
+  <text x="717" y="436" text-anchor="middle" class="t-sm">checkpoints vcs (esqueleto)</text>
+  <!-- Estado -->
+  <line x1="822" y1="64" x2="876" y2="64" class="ln-new" marker-start="url(#o1n)" marker-end="url(#o1n)"/>
+  <rect x="880" y="24" width="220" height="130" rx="10" class="b-new"/>
+  <text x="990" y="50" text-anchor="middle" class="t-hd">Estado do projeto</text>
+  <text x="990" y="73" text-anchor="middle" class="t-mono">.konnect/flow/</text>
+  <text x="990" y="95" text-anchor="middle" class="t-sm">estado · registros · entregas</text>
+  <text x="990" y="114" text-anchor="middle" class="t-sm">decisões · memória por papel</text>
+  <text x="990" y="133" text-anchor="middle" class="t-sm">fora do hash do projeto</text>
+  <!-- Cérebro -->
+  <line x1="822" y1="200" x2="876" y2="200" class="ln-dash" marker-end="url(#o1d)"/>
+  <text x="849" y="192" text-anchor="middle" class="t-sm">consulta</text>
+  <line x1="814" y1="262" x2="876" y2="262" class="ln-new" marker-end="url(#o1n)"/>
+  <rect x="880" y="180" width="220" height="120" rx="10" class="b-new"/>
+  <text x="990" y="206" text-anchor="middle" class="t-hd">Cérebro</text>
+  <text x="990" y="230" text-anchor="middle" class="t-sm">referências · receitas · lições</text>
+  <text x="990" y="251" text-anchor="middle" class="t-sm">proposto no CEREBRO_DO_KONNECT</text>
+  <text x="990" y="272" text-anchor="middle" class="t-sm">lição só vale com sua revisão</text>
+  <!-- KiCad -->
+  <line x1="822" y1="412" x2="876" y2="412" class="ln" marker-start="url(#o1)" marker-end="url(#o1)"/>
+  <rect x="880" y="382" width="220" height="60" rx="8" class="b"/>
+  <text x="990" y="406" text-anchor="middle" class="t-hd">KiCad 10</text>
+  <text x="990" y="427" text-anchor="middle" class="t-mono">.kicad_sch · .kicad_pcb</text>
+</svg>
+    </div>
+    <figcaption>Em cobre, o que é novo. Como no orc, o mestre é a própria sessão: é quem conversa com você, confere as entregas e grava o estado. Os agentes nascem sem memória, recebem tudo no brief, trabalham pelas ferramentas do Konnect e devolvem um arquivo de entrega.</figcaption>
+  </figure>
+</section>
+
+<!-- ─────────────────────────── 7. O FLUXO ─────────────────────────── -->
+<section id="fluxo">
+  <h2>O fluxo de uma placa</h2>
+  <div class="prose"><p>Dez fases, três portões seus. Cada fase tem um papel, um registro que ela produz e uma condição de saída que o orquestrador confere com ferramenta, não com o relato do agente.</p></div>
+  <figure>
+    <div class="dia">
+<svg viewBox="0 0 1120 330" role="img" aria-label="Fases: 0 pedido, 1 requisitos, 2 arquitetura, portão 1 em que você aprova, 3 esquemático, 4 revisão do esquemático com retorno de correção de no máximo três rodadas, 5 posicionamento, portão 2 em que você aprova, 6 roteamento, 7 revisão pré-fabricação com retorno à camada que falhou, 8 fabricação, portão 3 em que você autoriza o pedido, 9 aprender.">
+  <defs>
+    <marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+    <marker id="f1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-dash"/></marker>
+  </defs>
+  <!-- linha 1 -->
+  <rect x="20" y="50" width="130" height="64" rx="8" class="b"/>
+  <text x="85" y="78" text-anchor="middle" class="t-hd">0 · Pedido</text>
+  <text x="85" y="98" text-anchor="middle" class="t-sm">objetivo e via</text>
+  <line x1="150" y1="82" x2="173" y2="82" class="ln" marker-end="url(#f1)"/>
+  <rect x="175" y="50" width="150" height="64" rx="8" class="b-new"/>
+  <text x="250" y="78" text-anchor="middle" class="t-hd">1 · Requisitos</text>
+  <text x="250" y="98" text-anchor="middle" class="t-sm">restrições</text>
+  <line x1="325" y1="82" x2="348" y2="82" class="ln" marker-end="url(#f1)"/>
+  <rect x="350" y="50" width="160" height="64" rx="8" class="b-new"/>
+  <text x="430" y="78" text-anchor="middle" class="t-hd">2 · Arquitetura</text>
+  <text x="430" y="98" text-anchor="middle" class="t-sm">brief de uma página</text>
+  <line x1="510" y1="82" x2="542" y2="82" class="ln" marker-end="url(#f1)"/>
+  <polygon points="570,56 596,82 570,108 544,82" class="c-new"/>
+  <text x="570" y="87" text-anchor="middle" class="num-t">1</text>
+  <text x="570" y="128" text-anchor="middle" class="t-sm">você aprova</text>
+  <line x1="598" y1="82" x2="618" y2="82" class="ln" marker-end="url(#f1)"/>
+  <rect x="620" y="50" width="160" height="64" rx="8" class="b-now"/>
+  <text x="700" y="78" text-anchor="middle" class="t-hd">3 · Esquemático</text>
+  <text x="700" y="98" text-anchor="middle" class="t-sm">ERC · netlist · render</text>
+  <line x1="780" y1="82" x2="803" y2="82" class="ln" marker-end="url(#f1)"/>
+  <rect x="805" y="50" width="150" height="64" rx="8" class="b-now"/>
+  <text x="880" y="78" text-anchor="middle" class="t-hd">4 · Revisão</text>
+  <text x="880" y="98" text-anchor="middle" class="t-sm">do esquemático</text>
+  <path d="M880,50 V30 H700 V47" class="ln-dash" marker-end="url(#f1d)"/>
+  <text x="790" y="24" text-anchor="middle" class="t-sm">FIX · máx. 3 rodadas</text>
+  <!-- conector -->
+  <path d="M880,114 V160 H95 V197" class="ln" marker-end="url(#f1)"/>
+  <!-- linha 2 -->
+  <rect x="20" y="200" width="160" height="64" rx="8" class="b-now"/>
+  <text x="100" y="228" text-anchor="middle" class="t-hd">5 · Posicionamento</text>
+  <text x="100" y="248" text-anchor="middle" class="t-sm">gate de posicionamento</text>
+  <line x1="180" y1="232" x2="202" y2="232" class="ln" marker-end="url(#f1)"/>
+  <polygon points="230,206 256,232 230,258 204,232" class="c-new"/>
+  <text x="230" y="237" text-anchor="middle" class="num-t">2</text>
+  <text x="230" y="278" text-anchor="middle" class="t-sm">você aprova</text>
+  <line x1="258" y1="232" x2="278" y2="232" class="ln" marker-end="url(#f1)"/>
+  <rect x="280" y="200" width="150" height="64" rx="8" class="b-now"/>
+  <text x="355" y="228" text-anchor="middle" class="t-hd">6 · Roteamento</text>
+  <text x="355" y="248" text-anchor="middle" class="t-sm">DRC com paridade</text>
+  <line x1="430" y1="232" x2="453" y2="232" class="ln" marker-end="url(#f1)"/>
+  <rect x="455" y="200" width="170" height="64" rx="8" class="b-now"/>
+  <text x="540" y="228" text-anchor="middle" class="t-hd">7 · Revisão pré-fab</text>
+  <text x="540" y="248" text-anchor="middle" class="t-sm">verificador · crítico</text>
+  <path d="M540,264 V300 H355 V267" class="ln-dash" marker-end="url(#f1d)"/>
+  <text x="448" y="318" text-anchor="middle" class="t-sm">FIX volta à camada que falhou</text>
+  <line x1="625" y1="232" x2="648" y2="232" class="ln" marker-end="url(#f1)"/>
+  <rect x="650" y="200" width="150" height="64" rx="8" class="b-new"/>
+  <text x="725" y="228" text-anchor="middle" class="t-hd">8 · Fabricação</text>
+  <text x="725" y="248" text-anchor="middle" class="t-sm">pacote · pedido</text>
+  <line x1="800" y1="232" x2="822" y2="232" class="ln" marker-end="url(#f1)"/>
+  <polygon points="850,206 876,232 850,258 824,232" class="c-new"/>
+  <text x="850" y="237" text-anchor="middle" class="num-t">3</text>
+  <text x="850" y="278" text-anchor="middle" class="t-sm">você autoriza</text>
+  <line x1="878" y1="232" x2="898" y2="232" class="ln" marker-end="url(#f1)"/>
+  <rect x="900" y="200" width="150" height="64" rx="8" class="b-new"/>
+  <text x="975" y="228" text-anchor="middle" class="t-hd">9 · Aprender</text>
+  <text x="975" y="248" text-anchor="middle" class="t-sm">lições candidatas</text>
+</svg>
+    </div>
+    <figcaption>Verde: fases cujo agente e método já existem. Cobre: papéis novos. Um FIX diz qual camada falhou — requisito, arquitetura ou implementação — e o orquestrador volta direto para lá, como o orc faz com intenção, especificação e implementação.</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>Fase</th><th>Quem</th><th>Produz</th><th>Sai quando</th></tr></thead>
+    <tbody>
+      <tr><td>0 · Pedido</td><td>orquestrador</td><td>objetivo numa frase e a via escolhida</td><td>a via e o motivo estão no log</td></tr>
+      <tr><td>1 · Requisitos</td><td>requisitos</td><td>registro de restrições: ambiente, alimentação, correntes, interfaces, conectores e lados, tamanho, gabinete, fabricante e serviço, quantidade, custo</td><td>nenhum valor que decide o projeto está faltando; o que faltava foi perguntado de uma vez</td></tr>
+      <tr><td>2 · Arquitetura</td><td>arquitetura + pesquisa</td><td>diagrama de blocos, árvore de energia e orçamento, peças com estoque conferido, plano de pinos, interfaces, registros de pior caso</td><td><b>você aprova</b>; o portão de prontidão confirma que nenhum bloco depende de valor inventado</td></tr>
+      <tr><td>3 · Esquemático</td><td>esquemático (+ biblioteca)</td><td>folhas por bloco, gravadas uma de cada vez</td><td>ERC, asserções de netlist, render inspecionado, referências únicas entre folhas</td></tr>
+      <tr><td>4 · Revisão do esquemático</td><td>revisores por dimensão → verificador</td><td>ledger com veredito e ação por achado</td><td>nenhum <code>FIX_BEFORE_FAB</code> aberto; teto de 3 rodadas</td></tr>
+      <tr><td>5 · Posicionamento</td><td>layout</td><td>blocos, fan-out planar, gate de posicionamento, imagens por camada</td><td><b>você aprova a imagem</b></td></tr>
+      <tr><td>6 · Roteamento</td><td>layout</td><td>plano de camadas, netclasses, roteamento por criticidade, zonas</td><td>DRC com paridade, larguras auditadas, terra sem ponto único</td></tr>
+      <tr><td>7 · Revisão pré-fab</td><td>revisores → verificador → crítico de cobertura</td><td>ledger e nível de prontidão</td><td>nada a corrigir antes de fabricar; teto de 3 rodadas</td></tr>
+      <tr><td>8 · Fabricação</td><td>fabricação</td><td>Gerber, furação, BOM, posições, integridade do BOM, configuração do pedido, notas de release e contrato de firmware</td><td><b>você autoriza o pedido</b></td></tr>
+      <tr><td>9 · Aprender</td><td>curador</td><td>lições candidatas com evidência; playbook quando houve no máximo uma rodada de correção</td><td>as lições estão na sua fila de revisão do cérebro</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Vias e agentes individuais</h3>
+  <div class="prose"><p>Nem todo pedido precisa das dez fases. O orquestrador escolhe a via no pedido e registra o motivo:</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Via</th><th>Quando</th><th>Caminho</th></tr></thead>
+    <tbody>
+      <tr><td>Placa nova</td><td>“crie uma placa que…”</td><td>fases 0 a 9</td></tr>
+      <tr><td>Revisão de placa (ECO)</td><td>mudança num projeto existente</td><td>registro da mudança → só as fases afetadas → revisão → fabricação</td></tr>
+      <tr><td>Edição pontual</td><td>poucos objetos, sem mudança de arquitetura, reversível (“troque R5 por 4,7k”)</td><td>skill direta e verificação, sem pasta de trabalho</td></tr>
+      <tr><td>Agente sozinho</td><td>o pedido é exatamente o papel de um agente (“revise o layout”, “gere os arquivos da JLC”)</td><td>um brief completo para esse agente; o mestre confere a entrega</td></tr>
+      <tr><td>Só revisão / só fabricação</td><td>projeto pronto, pedido de auditoria ou de pacote</td><td>fase 7 ou fase 8</td></tr>
+      <tr><td>Foto → KiCad</td><td>engenharia reversa de uma placa</td><td>agente de foto → mapa aprovado por você → fase 3</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ─────────────────────────── 8. OS AGENTES ─────────────────────────── -->
+<section id="agentes">
+  <h2>Os agentes</h2>
+  <div class="prose"><p>Cada agente ganha o contrato do orc: gatilhos e anti-gatilhos num índice que o mestre lê antes de delegar, ferramentas liberadas, orçamento e os arquivos que pode escrever. Os métodos já estão nas skills; os papéis novos são, na maior parte, recortes do que as skills já ensinam.</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Papel</th><th>Hoje</th><th>Método vem de</th><th>Escreve em</th></tr></thead>
+    <tbody>
+      <tr><td>Orquestrador</td><td class="miss">novo (skill)</td><td>skill <code>konnect</code> + referência de orquestração nova</td><td>estado do fluxo, só pelo toolset flow</td></tr>
+      <tr><td>Requisitos</td><td class="miss">novo</td><td>entradas de <code>design-calculations</code> e <code>interface-design</code></td><td>registro de restrições</td></tr>
+      <tr><td>Arquitetura</td><td class="miss">novo (hoje é um passo do agente de esquemático)</td><td><code>kicad-schematic</code>, cérebro</td><td>brief de arquitetura, registros de pior caso</td></tr>
+      <tr><td>Pesquisa e compras</td><td class="miss">novo</td><td><code>jlcpcb-rules</code>, <code>datasheet-audit</code></td><td>lista de peças com estoque e fonte</td></tr>
+      <tr><td>Esquemático</td><td class="yes">existe</td><td><code>kicad-schematic</code></td><td>folhas do esquemático</td></tr>
+      <tr><td>Biblioteca</td><td class="miss">novo</td><td><code>kicad-library</code></td><td>símbolos e footprints do projeto</td></tr>
+      <tr><td>Layout</td><td class="yes">existe</td><td><code>kicad-pcb</code></td><td>placa</td></tr>
+      <tr><td>Revisão</td><td class="yes">existe</td><td><code>kicad-review</code> e sua orquestração de revisão</td><td>ledger; nunca altera o projeto</td></tr>
+      <tr><td>Fabricação</td><td class="miss">novo</td><td><code>kicad-manufacture</code></td><td>pacote de fabricação</td></tr>
+      <tr><td>Curador</td><td class="miss">novo</td><td>protocolo de memória do orc + ciclo do cérebro</td><td>lições candidatas</td></tr>
+      <tr><td>Foto → KiCad</td><td class="miss">no branch</td><td><code>kicad-photo-intake</code></td><td>mapa revisado</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">Os três agentes atuais usam Sonnet. O orc usa Opus para arquitetura e implementação, e um modelo de outra família (Codex) para revisar e testar — verificação cruzada. Vale repetir aqui: arquitetura e verificador com Opus; revisor cruzado pelo Codex numa fase posterior, já que o <code>konnect init</code> instala para os dois.</p>
+</section>
+
+<!-- ─────────────────────────── 9. ESTADO E MEMÓRIA ─────────────────────────── -->
+<section id="estado">
+  <h2>Estado e memória</h2>
+  <div class="prose"><p>O estado mora ao lado do projeto, na pasta <code>.konnect/</code> que já existe e que o hash do projeto ignora de propósito: gravar o estado não muda a identidade do desenho.</p></div>
+<pre class="dia" style="font-family:var(--mono);font-size:13px;line-height:1.55;overflow-x:auto;margin:18px 0">&lt;projeto KiCad&gt;/.konnect/
+├── project.json                    já existe: configuração do projeto
+└── flow/
+    ├── STATE.md                    fase · trabalho ativo · próximo passo · fila
+    │                               aprovações pendentes · achados adiados · histórico
+    ├── records/                    restrições · arquitetura · pior caso · plano de pinos · ledger
+    ├── handoffs/&lt;trabalho&gt;/        NN-&lt;papel&gt;.md — veredito, evidência, para o próximo
+    ├── log/&lt;data&gt;-&lt;trabalho&gt;.md    DECISÃO / POR QUÊ / REVERSÃO
+    └── memory/&lt;papel&gt;.md           o que o papel precisa saber deste projeto
+
+~/.konnect/agents/&lt;papel&gt;/MEMORY.md  lições do papel, até 60 linhas (até o cérebro existir)</pre>
+  <div class="prose">
+    <ol>
+      <li><b>Registros são a interface.</b> O brief de cada agente cita os registros de que ele depende; ninguém reconstrói requisitos a partir do chat.</li>
+      <li><b>Uma lição, um destino</b>, com a triagem do orc: sobre o papel → memória global do papel; sobre uma tecnologia ou peça (ESP32, TPIC6B595, JLCPCB) → cérebro; o resto → memória do projeto.</li>
+      <li><b>Erro próprio se registra na hora</b>, não no fim: o detalhe morre antes da fase de aprendizado.</li>
+      <li><b>Retomar é ler e conferir.</b> Uma sessão nova lê o estado, confere a realidade (hash do projeto, travas do KiCad, arquivos salvos) e continua no próximo passo sem perguntar nada.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 10. O MOTOR ─────────────────────────── -->
+<section id="motor">
+  <h2>O motor: um toolset <code>flow</code> no konnect.exe</h2>
+  <div class="prose"><p>O orc aprendeu que o estado só fica confiável quando ninguém o edita à mão: <code>STATE.md</code> é escrito apenas por <code>orc state &lt;verbo&gt;</code>. No Konnect o equivalente natural são ferramentas MCP, tipadas e testadas como as demais:</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Ferramenta</th><th>Faz</th><th>Recusa quando</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">flow_status</td><td>lê o estado e confere a realidade: hash do projeto, travas do KiCad</td><td>—</td></tr>
+      <tr><td class="mono">flow_start</td><td>abre um trabalho com objetivo, via e projeto</td><td>já há trabalho ativo no projeto</td></tr>
+      <tr><td class="mono">flow_advance</td><td>muda de fase</td><td>falta o registro obrigatório da fase, ou o portão anterior não foi aprovado para o hash atual</td></tr>
+      <tr><td class="mono">flow_gate</td><td>pede e registra aprovação: resumo do pacote, suas palavras, hash do projeto no momento</td><td>o pacote do portão está incompleto</td></tr>
+      <tr><td class="mono">flow_log</td><td>grava decisão (o quê, por quê, como desfazer) ou evidência</td><td>decisão sem motivo ou sem reversão</td></tr>
+      <tr><td class="mono">flow_defer</td><td>achado adiado, item de fila, aprovação pendente</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <div class="cols three">
+    <div class="card"><h4>Aprovação que expira</h4><p>Cada aprovação guarda o hash do projeto. Se o desenho mudar depois que você aprovou o posicionamento, o roteamento recusa até você reaprovar — a mesma ideia do <code>approval_valid</code> do mapa de foto.</p></div>
+    <div class="card"><h4>Entrega conferida pelo log</h4><p>O Konnect registra cada chamada. O mestre compara as chamadas que a entrega cita com o <code>get_recent_calls</code>: evidência inventada é recusada.</p></div>
+    <div class="card"><h4>Checkpoint de verdade</h4><p>Antes de cada fase que altera o projeto, um checkpoint pelo <code>konnect-vcs</code>, com restauração por branch de recuperação. Fecha a lacuna de backup restaurável que o display-remoto mostrou.</p></div>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 11. EXEMPLO ─────────────────────────── -->
+<section id="exemplo">
+  <h2>Um pedido do começo ao fim</h2>
+  <div class="prose">
+    <p><code>/konnect crie um conversor USB-serial com ESP32</code></p>
+    <ol>
+      <li><b>Pedido.</b> O orquestrador escolhe a via “placa nova” e abre o trabalho no projeto.</li>
+      <li><b>Requisitos.</b> Pergunta de uma vez só o que decide: alimentação, conector, tamanho, gabinete, quantidade, serviço da JLC. O que é óbvio vira decisão registrada, não pergunta.</li>
+      <li><b>Arquitetura e pesquisa.</b> Com o cérebro pronto, consulta as receitas “ESP32 mínimo” e “USB-serial” (EN com 10 kΩ e 1 µF, botão de reset; ponte CH340X ou USB nativo), confere estoque e calcula o regulador no pior caso. Sai um brief de uma página. <b>Portão 1: você aprova.</b></li>
+      <li><b>Esquemático.</b> Folhas por bloco, ERC, netlist e render; revisão por dimensão; correções, se houver.</li>
+      <li><b>Posicionamento.</b> Imagem por camada. <b>Portão 2: você aprova.</b></li>
+      <li><b>Roteamento e revisão.</b> DRC com paridade, revisão pré-fab com verificador, nível de prontidão.</li>
+      <li><b>Fabricação.</b> Pacote e configuração do pedido. <b>Portão 3: você autoriza a compra.</b></li>
+      <li><b>Aprender.</b> Lições candidatas entram na sua fila de revisão.</li>
+    </ol>
+    <p>Uma rodada de perguntas de produto e três aprovações. O resto é decisão registrada com dados.</p>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 12. CUSTO ─────────────────────────── -->
+<section id="custo">
+  <h2>Custo e tempo</h2>
+  <div class="prose">
+    <p>O display-remoto dá a escala. Montar o esquemático (344 peças, 11 folhas) levou 167 turnos. A rodada de revisão com verificação usou 45 agentes, 2.211 chamadas de ferramenta e 8,55 milhões de tokens em 3 h 19 min.</p>
+    <p>Por isso o orquestrador precisa de:</p>
+    <ol>
+      <li><b>Vias</b>, para que uma troca de resistor não passe pelas dez fases.</li>
+      <li><b>Orçamento por brief</b>, como o BU do orc: pequeno, normal ou pesquisa. O agente devolve BLOCKED em vez de insistir.</li>
+      <li><b>Teto de três rodadas</b> de correção por trabalho.</li>
+      <li><b>Paralelismo só para leitura</b> (revisores, pesquisa). Quem escreve no projeto trabalha um de cada vez.</li>
+      <li><b>Revisão completa, com vários revisores</b>, reservada para placa que vai para produção. Para protótipo, o agente de revisão sozinho.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ─────────────────────────── 13. ORDEM ─────────────────────────── -->
+<section id="ordem">
+  <h2>Ordem proposta</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Fase</th><th>Entrega</th><th>Pronto quando</th></tr></thead>
+    <tbody>
+      <tr><td>1 · Mestre e estado</td><td>Referência de orquestração na skill <code>konnect</code> (roteador “se X, leia Y”), toolset flow, moldes de brief e de entrega</td><td>uma placa nova vai do pedido ao portão de arquitetura, e uma sessão nova retoma do estado sem perguntar nada</td></tr>
+      <tr><td>2 · Elenco</td><td>Agentes de requisitos, arquitetura, pesquisa e compras, biblioteca e fabricação; índice com gatilhos; vias e agente sozinho</td><td>uma placa de teste sai do pedido ao pacote de fabricação passando pelos três portões</td></tr>
+      <tr><td>3 · Garantias</td><td>Aprovações ligadas ao hash do projeto, checkpoints pelo <code>konnect-vcs</code>, entregas conferidas pelo log de chamadas</td><td>mudar o projeto invalida a aprovação; um checkpoint restaura a placa; uma entrega que cita chamada inexistente é recusada</td></tr>
+      <tr><td>4 · Aprender</td><td>Curador e fase de aprendizado ligados ao cérebro (fase 3 dele); playbooks</td><td>a próxima placa real deixa lições aprovadas e um playbook</td></tr>
+      <tr><td>5 · Depois</td><td>Revisor cruzado pelo Codex; contrato de firmware entregue ao orc, que já tem o stack <code>esp32-cpp</code></td><td>o firmware começa do contrato da placa, sem redigitar pinos</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ─────────────────────────── 14. DECISÕES ─────────────────────────── -->
+<section id="decisoes">
+  <h2>Decisões para fecharmos</h2>
+  <div class="prose">
+    <p>Tenho uma recomendação para cada uma; basta responder no chat com o número e “ok” ou a alternativa.</p>
+    <ol class="decide">
+      <li><b>Onde o mestre começa.</b> Recomendo <code>/konnect &lt;pedido&gt;</code>: a skill <code>konnect</code>, que já carrega em toda tarefa de KiCad, ganha o roteador do orquestrador e escolhe a via. Edição pontual continua direta.</li>
+      <li><b>Autonomia.</b> Recomendo o modo guiado por padrão (três portões e as trocas de custo e produto) e um modo autônomo opcional por trabalho, que registra decisões e para só no pedido de compra.</li>
+      <li><b>Motor.</b> Recomendo o toolset flow em Rust, dentro do <code>konnect.exe</code>. As alternativas são só skill e arquivos (mais rápido de fazer, mas repete o erro que o orc corrigiu com <code>orc state</code>) ou usar o próprio orc (exige Node e orc no computador de quem usa o Konnect).</li>
+      <li><b>Estado.</b> Recomendo <code>&lt;projeto&gt;/.konnect/flow/</code>, ao lado do <code>project.json</code> que já existe.</li>
+      <li><b>Memória global.</b> Recomendo começar em <code>~/.konnect/agents/</code> e migrar para o cérebro quando a fase 3 dele existir, mantendo a triagem do orc.</li>
+      <li><b>Primeiros agentes novos.</b> Recomendo arquitetura e fabricação primeiro. O brief de arquitetura hoje é um passo escondido no agente de esquemático, e a fabricação do display-remoto (BOM, estoque na JLC, posições, configuração do pedido) foi feita com scripts avulsos. Requisitos, pesquisa, biblioteca e curador vêm em seguida.</li>
+      <li><b>Como construir.</b> Recomendo abrir isto como uma mudança OpenSpec e rodar pelo orc, como foram construídos o foto → KiCad e o dossiê: o orc construindo o orquestrador do Konnect.</li>
+    </ol>
+  </div>
+</section>
+
+</div>
+</body>
+</html>
