@@ -23,10 +23,6 @@
 //! No tool here touches a live KiCad board, so every one keeps the default
 //! [`BoardAccess::None`](crate::tools::BoardAccess).
 
-// Foundations land before the handlers that consume them; this allow is
-// removed in the same series, once `flow_advance` uses the last of them.
-#![allow(dead_code)]
-
 use crate::design_hash::design_state_hash;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -1551,6 +1547,486 @@ fn write_first_state(state_path: &Path, rendered: &str) -> Result<(), CallToolRe
     }
 }
 
+// ─── flow_advance (design D1, D3, D4, D5, D11) ────────────────────────────────
+
+/// How `to_phase` relates to the job's sequence (D3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transition {
+    /// The entry right after the current one.
+    Forward,
+    /// `closed` from the last entry.
+    Close,
+    /// Any earlier entry.
+    Rewind,
+    /// `closed` from any entry but the last.
+    Abandon,
+}
+
+/// Classify a move of an open job (its `phase` is an entry of `phases`).
+/// Skip-ahead, same phase and tokens outside the job are errors.
+pub(crate) fn classify_transition(state: &JobState, to_phase: &str) -> Result<Transition, String> {
+    let Some(current) = state.phases.iter().position(|phase| *phase == state.phase) else {
+        return Err(format!(
+            "the job is not at an entry of its phases ({:?})",
+            state.phase
+        ));
+    };
+    let is_last = current + 1 == state.phases.len();
+    if to_phase == CLOSED {
+        return Ok(if is_last {
+            Transition::Close
+        } else {
+            Transition::Abandon
+        });
+    }
+    let Some(target) = state.phases.iter().position(|phase| phase == to_phase) else {
+        return Err(format!(
+            "{to_phase:?} is not in this job's phases: {}",
+            state.phases.join(", ")
+        ));
+    };
+    let next = state.phases.get(current + 1).map_or(CLOSED, String::as_str);
+    match target.cmp(&current) {
+        std::cmp::Ordering::Less => Ok(Transition::Rewind),
+        std::cmp::Ordering::Equal => Err(format!(
+            "the job is already at {to_phase:?}; the next phase is {next:?}"
+        )),
+        std::cmp::Ordering::Greater if target == current + 1 => Ok(Transition::Forward),
+        std::cmp::Ordering::Greater => Err(format!(
+            "{to_phase:?} skips ahead of {:?}; the next phase is {next:?}",
+            state.phase
+        )),
+    }
+}
+
+/// The history index of the entry that entered the current phase — a gate
+/// approval's `visit` must equal it for the approval to count.
+pub(crate) fn current_visit(state: &JobState) -> Option<usize> {
+    state
+        .history
+        .iter()
+        .rposition(|entry| entry.to == state.phase)
+}
+
+/// A validated `flow_advance` call, before it meets the state file.
+struct AdvanceRequest {
+    job_id: String,
+    to_phase: String,
+    records: Vec<(String, String)>,
+    evidence_calls: Vec<String>,
+    reason: Option<String>,
+}
+
+/// `records`: an array of `{filename, content}`, each filename one of D4's
+/// ten names, none repeated.
+fn parse_records(args: &Value) -> Result<Vec<(String, String)>, CallToolResult> {
+    let entries = match args.get("records") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_arg(
+                "records",
+                "expected an array of {filename, content} objects",
+            ))
+        }
+    };
+    let mut records: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        let filename = entry.get("filename").and_then(Value::as_str);
+        let content = entry.get("content").and_then(Value::as_str);
+        let (Some(filename), Some(content)) = (filename, content) else {
+            return Err(invalid_arg(
+                "records",
+                "every entry needs a string `filename` and a string `content`",
+            ));
+        };
+        if !RECORD_NAMES.contains(&filename) {
+            return Err(invalid_arg(
+                "records",
+                &format!(
+                    "{filename:?} is not a record name; expected one of: {}",
+                    RECORD_NAMES.join(", ")
+                ),
+            ));
+        }
+        if records.iter().any(|(name, _)| name == filename) {
+            return Err(invalid_arg(
+                "records",
+                &format!("{filename:?} appears more than once"),
+            ));
+        }
+        records.push((filename.to_string(), content.to_string()));
+    }
+    Ok(records)
+}
+
+async fn handle_flow_advance(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let project_arg = match require_str(args, "project_dir") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let job_id = match require_str(args, "job_id") {
+        Ok(value) => value.to_string(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let to_phase = match require_str(args, "to_phase") {
+        Ok(value) if value == CLOSED || canonical_index(value).is_some() => value.to_string(),
+        Ok(value) => {
+            return Ok(invalid_arg(
+                "to_phase",
+                &format!("{value:?} is not a phase token or {CLOSED:?}. Nothing was written."),
+            ))
+        }
+        Err(rejection) => return Ok(rejection),
+    };
+    let records = match parse_records(args) {
+        Ok(records) => records,
+        Err(rejection) => return Ok(rejection),
+    };
+    let evidence_calls = match opt_str_list(args, "evidence_calls") {
+        Ok(calls) => calls.unwrap_or_default(),
+        Err(rejection) => return Ok(rejection),
+    };
+    let reason = match args.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(reason)) => Some(reason.clone()).filter(|r| !r.trim().is_empty()),
+        Some(_) => return Ok(invalid_arg("reason", "must be a string")),
+    };
+    let project = match resolve_project_dir(&project_arg) {
+        Ok(project) => project,
+        Err(reason) => return Ok(invalid_arg("project_dir", &reason)),
+    };
+    let request = AdvanceRequest {
+        job_id,
+        to_phase,
+        records,
+        evidence_calls,
+        reason,
+    };
+    Ok(tokio::task::spawn_blocking(move || advance_job(&project, &request)).await?)
+}
+
+/// The existing `STATE.md` of a mutating call: absent → `stale_target`,
+/// nothing created (only `flow_start` creates the flow directory).
+fn existing_state_path(project: &Path) -> Result<(PathBuf, PathBuf), CallToolResult> {
+    let no_job = || {
+        stale(
+            STATE_FILE,
+            format!(
+                "{} has no flow job ({STATE_FILE} is absent); call flow_start first. Nothing \
+                 was written.",
+                project.display()
+            ),
+        )
+    };
+    let flow_dir = match existing_flow_dir(project) {
+        Ok(Some(flow_dir)) => flow_dir,
+        Ok(None) => return Err(no_job()),
+        Err(reason) => return Err(CallToolResult::error(reason)),
+    };
+    let state_path = flow_dir.join(STATE_FILE);
+    if !state_path.is_file() {
+        return Err(no_job());
+    }
+    Ok((flow_dir, state_path))
+}
+
+/// Run the transition under the `STATE.md` lock. The closure validates
+/// everything first; a refusal hands the content back unchanged, so nothing
+/// is written.
+fn advance_job(project: &Path, request: &AdvanceRequest) -> CallToolResult {
+    let (flow_dir, state_path) = match existing_state_path(project) {
+        Ok(paths) => paths,
+        Err(refusal) => return refusal,
+    };
+    let outcome = konnect_sexp::transact_atomic(&state_path, |current| {
+        Ok(
+            match apply_advance(project, &flow_dir, &state_path, current, request) {
+                Ok((next, response)) => (next, Ok(response)),
+                Err(refusal) => (current.to_string(), Err(refusal)),
+            },
+        )
+    });
+    match outcome {
+        Ok(Ok(response)) => CallToolResult::json(&response),
+        Ok(Err(refusal)) => refusal,
+        Err(error) => CallToolResult::error(format!(
+            "Could not update {} ({error})",
+            state_path.display()
+        )),
+    }
+}
+
+/// Parse, check the job, classify, then dispatch on the transition. Returns
+/// the new `STATE.md` text and the response.
+fn apply_advance(
+    project: &Path,
+    flow_dir: &Path,
+    state_path: &Path,
+    current: &str,
+    request: &AdvanceRequest,
+) -> Result<(String, Value), CallToolResult> {
+    let state = parse_state(current).map_err(|error| {
+        conflict(
+            state_path,
+            format!("{error}. Fix it by hand; nothing was written."),
+        )
+    })?;
+    if request.job_id != state.job_id {
+        return Err(stale(
+            &format!("job:{}", request.job_id),
+            format!(
+                "job_id {:?} is not this project's job ({:?}); read flow_status. Nothing was \
+                 written.",
+                request.job_id, state.job_id
+            ),
+        ));
+    }
+    if state.phase == CLOSED {
+        return Err(stale(
+            &format!("job:{}", request.job_id),
+            format!(
+                "job {:?} is closed; start a new one with flow_start. Nothing was written.",
+                state.job_id
+            ),
+        ));
+    }
+    let transition = classify_transition(&state, &request.to_phase)
+        .map_err(|reason| invalid_arg("to_phase", &format!("{reason}. Nothing was written.")))?;
+    match transition {
+        Transition::Forward | Transition::Close => {
+            advance_forward(project, flow_dir, state, request, transition)
+        }
+        Transition::Rewind | Transition::Abandon => Err(invalid_arg(
+            "to_phase",
+            &format!(
+                "{:?} from {:?} is a rewind or an abandon; this build moves jobs forward \
+                 only. Nothing was written.",
+                request.to_phase, state.phase
+            ),
+        )),
+    }
+}
+
+/// D4's same-call rule: every record the phase being left produces must be
+/// in THIS call's `records`, and every supplied record must belong to that
+/// phase. A file already on disk never counts — it was written by an earlier
+/// visit or an earlier job.
+fn check_forward_records(
+    leaving: &str,
+    records: &[(String, String)],
+) -> Result<(), CallToolResult> {
+    for (name, _) in records {
+        let owner = record_phase(name).unwrap_or("no phase");
+        if owner != leaving {
+            return Err(invalid_arg(
+                "records",
+                &format!(
+                    "{name} belongs to phase {owner:?}, not to {leaving:?}, the phase being \
+                     left. Nothing was written."
+                ),
+            ));
+        }
+    }
+    let missing: Vec<&str> = required_records(leaving)
+        .iter()
+        .copied()
+        .filter(|required| !records.iter().any(|(name, _)| name == required))
+        .collect();
+    if !missing.is_empty() {
+        return Err(invalid_arg(
+            "records",
+            &format!(
+                "leaving {leaving:?} requires {} in this call's records; a record already on \
+                 disk does not count. Nothing was written.",
+                missing.join(", ")
+            ),
+        ));
+    }
+    if leaving == "architecture" {
+        let content = records
+            .iter()
+            .find(|(name, _)| name == ARCHITECTURE_RECORD)
+            .map_or("", |(_, content)| content.as_str());
+        let problem = match parse_readiness(content) {
+            Readiness::Pass => return Ok(()),
+            Readiness::Blocked(reason) => format!("its readiness line is BLOCKED — {reason}"),
+            Readiness::Malformed => "its last non-empty line is not a readiness line".to_string(),
+        };
+        return Err(invalid_arg(
+            "records",
+            &format!(
+                "{ARCHITECTURE_RECORD} must end with `Readiness: PASS` to leave architecture; \
+                 {problem}. Collect the missing value (typically a rewind to requirements). \
+                 Nothing was written."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Leaving a gate phase: the approval must be of the current visit, and the
+/// design and package must still equal what it approved (D11).
+fn check_gate_exit(
+    flow_dir: &Path,
+    state: &JobState,
+    design_hash: &str,
+) -> Result<(), CallToolResult> {
+    let gate_token = state.phase.as_str();
+    let gate = gate_token.trim_start_matches("gate:");
+    let visit = current_visit(state);
+    let Some(approval) = state
+        .gate_approvals
+        .get(gate)
+        .filter(|approval| Some(approval.visit) == visit)
+    else {
+        return Err(stale(
+            gate_token,
+            format!(
+                "gate {gate:?} has no approval recorded during this visit; approve it with \
+                 flow_gate first. Nothing was written."
+            ),
+        ));
+    };
+    if approval.design_hash_at_approval != design_hash {
+        return Err(stale(
+            gate_token,
+            format!(
+                "the design changed after gate {gate:?} was approved (design_hash {} then, {} \
+                 now); rewind or re-approve. Nothing was written.",
+                short_hash(&approval.design_hash_at_approval),
+                short_hash(design_hash)
+            ),
+        ));
+    }
+    let package = current_package(flow_dir, &state.phases, gate_token).map_err(|error| {
+        CallToolResult::error(format!(
+            "Could not hash the package of {gate_token}: {error}"
+        ))
+    })?;
+    if approval.package_hash_at_approval != package.hash {
+        let shown = visit
+            .and_then(|visit| state.history.get(visit))
+            .map(|entry| &entry.package_files);
+        let changed: Vec<&str> = package
+            .files
+            .iter()
+            .filter(|(name, digest)| shown.and_then(|files| files.get(*name)) != Some(*digest))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        return Err(stale(
+            gate_token,
+            format!(
+                "the package of gate {gate:?} changed after it was approved (changed or \
+                 missing: {}); rewind or re-approve. Nothing was written.",
+                if changed.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    changed.join(", ")
+                }
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A forward move (or the close from the last entry): validate, hash, write
+/// the records, then build the history entry and the new state.
+fn advance_forward(
+    project: &Path,
+    flow_dir: &Path,
+    mut state: JobState,
+    request: &AdvanceRequest,
+    transition: Transition,
+) -> Result<(String, Value), CallToolResult> {
+    let leaving = state.phase.clone();
+    check_forward_records(&leaving, &request.records)?;
+    let (design_hash, _) = design_state_hash(project).map_err(|error| {
+        CallToolResult::error(format!(
+            "Could not hash the design under {}: {error:#}. Nothing was written.",
+            project.display()
+        ))
+    })?;
+    if is_gate(&leaving) {
+        check_gate_exit(flow_dir, &state, &design_hash)?;
+    }
+
+    // Everything is validated: side files first, STATE.md last (D2).
+    if !request.records.is_empty() {
+        let records_dir =
+            ensure_flow_subdir(flow_dir, &[RECORDS_DIR]).map_err(CallToolResult::error)?;
+        for (name, content) in &request.records {
+            let path = records_dir.join(name);
+            konnect_sexp::write_atomic(&path, content).map_err(|error| {
+                CallToolResult::error(format!("Could not write {} ({error})", path.display()))
+            })?;
+        }
+    }
+
+    let at = crate::tools::photo_intake::now_rfc3339_utc();
+    let kind = if transition == Transition::Close {
+        HistoryKind::Close
+    } else {
+        HistoryKind::Advance
+    };
+    let mut entry = HistoryEntry::new(kind, Some(&leaving), &request.to_phase, &at, &design_hash);
+    entry.records = request
+        .records
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    entry.evidence_calls = request.evidence_calls.clone();
+    entry.reason = request.reason.clone();
+    if is_gate(&request.to_phase) {
+        let package =
+            current_package(flow_dir, &state.phases, &request.to_phase).map_err(|error| {
+                CallToolResult::error(format!(
+                    "Could not hash the package of {}: {error}",
+                    request.to_phase
+                ))
+            })?;
+        entry.package_hash = Some(package.hash);
+        entry.package_files = package.files;
+    }
+
+    let mut lines = vec![format!("design_hash: `{design_hash}`")];
+    if !entry.records.is_empty() {
+        lines.push(format!("records: {}", entry.records.join(", ")));
+    }
+    if let Some(package_hash) = &entry.package_hash {
+        lines.push(format!("package_hash: `{package_hash}`"));
+    }
+    if !entry.evidence_calls.is_empty() {
+        lines.push(format!(
+            "evidence_calls: {}",
+            entry.evidence_calls.join(", ")
+        ));
+    }
+    if let Some(reason) = &entry.reason {
+        lines.push(format!("reason: {}", one_line(reason)));
+    }
+    let log = log_entry(
+        &at,
+        &format!("{} {leaving} → {}", kind.as_str(), request.to_phase),
+        &lines,
+    );
+
+    let response = json!({
+        "job_id": state.job_id,
+        "transition": kind.as_str(),
+        "from": leaving,
+        "phase": request.to_phase,
+        "records_written": entry.records,
+        "design_hash": design_hash,
+        "package_hash": entry.package_hash,
+        "history_index": state.history.len(),
+    });
+    state.phase = request.to_phase.clone();
+    state.history.push(entry);
+    append_log(flow_dir, &state, &log).map_err(CallToolResult::error)?;
+    Ok((render_state(&state), response))
+}
+
 // ─── Tool definitions (design D1) ─────────────────────────────────────────────
 
 /// The `flow` tools in D1 order. The router registers them (task 1.8).
@@ -1620,6 +2096,58 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["project_dir", "objective", "lane"]
             }),
             |args, ctx| async move { handle_flow_start(args, ctx).await }
+        ),
+        tool!(
+            "flow_advance",
+            "Move the project's job to `to_phase`. Forward (the next entry of the job's \
+             phases, or closed from the last one) requires every record the phase being left \
+             produces in THIS call's `records` — a record already on disk never counts — and \
+             each supplied record must belong to that phase; leaving architecture requires \
+             architecture.md to end with `Readiness: PASS`; leaving a gate requires an \
+             approval from this visit whose design and package hashes still match. Records \
+             are written only when the whole transition is accepted; a refusal writes \
+             nothing. The producer of a phase calls this as its last action.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "KiCad project directory: must hold a *.kicad_pro directly."
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id flow_start returned (flow_status reports it)."
+                    },
+                    "to_phase": {
+                        "type": "string",
+                        "enum": CANONICAL_PHASES.iter().copied().chain([CLOSED]).collect::<Vec<_>>(),
+                        "description": "The next phase of the job's sequence, or closed from its last phase."
+                    },
+                    "records": {
+                        "type": "array",
+                        "description": "The records of the phase being left, as Markdown text. Written to .konnect/flow/records/<filename>.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": { "type": "string", "enum": RECORD_NAMES },
+                                "content": { "type": "string" }
+                            },
+                            "required": ["filename", "content"]
+                        }
+                    },
+                    "evidence_calls": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tool names whose results this phase's records cite (for example run_erc). Stored in the history entry."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the move is made; stored in the history entry."
+                    }
+                },
+                "required": ["project_dir", "job_id", "to_phase"]
+            }),
+            |args, ctx| async move { handle_flow_advance(args, ctx).await }
         ),
     ]
 }
@@ -2446,6 +2974,31 @@ mod schema_tests {
             "lane": "new_board",
             "phases": ["layout"]
         })));
+
+        let advance = tool("flow_advance");
+        assert!(advance.input_validator.is_valid(&json!({
+            "project_dir": "p",
+            "job_id": "j",
+            "to_phase": "gate:architecture",
+            "records": [{ "filename": "architecture.md", "content": "Readiness: PASS" }],
+            "evidence_calls": ["run_erc"],
+            "reason": "r"
+        })));
+        assert!(advance
+            .input_validator
+            .is_valid(&json!({ "project_dir": "p", "job_id": "j", "to_phase": "closed" })));
+        assert!(!advance.input_validator.is_valid(&json!({
+            "project_dir": "p",
+            "job_id": "j",
+            "to_phase": "architecture",
+            "records": [{ "filename": "../escape.md", "content": "x" }]
+        })));
+        assert!(!advance.input_validator.is_valid(&json!({
+            "project_dir": "p",
+            "job_id": "j",
+            "to_phase": "architecture",
+            "records": [{ "filename": "constraints.md", "content": "x", "extra": 1 }]
+        })));
     }
 }
 
@@ -2640,5 +3193,384 @@ mod start_tests {
         );
         let loser = if first.is_error { &first } else { &second };
         assert_eq!(error_kind(loser), "conflict");
+    }
+}
+
+// ─── Tests: flow_advance forward (task 1.4) ───────────────────────────────────
+
+#[cfg(test)]
+mod advance_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::mcp::protocol::CallToolResult;
+    use serde_json::{json, Value};
+
+    const PASSING_ARCHITECTURE: &str = "# Architecture\n\nBlocks.\n\nReadiness: PASS\n";
+
+    /// Open a job through the real tool and return its job_id.
+    async fn open(dir: &tempfile::TempDir, lane: &str, phases: Option<&[&str]>) -> String {
+        let mut args = json!({ "project_dir": arg(dir), "objective": "Demo board", "lane": lane });
+        if let Some(phases) = phases {
+            args["phases"] = json!(phases);
+        }
+        let result = handle_flow_start(&args, &ctx()).await.unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        body(&result)["job_id"].as_str().unwrap().to_string()
+    }
+
+    async fn advance(
+        dir: &tempfile::TempDir,
+        job_id: &str,
+        to_phase: &str,
+        records: &[(&str, &str)],
+    ) -> CallToolResult {
+        let records: Vec<Value> = records
+            .iter()
+            .map(|(filename, content)| json!({ "filename": filename, "content": content }))
+            .collect();
+        handle_flow_advance(
+            &json!({
+                "project_dir": arg(dir),
+                "job_id": job_id,
+                "to_phase": to_phase,
+                "records": records,
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn state_bytes(dir: &tempfile::TempDir) -> Vec<u8> {
+        std::fs::read(flow_path(dir).join(STATE_FILE)).unwrap()
+    }
+
+    fn state_on_disk(dir: &tempfile::TempDir) -> JobState {
+        parse_state(&String::from_utf8(state_bytes(dir)).unwrap()).unwrap()
+    }
+
+    fn record_path(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        flow_path(dir).join("records").join(name)
+    }
+
+    /// A new_board job standing at `gate:architecture`, entered by the real
+    /// tool with a passing package.
+    async fn at_architecture_gate(dir: &tempfile::TempDir) -> String {
+        let job_id = open(dir, "new_board", None).await;
+        let left = advance(dir, &job_id, "architecture", &[("constraints.md", "# C\n")]).await;
+        assert!(!left.is_error, "{}", text(&left));
+        let entered = advance(
+            dir,
+            &job_id,
+            "gate:architecture",
+            &[
+                ("architecture.md", PASSING_ARCHITECTURE),
+                ("worst-case.md", "# WC\n"),
+                ("pin-plan.md", "# Pins\n"),
+            ],
+        )
+        .await;
+        assert!(!entered.is_error, "{}", text(&entered));
+        job_id
+    }
+
+    #[tokio::test]
+    async fn leaving_requirements_with_its_record_writes_it_and_moves_the_phase() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let result = advance(
+            &dir,
+            &job_id,
+            "architecture",
+            &[("constraints.md", "# Constraints\nUSB-C\n")],
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(body(&result)["phase"], "architecture");
+
+        assert_eq!(
+            std::fs::read_to_string(record_path(&dir, "constraints.md")).unwrap(),
+            "# Constraints\nUSB-C\n"
+        );
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, "architecture");
+        let entry = state.history.last().unwrap();
+        assert_eq!(entry.kind, HistoryKind::Advance);
+        assert_eq!(entry.from.as_deref(), Some("requirements"));
+        assert_eq!(entry.to, "architecture");
+        assert_eq!(entry.records, ["constraints.md"]);
+        assert_eq!(entry.design_hash, state.history[0].design_hash);
+        assert!(entry.package_hash.is_none(), "not entering a gate");
+
+        let log = flow_path(&dir)
+            .join("log")
+            .join(format!("{}-{job_id}.md", &state.started_at[..10]));
+        let log_text = std::fs::read_to_string(log).unwrap();
+        assert!(
+            log_text.contains("requirements → architecture"),
+            "{log_text}"
+        );
+    }
+
+    /// Design D4 / pre-mortem 3: a record already on disk — here a stale
+    /// architecture.md from an earlier write — never satisfies an exit.
+    #[tokio::test]
+    async fn a_stale_record_on_disk_does_not_satisfy_leaving_architecture() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        assert!(
+            !advance(
+                &dir,
+                &job_id,
+                "architecture",
+                &[("constraints.md", "# C\n")]
+            )
+            .await
+            .is_error
+        );
+        let stale = "# Old board\n\nReadiness: PASS\n";
+        std::fs::write(record_path(&dir, "architecture.md"), stale).unwrap();
+        let before = state_bytes(&dir);
+
+        let result = advance(
+            &dir,
+            &job_id,
+            "gate:architecture",
+            &[("worst-case.md", "# WC\n"), ("pin-plan.md", "# Pins\n")],
+        )
+        .await;
+        assert_eq!(error_kind(&result), "invalid_argument");
+        assert_eq!(body(&result)["error"]["field"], "records");
+        // The same-call rule itself must refuse — not the readiness check,
+        // which would also refuse an empty architecture.md and so mask it.
+        assert!(
+            text(&result).contains("requires architecture.md"),
+            "{}",
+            text(&result)
+        );
+        assert_eq!(state_bytes(&dir), before, "STATE.md unchanged");
+        assert_eq!(state_on_disk(&dir).phase, "architecture");
+        assert_eq!(
+            std::fs::read_to_string(record_path(&dir, "architecture.md")).unwrap(),
+            stale
+        );
+        assert!(
+            !record_path(&dir, "worst-case.md").exists()
+                && !record_path(&dir, "pin-plan.md").exists(),
+            "a refusal writes none of the supplied records"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skip_ahead_or_foreign_target_is_refused() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let before = state_bytes(&dir);
+        for to_phase in ["gate:architecture", "requirements", "learn", "closed"] {
+            let result = advance(&dir, &job_id, to_phase, &[("constraints.md", "# C\n")]).await;
+            if to_phase == "closed" {
+                // An abandon, not a forward move: never allowed with records.
+                assert!(result.is_error, "{to_phase}");
+            } else {
+                assert_eq!(error_kind(&result), "invalid_argument", "{to_phase}");
+                assert_eq!(body(&result)["error"]["field"], "to_phase", "{to_phase}");
+            }
+            assert_eq!(state_bytes(&dir), before, "{to_phase}");
+            assert!(!record_path(&dir, "constraints.md").exists(), "{to_phase}");
+        }
+
+        let fab = project();
+        let fab_job = open(&fab, "fab_only", Some(&["manufacturing", "gate:purchase"])).await;
+        let result = advance(&fab, &fab_job, "routing", &[]).await;
+        assert_eq!(error_kind(&result), "invalid_argument");
+        assert!(text(&result).contains("routing"), "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn a_record_belonging_to_another_phase_is_refused() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        let before = state_bytes(&dir);
+        let result = advance(
+            &dir,
+            &job_id,
+            "architecture",
+            &[("constraints.md", "# C\n"), ("placement.md", "# P\n")],
+        )
+        .await;
+        assert_eq!(error_kind(&result), "invalid_argument");
+        assert_eq!(body(&result)["error"]["field"], "records");
+        assert!(text(&result).contains("placement.md"), "{}", text(&result));
+        assert_eq!(state_bytes(&dir), before);
+        assert!(!record_path(&dir, "constraints.md").exists());
+        assert!(!record_path(&dir, "placement.md").exists());
+    }
+
+    #[tokio::test]
+    async fn only_a_passing_readiness_line_leaves_architecture() {
+        let dir = project();
+        let job_id = open(&dir, "new_board", None).await;
+        assert!(
+            !advance(
+                &dir,
+                &job_id,
+                "architecture",
+                &[("constraints.md", "# C\n")]
+            )
+            .await
+            .is_error
+        );
+        for (architecture, expected) in [
+            (
+                "# A\nReadiness: BLOCKED — no input voltage range\n",
+                "no input voltage range",
+            ),
+            ("# A\nno readiness line\n", "Readiness: PASS"),
+        ] {
+            let before = state_bytes(&dir);
+            let result = advance(
+                &dir,
+                &job_id,
+                "gate:architecture",
+                &[
+                    ("architecture.md", architecture),
+                    ("worst-case.md", "# WC\n"),
+                    ("pin-plan.md", "# Pins\n"),
+                ],
+            )
+            .await;
+            assert_eq!(error_kind(&result), "invalid_argument", "{architecture}");
+            assert!(text(&result).contains(expected), "{}", text(&result));
+            assert_eq!(state_bytes(&dir), before);
+            assert!(!record_path(&dir, "architecture.md").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_a_gate_records_the_package_it_binds_to() {
+        let dir = project();
+        at_architecture_gate(&dir).await;
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, "gate:architecture");
+        let entry = state.history.last().unwrap();
+        let expected = package_hash(
+            &flow_path(&dir).join("records"),
+            &[
+                "constraints.md",
+                "architecture.md",
+                "worst-case.md",
+                "pin-plan.md",
+            ],
+        )
+        .unwrap();
+        assert_eq!(entry.package_hash.as_deref(), Some(expected.hash.as_str()));
+        assert_eq!(entry.package_files, expected.files);
+        assert_eq!(entry.package_files.len(), 4);
+        assert!(entry.package_files.values().all(Option::is_some));
+    }
+
+    /// Leaving a gate needs an approval granted during THIS visit whose keys
+    /// still match the design and the package.
+    #[tokio::test]
+    async fn leaving_a_gate_requires_a_current_visit_approval_with_matching_keys() {
+        let dir = project();
+        let job_id = at_architecture_gate(&dir).await;
+
+        let unapproved = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(error_kind(&unapproved), "stale_target");
+        assert_eq!(body(&unapproved)["error"]["target"], "gate:architecture");
+
+        let entered = state_on_disk(&dir);
+        let visit = entered.history.len() - 1;
+        let approve = |visit: usize| {
+            let mut state = entered.clone();
+            let entry = &state.history[visit.min(state.history.len() - 1)];
+            let approval = GateApproval {
+                decision: GateDecision::Approve,
+                approved_by: ApprovedBy::User,
+                approved_at: "2026-09-21T15:00:00Z".into(),
+                design_hash_at_approval: entry.design_hash.clone(),
+                package_hash_at_approval: entry.package_hash.clone().unwrap_or_default(),
+                visit,
+                summary: "shown".into(),
+                user_words: "pode seguir".into(),
+            };
+            state.gate_approvals.insert("architecture".into(), approval);
+            state
+        };
+
+        plant_state(&dir, &approve(visit - 1));
+        let old_visit = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(
+            error_kind(&old_visit),
+            "stale_target",
+            "an earlier visit's approval"
+        );
+
+        plant_state(&dir, &approve(visit));
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch (moved))\n").unwrap();
+        let design_changed = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(error_kind(&design_changed), "stale_target");
+        std::fs::write(dir.path().join("demo.kicad_sch"), "(kicad_sch)\n").unwrap();
+
+        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins, edited\n").unwrap();
+        let package_changed = advance(&dir, &job_id, "schematic", &[]).await;
+        assert_eq!(error_kind(&package_changed), "stale_target");
+        assert!(
+            text(&package_changed).contains("pin-plan.md"),
+            "{}",
+            text(&package_changed)
+        );
+        std::fs::write(record_path(&dir, "pin-plan.md"), "# Pins\n").unwrap();
+
+        let left = advance(&dir, &job_id, "schematic", &[]).await;
+        assert!(!left.is_error, "{}", text(&left));
+        assert_eq!(state_on_disk(&dir).phase, "schematic");
+    }
+
+    #[tokio::test]
+    async fn the_last_phase_closes_the_job_with_its_record() {
+        let dir = project();
+        let job_id = open(&dir, "review_only", Some(&["prefab_review"])).await;
+        let result = advance(
+            &dir,
+            &job_id,
+            "closed",
+            &[("ledger-prefab.md", "# Ledger\n")],
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let state = state_on_disk(&dir);
+        assert_eq!(state.phase, CLOSED);
+        assert_eq!(state.history.last().unwrap().kind, HistoryKind::Close);
+
+        let after_close = advance(&dir, &job_id, "closed", &[]).await;
+        assert_eq!(
+            error_kind(&after_close),
+            "stale_target",
+            "a closed job moves no more"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_job_or_a_missing_state_is_a_stale_target_that_creates_nothing() {
+        let dir = project();
+        let orphan = advance(&dir, "demo-20260921-140000", "architecture", &[]).await;
+        assert_eq!(error_kind(&orphan), "stale_target");
+        assert!(!dir.path().join(".konnect").exists());
+
+        let job_id = open(&dir, "new_board", None).await;
+        let before = state_bytes(&dir);
+        let foreign = advance(
+            &dir,
+            "another-20260101-000000",
+            "architecture",
+            &[("constraints.md", "# C\n")],
+        )
+        .await;
+        assert_eq!(error_kind(&foreign), "stale_target");
+        assert_eq!(state_bytes(&dir), before);
+        assert!(!record_path(&dir, "constraints.md").exists());
+        assert_ne!(job_id, "another-20260101-000000");
     }
 }
