@@ -123,6 +123,32 @@ cost the most when ignored:
   ready from your own pass; the `kicad-review` skill defines the evidence and
   the readiness levels.
 
+## Orchestrator — `/konnect <request>`
+
+`/konnect <request>` is Claude Code's invocation of this skill; under Codex the
+same skill loads by name. Either way the session becomes the orchestrator and
+picks the lane first:
+
+| Lane | When | Path |
+|---|---|---|
+| Bounded edit | A few objects, no architecture change, reversible ("change R5 from 10k to 4.7k") | The Decision Tree below; no job |
+| Single agent | The request is exactly one bundled agent's purpose ("review my layout") | One complete brief to that agent (Agent Routing below), then check its handoff; no job |
+| New board, board revision, review only, fab only, photo → KiCad | Everything else | A flow job: read `references/orchestration.md`, then `load_toolset("flow")` and `flow_status(project_dir)` |
+
+A session that finds an active job in `flow_status` resumes it at the step the
+state reports, without asking again what the state already answers. In a job,
+every agent reads its input records through `flow_status`, and the producer of
+a phase records it with `flow_advance`.
+
+| Need | Read |
+|---|---|
+| Lanes, phases, gates, the FIX loop, evidence checks, resume | [references/orchestration.md](references/orchestration.md) |
+| Writing a brief for an agent | [references/brief-template.md](references/brief-template.md) |
+| The handoff every agent returns | [references/handoff-template.md](references/handoff-template.md) |
+
+The Decision Tree and Agent Routing below stay the direct path. A job wraps
+them; it does not replace them.
+
 ## Decision Tree
 
 | User Request | Channel | Tool / Action |
@@ -179,6 +205,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Config | config |
 | Templates | templates |
 | Manufacturing | manufacturing |
+| Orchestration | flow |
 
 ## Agent Routing and Mutation Ownership
 
@@ -218,6 +245,33 @@ that agent until it hands back a saved, verified result.
 - Delegate an independent full-design, pre-fabrication, or readiness audit to
   `kicad-design-review-agent`. It gathers and reports evidence without mutating
   the design. Return fixes to the current design owner, then run a fresh review.
+- Delegate the constraint record of a new board or a revision to
+  `kicad-requirements-agent`. It captures every constraint once, logs the
+  obvious decisions, returns BLOCKED with every product question at once, and
+  in a job records `constraints.md` with `flow_advance`. It changes no design
+  file.
+- Delegate the architecture — blocks, power tree and budget, interfaces, pin
+  plan, worst-case records, parts list — to `kicad-architecture-agent`,
+  following the `kicad-architecture` skill. In a job it advances into
+  `gate:architecture` only when `architecture.md` ends with
+  `Readiness: PASS`; otherwise it returns BLOCKED naming the missing value.
+- Delegate stock, source, AVL and derating checks of a parts list to
+  `kicad-sourcing-agent`. It only looks parts up — it never places or wires
+  one and never calls `flow_advance` — and returns parts-list rows. Several can
+  run in parallel on disjoint part groups.
+- Delegate a missing symbol or footprint to `kicad-library-agent`, which makes
+  it to the `kicad-library` skill's physical pin-map acceptance contract. It
+  never edits a schematic sheet or the board; the build that places the part
+  starts after it returns.
+- Delegate the fabrication package — exports, BOM integrity, order settings,
+  indicative cost, release notes — to `kicad-manufacture-agent`, following the
+  `kicad-manufacture` skill, once the board passed its pre-fabrication review.
+  In a job it records `manufacturing.md` with `flow_advance` into
+  `gate:purchase`, where the user authorizes the order.
+- Delegate a job's `learn` phase to `kicad-curator-agent`, following the
+  `kicad-curator` skill. It records distilled lessons with `flow_log`, returns
+  the list to promote, and closes the job; it never writes a `MEMORY.md`, and
+  promotion is the session's.
 - Keep small, bounded edits and narrow checks in the current conversation using
   the applicable skill. Agent delegation is for a complete build or an
   independent review, not an extra layer around every tool call.
