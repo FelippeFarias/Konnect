@@ -67,7 +67,7 @@ gate:purchase → learn
 | `gate:placement` | the session | — | an approval (§4) | The user approved the images |
 | `routing` | `kicad-pcb-layout-agent` | `constraints.md`, `placement.md` | `routing.md` | DRC with schematic parity, widths audited against current |
 | `prefab_review` | as `schematic_review` | `routing.md`, `placement.md`, `ledger-schematic.md`, `constraints.md` | `ledger-prefab.md` | Verdicts and a readiness level; no open `FIX_BEFORE_FAB` |
-| `manufacturing` | `kicad-manufacture-agent` | `constraints.md`, `architecture.md` (its parts list), `ledger-prefab.md` | `manufacturing.md` | Package summary, BOM integrity, indicative cost, release notes; an `INCOMPLETE` package is not an exit |
+| `manufacturing` | `kicad-manufacture-agent` | `constraints.md`, `architecture.md` (its parts list), `ledger-prefab.md` | `manufacturing.md` | Package summary, BOM integrity, indicative cost, release notes; an `INCOMPLETE` package is not an exit, except when its only open items are the three `## Checks at the purchase gate` entries, which may exit to `gate:purchase` |
 | `gate:purchase` | the session | — | an approval (§4) | The user authorized the order in their own words |
 | `learn` | `kicad-curator-agent` | `log`, `lessons-candidates.md`, the handoffs, `memory/<role>.md` | none; the job ends with `flow_advance` to `closed` | Lessons recorded, promote list returned (§11) |
 

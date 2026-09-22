@@ -83,7 +83,9 @@ load_toolset("flow")   # flow_status, flow_log, flow_defer, flow_advance
 - **Defer what is not yours** with
   `flow_defer(project_dir, job_id, kind, description, owner)` — `kind`
   `finding`.
-- **Record the phase** only on a `READY` verdict — see "Ending the run".
+- **Record the phase** only on a `READY` verdict, or on an `INCOMPLETE` one
+  whose only open items are the three purchase-gate checks — see "Ending the
+  run".
 - **Persist the handoff** before returning it, whatever the verdict:
   `flow_log(project_dir, job_id, kind, message, role)` — `kind` `handoff`,
   `role` `manufacture`, `message` the whole handoff below.
@@ -171,10 +173,15 @@ price re-check before payment. Never mark them done. List them under
   questions remain.
 - **Checks at the purchase gate**: the three checks above, each "not done —
   needs the user".
-- **Verdict**: `READY` when every check your tools can run passed and only the
-  purchase-gate checks remain; `NOT READY` when a design defect blocks the
-  order; `INCOMPLETE` when a check your tools can run did not run, failed to
-  execute, or left an artifact missing. `READY` means the package matches the
+- **Verdict**: `READY` when every check your tools can run passed with no
+  warning and no purchase-gate check is still open; `NOT READY` when a design
+  defect blocks the order; `INCOMPLETE` when a check your tools can run did
+  not run, failed to execute, left an artifact missing, or
+  passed with a warning (the skill's "Any warning … keeps the result
+  `INCOMPLETE`"), or when a purchase-gate check is still open. You never
+  mark those checks done, so a package whose own checks all passed reads
+  `INCOMPLETE` and names the three — with or without a job, since
+  "Only `READY` permits upload". `READY` means the package matches the
   board — never that the product is proven.
 
 **Firmware-contract non-goal.** Firmware requirements are release notes of
@@ -184,7 +191,9 @@ contract file, no hand-off to `orc`.
 
 ### Ending the run
 
-In a job with a `READY` verdict, the run ends with
+In a job with a `READY` verdict, or an `INCOMPLETE` verdict whose only open
+items are exactly the three `## Checks at the purchase gate` entries — named
+in the record, and nothing else open — the run ends with
 `flow_advance(project_dir, job_id, to_phase, records, evidence_calls)`:
 `to_phase` is `gate:purchase`, `records` holds `manufacturing.md` as
 `{filename, content}` in this one call, and `evidence_calls` lists every tool
@@ -193,7 +202,9 @@ the record cites (`run_drc`, `get_drc_violations`,
 `estimate_cost`, …). After it is accepted, change nothing — the user's
 approval binds to this design and this record.
 
-A `NOT READY` or `INCOMPLETE` package is not an exit: do not advance. Return
+A `NOT READY` package, or an `INCOMPLETE` one with any other open item (a
+warning, a check that did not run or failed, a missing artifact), is not an
+exit: do not advance. Return
 `FIX` with `failing_layer` `implementation` for a design defect (name the
 phase that produced it), or `BLOCKED` for evidence only the session or the
 user can supply. A refused `flow_advance` wrote nothing — fix a record that
