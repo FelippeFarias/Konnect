@@ -161,8 +161,19 @@ fn no_file_quotes_a_stale_catalogue_total() {
 /// Markdown and JSON under the repo, skipping build output and vendored trees.
 fn text_files(root: &Path) -> Vec<PathBuf> {
     // .claude holds agent worktrees — other checkouts whose docs answer to
-    // their own commit, not this one.
-    const SKIP: &[&str] = &["target", "node_modules", ".git", ".claude", "dist", "build"];
+    // their own commit, not this one. .orchestrator (run handoffs) and
+    // archive (archived OpenSpec changes) are historical records: they
+    // answer to their own commit too and are never rewritten to match it.
+    const SKIP: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        ".claude",
+        ".orchestrator",
+        "archive",
+        "dist",
+        "build",
+    ];
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

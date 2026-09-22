@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **22 toolsets** organized into 10 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **23 toolsets** organized into 11 categories
+- **238 registered tools** + **7 always-visible meta-tools** = **245 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -491,6 +491,28 @@ the approved map is handed to schematic build, which re-checks the approval.
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB output applies versioned footprint/component CPL corrections, reports every match and unmatched footprint, and requires a Component Placements preview. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
+
+---
+
+## Orchestration
+
+### `flow` · 6 tools
+**Purpose:** Orchestration state of one project's design job, kept in `<project>/.konnect/flow/`: the phase sequence, gate approvals bound to the design and the records a human was shown, the phase records, the job's journal and its deferred items.
+**Source:** [`crates/konnect-core/src/tools/flow.rs`](crates/konnect-core/src/tools/flow.rs)
+
+| Tool | Description |
+|------|-------------|
+| `flow_status` | Read the project's job and phase, the current design hash and the files it covered, KiCad lock files, gate approvals with a recomputed `valid`, deferred items, FIX rounds per review phase, the newest transition, the handoffs, the next step, and each requested `read` record. Creates nothing; an unparseable `STATE.md` is reported in `state_error`, never as an error result. |
+| `flow_start` | Open a job on a lane (`new_board` runs the full sequence; other lanes pass `phases`) in `guided` or `autonomous` mode. One job at a time. Returns the server-minted `job_id` every later call names. |
+| `flow_advance` | Move the job to `to_phase`. Forward requires every record of the phase being left in the same call's `records`, and leaving `architecture` requires `Readiness: PASS`; leaving a gate requires an approval from this visit whose design and package hashes still match. A rewind needs a `reason` and clears the approvals of gates at or after its target. A refusal writes nothing. |
+| `flow_gate` | Record the user's `approve` or `reject` on the gate the job stands at. An approval binds to the design and package hashes recorded when the job entered the gate; `user_words` quotes the user verbatim (only an `autonomous` job may approve `architecture` or `placement` without them). Never moves the phase. |
+| `flow_log` | Append one journal entry by `kind`: `decision` (with `why` and `rollback`) or `evidence` to the job log, `lesson` to project memory or the candidates queue by `scope`, `handoff` to a new numbered handoff file. Never changes `STATE.md`. |
+| `flow_defer` | Append a `finding`, `queue_item` or `pending_approval` to the job's `STATE.md` lists with the phase it was found in. Append-only; works in any phase, `closed` included. |
+
+Every write stays below the project's `.konnect/flow/`, and no tool here opens
+a live KiCad board. A gate approval is content-bound: any change to the KiCad
+design or to the records shown at the gate revokes it, and a rewind always
+re-asks.
 
 ---
 
